@@ -69,6 +69,16 @@ int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms);
  * 不做常驻监听：shell 无 Ctrl-C 中断机制，accept 常驻会让 shell 永久阻塞。 */
 int net_httpd_once(void);
 
+/* ---------- 内核内部 TCP 客户端（不经 sockcall，故不做用户指针校验） ----------
+ * 系统调用路径要过 uptr_ok，内核自己用会被判非法。**仅供内核内部模块
+ * 调用**，调用方须自行保证指针有效。
+ * connect 返回 sock 下标（>=0）或 -1；send/recv 返回字节数，
+ * recv 返回 0 = 对端 FIN 正常 EOF，-1 = 超时或出错；close 幂等。 */
+int  net_tcp_connect(uint32_t dst_ip_be, uint16_t port, uint32_t timeout_ms);
+int  net_tcp_send(int sid, const void *buf, uint32_t len, uint32_t timeout_ms);
+int  net_tcp_recv(int sid, void *buf, uint32_t maxlen, uint32_t timeout_ms);
+void net_tcp_close(int sid);
+
 /* ---- DHCP 客户端（RFC 2131：DISCOVER/OFFER/REQUEST/ACK + T1/T2 续租） ----
  * 只能在任务上下文调用（内部睡等响应）。会覆盖 rtl8139 的 IP 配置。
  * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或

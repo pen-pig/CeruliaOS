@@ -21,6 +21,7 @@
 #include "isr.h"
 #include "dmesg.h"
 #include "kmalloc.h"
+#include "http.h"
 #include "paging.h"
 #include "syscall.h"
 #include "pmm.h"
@@ -2784,3 +2785,133 @@ void cmd_dhcp(const char *args) {
     ezos_console_write("s\n");
 }
 
+
+/* ===================== fetch：HTTP 客户端 =====================
+ * 用法：
+ *   fetch <url>            抓取并打印到屏幕（截断时会提示）
+ *   fetch <url> <file>     抓取并存成文件
+ * 只有明文 http://。没有 TLS 就明说，不做"去掉 s 降级"那种假成功。 */
+
+#define FETCH_BUF_SZ  32768u      /* 抓取缓冲：≥4KB，按纪律必须 static */
+static uint8_t g_fetch_buf[FETCH_BUF_SZ] __attribute__((section(".bss")));
+
+/* 把 fetch 的错误码翻成人话 */
+static const char *fetch_err(int rc) {
+    switch (rc) {
+    case -1: return "bad url (syntax / too long)";
+    case -2: return "dns failed (no A record / no server)";
+    case -3: return "connect failed (no route / refused / timeout)";
+    case -4: return "send failed";
+    case -5: return "bad or truncated response";
+    case -6: return "malformed status line / headers";
+    case -7: return "https needs TLS, not implemented";
+    case -8: return "too many redirects";
+    default:  return "unknown error";
+    }
+}
+
+/* 判断 Content-Type 是不是 HTML（决定要不要直接刷屏）。
+ * 必须比全 "text/html"，不能只看前 5 个字符 —— 那样 "text/plain"
+ * 会被当成 HTML，文本文件一律不显示。 */
+static int h_ct_is_html(const char *ct) {
+    while (*ct == ' ') ct++;
+    static const char *pfx = "text/html";
+    for (uint32_t i = 0; i < 9; i++) {
+        char c = ct[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != pfx[i]) return 0;
+    }
+    /* "text/htmlxxx" 不算 HTML：后继必须是 '/'（charset）或结束 */
+    char nx = ct[9];
+    if (nx && nx != '/' && nx != ';' && nx != ' ') return 0;
+    return 1;
+}
+
+void cmd_fetch(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("usage: fetch <url> [file]\n");
+        ezos_console_write("  fetch http://example.com/          print to screen\n");
+        ezos_console_write("  fetch http://example.com/ page.html save to file\n");
+        return;
+    }
+
+    /* 切出 url 与可选文件名（就地切分，args 由 shell 传入可写） */
+    char url[256];
+    uint32_t un = 0;
+    const char *file = 0;
+    while (args[un] && args[un] != ' ') { if (un + 1 >= sizeof(url)) {
+            ezos_console_write("fetch: url too long\n"); return; }
+        url[un] = args[un]; un++; }
+    url[un] = '\0';
+    const char *rest = args + un;
+    while (*rest == ' ') rest++;
+    if (*rest) {
+        static char fn[128];
+        uint32_t i = 0;
+        while (rest[i] && rest[i] != ' ' && i + 1 < sizeof(fn)) { fn[i] = rest[i]; i++; }
+        fn[i] = '\0';
+        file = fn;
+    }
+
+    ezos_console_write("fetch: ");
+    ezos_console_write(url);
+    ezos_console_write("\n");
+
+    http_result_t r;
+    int rc = http_fetch(url, g_fetch_buf, FETCH_BUF_SZ, 5000, &r);
+    if (rc != 0) {
+        ezos_console_write("fetch: ");
+        ezos_console_write(fetch_err(rc));
+        ezos_console_write("\n");
+        return;
+    }
+
+    ezos_console_write("HTTP ");
+    ezos_console_print_dec((uint32_t)r.status);
+    if (r.content_length) {
+        ezos_console_write(", content-length ");
+        ezos_console_print_dec(r.content_length);
+    }
+    if (r.chunked) ezos_console_write(", chunked");
+    if (r.redirects) {
+        ezos_console_write(", redirects ");
+        ezos_console_print_dec(r.redirects);
+    }
+    if (r.content_type[0]) {
+        ezos_console_write(", type ");
+        ezos_console_write(r.content_type);
+    }
+    ezos_console_write("\n");
+
+    if (file) {
+        if (fs_create_file(file, g_fetch_buf, r.body_len) == 0) {
+            ezos_console_write("saved ");
+            ezos_console_write(file);
+            ezos_console_write(" (");
+            ezos_console_print_dec(r.body_len);
+            ezos_console_write(" bytes)\n");
+        } else {
+            ezos_console_write("fetch: write failed: ");
+            ezos_console_write(file);
+            ezos_console_write("\n");
+        }
+        if (r.truncated)
+            ezos_console_write("note: response larger than buffer, saved truncated\n");
+        return;
+    }
+
+    /* 打到屏幕。HTML/JS 源码直接刷屏没意义，提示存文件。 */
+    if (h_ct_is_html(r.content_type)) {
+        ezos_console_print_dec(r.body_len);
+        ezos_console_write(" bytes of HTML. save it: fetch <url> <file>\n");
+        return;
+    }
+    ezos_console_write("--- ");
+    ezos_console_print_dec(r.body_len);
+    ezos_console_write(" bytes ---\n");
+    for (uint32_t i = 0; i < r.body_len; i++) ezos_console_putchar((char)g_fetch_buf[i]);
+    if (r.body_len == 0 || g_fetch_buf[r.body_len - 1] != '\n') ezos_console_write("\n");
+    if (r.truncated)
+        ezos_console_write("(truncated: response exceeds 32K buffer)\n");
+}

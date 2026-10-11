@@ -480,6 +480,8 @@ static const command_t commands[] = {
     {"dhcp",      cmd_dhcp},
     {"lookup",    cmd_lookup},
     {"dns",       cmd_dns},
+    {"fetch",     cmd_fetch},
+    {"wget",      cmd_fetch},
     {0, 0}
 };
 

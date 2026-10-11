@@ -2060,6 +2060,132 @@ out:
     return rc;
 }
 
+/* ==================================================================
+ * 内核内部 TCP 客户端 API（不经 sockcall）
+ *
+ * 为什么不用 net_sockcall：SC_SENDTO/SC_RECVFROM 开头是 uptr_ok()，
+ * 即用户指针校验。内核自己用（shell 是 task 0、http.c 跑在内核态）传
+ * 的是内核地址，会被判非法直接 -1。所以这里另开一套直接操作 sock_t
+ * 的入口，**不做指针校验**——代价是调用方必须自己保证指针有效，
+ * 因此只给内核内部模块用，不导出到用户态 ABI。
+ *
+ * 与 sockcall 的差别仅此一项，连接/发送/接收的语义完全一致
+ * （含"一时刻只允许一段未确认"这条硬约束）。
+ * ================================================================== */
+
+/* 发完一段、等着对方 ACK 的条件：rtx 清空即已确认。
+ * 半关闭（对端已 FIN，我们还能发）也算可以继续。 */
+static int cond_sent(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->rtx_len == 0 ||
+           s->state == TS_FIN_WAIT_1 || s->state == TS_FIN_WAIT_2;
+}
+
+int net_tcp_connect(uint32_t dst_ip_be, uint16_t port, uint32_t timeout_ms) {
+    if (!build_ready()) return -1;
+    if (dst_ip_be == 0 || port == 0) return -1;
+
+    sock_t *s = sock_alloc(SOCK_TYPE_TCP, 0);
+    if (!s) return -1;
+
+    /* 临时端口：从游标往上找第一个未被占用的（与 SC_CONNECT 同策略）。
+     * 失败路径统一走 fail，直接 sock_free —— 不能留半初始化的表项，
+     * 否则 sock_alloc 的懒回收会把 owner_pid=0（内核）当常驻条目留着。 */
+    uint16_t local = 0;
+    for (int tries = 0; tries < 200 && local == 0; tries++) {
+        uint16_t cand = g_ephemeral++;
+        if (cand < 40000u) g_ephemeral = 40000u;
+        int conflict = 0;
+        for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
+            if (g_socks[i].used && g_socks[i].local_port == cand) { conflict = 1; break; }
+        if (!conflict) local = cand;
+    }
+    if (local == 0) { sock_free(s); return -1; }
+    if (!tcp_bufs(s)) { sock_free(s); return -1; }
+
+    s->local_port = local;
+    s->peer_ip   = dst_ip_be;
+    s->peer_port = port;
+    s->got_fin   = 0;
+    s->rx_r = s->rx_w = 0;
+    s->rcv_nxt = 0;
+    s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;   /* ISN：教学取舍 */
+    s->snd_una = s->snd_nxt;
+    s->state = TS_SYN_SENT;
+    s->syn_unacked = 1;
+
+    /* 先解析对端 MAC（可能睡等 ARP reply）再起重传定时器并发 SYN：
+     * 顺序反了会让定时器在 MAC 还没解析完时就白跑一趟重传。 */
+    if (arp_resolve(s->peer_ip, 3000) == 0) { sock_free(s); return -1; }
+    s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+    s->rtx_tries = 0;
+    {
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt = seq + 1;
+        tcp_send_seg_ex(s, TCP_SYN, 0, 0, seq);
+    }
+
+    if (!wait_cond(cond_connected, s, timeout_ms)) { sock_free(s); return -1; }
+    return (int)(s - g_socks);
+}
+
+int net_tcp_send(int sid, const void *buf, uint32_t len, uint32_t timeout_ms) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (!s || !buf || len == 0) return -1;
+    if (s->type != SOCK_TYPE_TCP) return -1;
+    if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    uint32_t sent = 0;
+    while (sent < len) {
+        /* 无滑动窗口：上一段没被 ACK 就必须等，否则 rtx 缓冲不够用 */
+        if (s->rtx_len != 0) {
+            if (!wait_cond(cond_sent, s, timeout_ms)) return -1;
+            if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
+        }
+        uint32_t n = len - sent;
+        if (n > TCP_RTX_BUF) n = TCP_RTX_BUF;
+        if (!s->rtx && !tcp_bufs(s)) return -1;
+        for (uint32_t k = 0; k < n; k++) s->rtx[k] = p[sent + k];
+        s->rtx_len = n;
+        /* 先推进 snd_nxt 再发送：段一上线 IRQ 可能立刻带回 ACK，
+         * 那时 snd_nxt 若还是旧值，后续 ACK/重传全用错序号 */
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt += n;
+        if (tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, s->rtx, n, seq) != 0) {
+            s->rtx_len = 0;                  /* 回滚，不留残状态 */
+            s->snd_nxt = seq;
+            return -1;
+        }
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+        s->rtx_tries = 0;
+        sent += n;
+    }
+    return (int)sent;
+}
+
+int net_tcp_recv(int sid, void *buf, uint32_t maxlen, uint32_t timeout_ms) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (!s || !buf || maxlen == 0) return -1;
+    if (s->type != SOCK_TYPE_TCP) return -1;
+
+    if (!cond_tcp(s) && !wait_cond(cond_tcp, s, timeout_ms)) return -1;
+
+    uint8_t *out = (uint8_t *)buf;
+    uint32_t n = 0;
+    while (n < maxlen && s->rx_r != s->rx_w) {
+        out[n++] = s->rx[s->rx_r];
+        s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+    }
+    /* n==0 且条件满足 => 对端 FIN 且环已空 = 正常 EOF（不是错误） */
+    return (int)n;
+}
+
+void net_tcp_close(int sid) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (s && s->type == SOCK_TYPE_TCP) tcp_close(s);
+}
+
 uint32_t net_udp_rx(void)      { return g_udp_rx; }
 uint32_t net_udp_tx(void)      { return g_udp_tx; }
 uint32_t net_tcp_rx(void)      { return g_tcp_rx; }

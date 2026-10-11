@@ -60,7 +60,7 @@ LAYERS = {
              "fsck"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
-    "net":  ["netapp", "dhcp", "dns"],
+    "net":  ["netapp", "dhcp", "dns", "fetch"],
     "gui":  ["vi", "vi_color", "uefi3", "exitmode"],
     # corrupt：故意把盘改坏后断言内核不卡死（6 FS，黄金盘 + 随机翻位 +
     # 定向损坏，约 45 分钟）
