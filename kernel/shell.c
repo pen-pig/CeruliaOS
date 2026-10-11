@@ -482,6 +482,7 @@ static const command_t commands[] = {
     {"dns",       cmd_dns},
     {"fetch",     cmd_fetch},
     {"wget",      cmd_fetch},
+    {"htmltest",  cmd_htmltest},
     {0, 0}
 };
 
@@ -1124,6 +1125,8 @@ static void cmd_help(const char *args) {
     help_line("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
     help_line("  ps - list tasks (pid/state/switches)\n");
     help_line("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
+    help_line("  fetch <url> [file] - HTTP GET (wget is an alias)\n");
+    help_line("  htmltest [url] - parse a page and print the layout to serial\n");
     help_line("  help <cmd> - detailed help for a command\n");
 }
 
