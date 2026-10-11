@@ -482,6 +482,7 @@ static const command_t commands[] = {
     {"dns",       cmd_dns},
     {"fetch",     cmd_fetch},
     {"wget",      cmd_fetch},
+    {"htmltest",  cmd_htmltest},
     {0, 0}
 };
 
@@ -893,8 +894,17 @@ static void shell_redraw_line(void) {
     input_rows_used = rows;
 }
 
-void shell_run(void) {
+/* 开场横幅。抽成函数是因为它有两个调用点：shell 启动，以及从图形
+ * 桌面退回文本模式（cmd_desktop -> gw_start 返回后）。后者不能只是
+ * 清屏 —— 满屏图形忽然变空、只剩一个提示符，用户没法确认自己到底是
+ * 回到了 shell 还是界面崩了。 */
+static void shell_banner(void)
+{
     terminal_writestring("EZOS Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
+}
+
+void shell_run(void) {
+    shell_banner();
     shell_prompt();
 
     cmd_pos = 0;
@@ -1124,6 +1134,8 @@ static void cmd_help(const char *args) {
     help_line("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
     help_line("  ps - list tasks (pid/state/switches)\n");
     help_line("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
+    help_line("  fetch <url> [file] - HTTP GET (wget is an alias)\n");
+    help_line("  htmltest [url] - parse a page and print the layout to serial\n");
     help_line("  help <cmd> - detailed help for a command\n");
 }
 
@@ -2035,7 +2047,10 @@ static void cmd_desktop(const char *args) {
     (void)args;
     terminal_initialize();
     gw_start();
+    /* 从桌面退回文本模式：重印横幅，而不是只留一个空屏 + 提示符。 */
     terminal_initialize();
+    terminal_scroll_reset();
+    shell_banner();
 }
 
 /* theme [n]: list or switch GUI theme (also selectable in Settings) */

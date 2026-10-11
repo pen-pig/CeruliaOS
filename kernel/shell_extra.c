@@ -41,6 +41,7 @@
 #include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
 #include "rust_bridge.h"    /* Rust / Zig 侧实现 */
 #include "mouse.h"          /* mouse_selftest / mouse_protocol / 指针状态 */
+#include "webview.h"        /* wv_parse_mem / wv_dump（htmltest 自检） */
 
 /* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
 static const char *ips_of(uint32_t be);
@@ -2383,6 +2384,21 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "httpd") == 0) {
         return "httpd - serve one HTTP request on port 80 (30s timeout)\n  usage: httpd";
     }
+    if (x_strcasecmp(cmd, "fetch") == 0 || x_strcasecmp(cmd, "wget") == 0) {
+        return "fetch|wget <url> [file] - HTTP GET and print or save\n"
+               "  usage: fetch http://example.com/\n"
+               "         fetch http://example.com/ page.html\n"
+               "  HTTPS is NOT supported and is never silently downgraded.\n"
+               "  HTML bodies are not dumped to the screen; save them first.";
+    }
+    if (x_strcasecmp(cmd, "htmltest") == 0) {
+        return "htmltest <file> - parse a local HTML file and dump the layout\n"
+               "  usage: htmltest PAGE.HTML\n"
+               "  Prints title / node count / line count and every laid-out\n"
+               "  line (y, indent, style, href, text) to the serial console.\n"
+               "  Runs the same parser and layout as the browser window, so\n"
+               "  E2E can assert on layout instead of squinting at pixels.";
+    }
     if (x_strcasecmp(cmd, "help") == 0) {
         return "help [cmd] - show this help or detailed help for a command\n  usage: help\n         help df";
     }
@@ -2914,4 +2930,105 @@ void cmd_fetch(const char *args) {
     if (r.body_len == 0 || g_fetch_buf[r.body_len - 1] != '\n') ezos_console_write("\n");
     if (r.truncated)
         ezos_console_write("(truncated: response exceeds 32K buffer)\n");
+}
+
+/* ===================== htmltest：HTML 解析/排版自检 =====================
+ *
+ * 为什么要有这个命令：浏览器的解析与排版链路（Rust html.rs + webview.c）
+ * 平时只能靠肉眼看窗口 —— 而"页面有字但断行错了""实体没展开""标题没抓到"
+ * 这几类错在屏幕上**看着都像正常的网页**，人眼分辨不出来。要把它们变成
+ * 能断言的东西，就得把内部结果打到串口上。
+ *
+ * 走本地文件而不是 URL：E2E 里网络一挂，"解析没跑起来"和"网不通"会长得
+ * 一模一样。解析是纯计算，不该依赖网络。
+ */
+/* 判断 args 的**第一个词**（到空格为止）是否等于 word。
+ *
+ * 不能直接 x_strcasecmp(args, word)：那是全串比较，"sample 1" 跟
+ * "sample" 永远不等，于是所有子命令都会掉进"当成文件名"的分支 ——
+ * 症状是 `htmltest sample 1` 回一句 "cannot read sample"，看着像文件
+ * 不存在，实际是分词根本没做。子命令带参数时必须先切词。 */
+static int arg_is(const char *args, const char *word)
+{
+    while (*args == ' ') args++;
+    int i = 0;
+    while (word[i] && args[i] && x_tolower(args[i]) == x_tolower(word[i])) i++;
+    if (word[i]) return 0;
+    return args[i] == '\0' || args[i] == ' ';
+}
+
+void cmd_htmltest(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("usage: htmltest <file>|sample <n>\n");
+        ezos_console_write("  htmltest PAGE.HTL      parse a local file\n");
+        ezos_console_write("  htmltest sample <n>    parse a builtin sample (1..6)\n");
+        return;
+    }
+
+    /* 内建样本存在的理由：QMP sendkey 打不出 '<' '>' '\\' 这类字符
+     *（未映射的键名会被静默丢弃），靠 write 命令把 HTML 送进 guest
+     * 根本不成立 —— 等了一串 '>' 一个没进去，却会显示成"解析器不认标签"。
+     * 样本写在核心里，才能在没有网络、没有特殊键的情况下钉住解析语义。 */
+    if (arg_is(args, "sample")) {
+        const char *p = args + 6;
+        while (*p == ' ') p++;
+        if (*p < '0' || *p > '9') {
+            ezos_console_write("htmltest: sample needs a number (1..6)\n");
+            return;
+        }
+        int n = 0;
+        while (*p >= '0' && *p <= '9') {
+            /* 钳制：位数再多也不要溢出成负数，那样 html_sample(负数)
+             * 会掉进 "n < 1" 之外的路径 someday。 */
+            if (n > 1000) { n = 1001; break; }
+            n = n * 10 + (*p - '0');
+            p++;
+        }
+        const char *s = html_sample(n);
+        if (!s) {
+            ezos_console_write("htmltest: no such sample (1..");
+            ezos_console_print_dec((uint32_t)html_sample_count());
+            ezos_console_write(")\n");
+            return;
+        }
+        int rc = wv_parse_mem(s, wv_strlen(s), "sample");
+        if (rc != 0) {
+            ezos_console_write("htmltest: parse failed rc=");
+            ezos_console_print_dec((uint32_t)rc);
+            ezos_console_write("\n");
+            return;
+        }
+        wv_dump("sample");
+        return;
+    }
+
+    /* 文件名分支：args 前面可能还有空格（arg_is 内部跳过了，这里要
+     * 自己再跳一次），否则 " htmltestA.HTML" 会把路径首字节读成空格。 */
+    while (*args == ' ') args++;
+    char path[128];
+    uint32_t n = 0;
+    while (args[n] && args[n] != ' ' && n + 1 < sizeof(path)) {
+        path[n] = args[n]; n++;
+    }
+    path[n] = '\0';
+
+    int got = fs_read_file(path, g_fetch_buf, FETCH_BUF_SZ);
+    if (got <= 0) {
+        ezos_console_write("htmltest: cannot read ");
+        ezos_console_write(path);
+        ezos_console_write("\n");
+        return;
+    }
+
+    /* 复用抓取缓冲：≥4KB 的缓冲按纪律必须 static，这里不另开一块，
+     * 两个 32KB 的 .bss 纯为了一个自检命令不值。 */
+    int rc = wv_parse_mem(g_fetch_buf, (uint32_t)got, path);
+    if (rc != 0) {
+        ezos_console_write("htmltest: parse failed rc=");
+        ezos_console_print_dec((uint32_t)rc);
+        ezos_console_write("\n");
+        return;
+    }
+    wv_dump(path);
 }
