@@ -565,28 +565,8 @@ void gfx_load_font(void) {
         }
     }
 }
-/* 裁剪矩形：所有绘制都过 gfx_putpixel / gfx_fill_rect，所以裁剪只需要在
- * 这两处生效（浏览器滚动页面时必需 —— 否则文字会画到窗口边框外面）。
- * clip_w <= 0 表示不裁剪。 */
-static int clip_x, clip_y, clip_w, clip_h;
-
-void gfx_set_clip(int x, int y, int w, int h) {
-    clip_x = x; clip_y = y; clip_w = w; clip_h = h;
-}
-
-void gfx_get_clip(int *x, int *y, int *w, int *h) {
-    if (x) *x = clip_x;
-    if (y) *y = clip_y;
-    if (w) *w = clip_w;
-    if (h) *h = clip_h;
-}
-
 void gfx_putpixel(int x, int y, uint8_t color) {
     if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) return;
-    if (clip_w > 0) {
-        if (x < clip_x || x >= clip_x + clip_w) return;
-        if (y < clip_y || y >= clip_y + clip_h) return;
-    }
     if (gfx_bpp == 4) {
         /* U3: 32bpp direct color, scanline stride aware */
         ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gfx_palette32[color];
@@ -597,34 +577,10 @@ void gfx_putpixel(int x, int y, uint8_t color) {
     }
 }
 
-/* 8bpp 下按行整段写：fill_rect 是最热的绘制调用（浏览器刷背景、窗口
- * 边框、桌面全屏都走它），逐像素 putpixel 在 TCG 下慢一个数量级。 */
 void gfx_fill_rect(int x, int y, int w, int h, uint8_t color) {
-    if (clip_w > 0) {
-        if (x < clip_x) { w += x - clip_x; x = clip_x; }
-        if (y < clip_y) { h += y - clip_y; y = clip_y; }
-        if (x + w > clip_x + clip_w) w = clip_x + clip_w - x;
-        if (y + h > clip_y + clip_h) h = clip_y + clip_h - y;
-    }
-    if (w <= 0 || h <= 0) return;
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > GFX_W) w = GFX_W - x;
-    if (y + h > GFX_H) h = GFX_H - y;
-    if (w <= 0 || h <= 0) return;
-
     for (int j = 0; j < h; j++) {
-        if (gfx_bpp == 4) {
-            uint32_t *row = (uint32_t*)gfx_fb + (uint32_t)(y + j) * gfx_stride;
-            uint32_t c32 = gfx_palette32[color];
-            for (int i = 0; i < w; i++) row[x + i] = c32;
-        } else if (gfx_bpp == 2) {
-            uint16_t *row = (uint16_t*)gfx_fb + (uint32_t)(y + j) * gfx_stride;
-            uint16_t c16 = gfx_palette16[color];
-            for (int i = 0; i < w; i++) row[x + i] = c16;
-        } else {
-            uint8_t *row = gfx_fb + (uint32_t)(y + j) * gfx_stride;
-            for (int i = 0; i < w; i++) row[x + i] = color;
+        for (int i = 0; i < w; i++) {
+            gfx_putpixel(x + i, y + j, color);
         }
     }
 }
@@ -656,69 +612,6 @@ void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
         x += 8;
         s++;
     }
-}
-
-/* ---- UTF-8 文本 ----
- *
- * 内置 8x8 字模（VGA ROM 8x8 / builtin_font）只有 ASCII，非 ASCII 位置在
- * gfx_load_font 里被清零。网页正文绝大多数是非 ASCII（中文网页全是中文），
- * 直接当字节画会得到一串"什么都看不见的空白"——用户看到的是**页面加载了
- * 但整页空白**，完全无法与"网络没通"区分。
- *
- * 所以这里把每个非 ASCII 码点画成一个 5x5 的空心方块（豆腐块），宽度仍
- * 按 8px 算：至少能看出"这里有个字，排版没崩"。真要显示汉字需要嵌入
- * 16x16 点阵字库，那是另一个量级的工作（字库本身几百 KB）。
- */
-static void gfx_draw_tofu(int x, int y, uint8_t fg, uint8_t bg) {
-    /* 背景：只填字模那 8x8 的框，避免破坏裁剪外的相邻内容 */
-    gfx_fill_rect(x, y, 8, 8, bg);
-    for (int i = 1; i < 6; i++) {
-        gfx_putpixel(x + i, y + 1, fg);
-        gfx_putpixel(x + i, y + 6, fg);
-        gfx_putpixel(x + 1, y + i, fg);
-        gfx_putpixel(x + 6, y + i, fg);
-    }
-}
-
-/* 与 Rust 的 utf8_seq_len 保持一致（非法首字节按 1 走，画成豆腐块） */
-static uint32_t gfx_seq_len(const uint8_t *s, uint32_t i, uint32_t n) {
-    uint8_t b = s[i];
-    if (b < 0x80) return 1;
-    if (b == 0xC0 || b == 0xC1 || b >= 0xF5) return 1;
-    uint32_t l = (b & 0xE0) == 0xC0 ? 2u : (b & 0xF0) == 0xE0 ? 3u : 4u;
-    if (i + l > n) return 1;
-    for (uint32_t k = 1; k < l; k++)
-        if ((s[i + k] & 0xC0) != 0x80) return 1;
-    return l;
-}
-
-int gfx_text_width_utf8(const char *sp, uint32_t n) {
-    const uint8_t *s = (const uint8_t *)sp;
-    uint32_t i = 0;
-    int w = 0;
-    while (i < n) {
-        w += 8;
-        i += gfx_seq_len(s, i, n);
-    }
-    return w;
-}
-
-int gfx_draw_text_utf8(int x, int y, const char *sp, uint32_t n,
-                       uint8_t fg, uint8_t bg) {
-    const uint8_t *s = (const uint8_t *)sp;
-    uint32_t i = 0;
-    while (i < n) {
-        uint32_t l = gfx_seq_len(s, i, n);
-        if (l == 1) {
-            if (s[i] >= 0x20 && s[i] < 0x7F) gfx_draw_char(x, y, (char)s[i], fg, bg);
-            else gfx_draw_tofu(x, y, fg, bg);   /* 控制字符也不该画出字形 */
-        } else {
-            gfx_draw_tofu(x, y, fg, bg);
-        }
-        x += 8;
-        i += l;
-    }
-    return x;
 }
 
 /* 按字符画点阵：每个 8x8 字形按 scale 倍放大画出（scale>=1）。

@@ -9,7 +9,7 @@
   5. 开始菜单打开（帧差断言）-> "返回终端" -> 回切 720x400 文本 shell
   6. 回切后 shell 仍可用（ver 命令 OCR）+ 全程无 "kernel panic"
 
-前置：uefi/esp/kernel.bin（与 ../kernel.bin 同大小、512 对齐、<= 507904）
+前置：uefi/esp/kernel.bin（与 ../kernel.bin 同大小、512 对齐、不超 KERNEL_BUDGET）
      + disk.vhd（拷为本测试私有副本，避免污染基线盘）。
 端口 4464（端口每脚本唯一，见 tests/README.md）。
 用法：python tests/test_uefi3.py   （退出码 0 = 全通过）
@@ -27,6 +27,10 @@ from ezos_env import (qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe,  # noqa: E402
                       kernel_version)
 
 VER = kernel_version() or "0.0.0"   # 版本号取自 kernel/version.h
+
+# ESP 里的内核体积预算（字节，含 512 对齐余量）。ESP 实际有 34MB，
+# 这里卡的是"内核别悄悄变大"，所以加实质功能时要显式上调这个数。
+KERNEL_BUDGET = 640 * 1024
 
 import json
 import os
@@ -197,12 +201,17 @@ def main():
         print("MISSING %s - build kernel/EFI first (see uefi/build.sh)"
               % ", ".join(missing))
         return 2
-    # 镜像大小现在是动态的，只能校验"非空 + 512 对齐 + 不超 496KB 上限"，
-    # 再和仓库根的 kernel.bin 比对，防止 esp 里留着上一轮的陈旧内核。
+    # 镜像大小是动态的，校验"非空 + 512 对齐 + 不超预算上限"，再和仓库根的
+    # kernel.bin 比对，防止 esp 里留着上一轮的陈旧内核。
+    #
+    # **KERNEL_BUDGET 是人为预算，不是物理限制**：ESP 有 34MB（FAT32 要
+    # >= 65525 簇才名副其实），装得下几十兆的内核。这个数字的作用是"内核
+    # 不该悄悄膨胀"，所以内核加了实质功能（浏览器解析+排版 +36KB）就该
+    # 显式上调，而不是把测试改成永远通过 —— 后者等于把闸门拆了。
     ksz = os.path.getsize(KERNEL_BIN)
-    if ksz == 0 or ksz % 512 != 0 or ksz > 507904:
-        print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= 507904)"
-              % ksz)
+    if ksz == 0 or ksz % 512 != 0 or ksz > KERNEL_BUDGET:
+        print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= %d)"
+              % (ksz, KERNEL_BUDGET))
         return 2
     root_k = os.path.join(ROOT, "kernel.bin")
     if os.path.isfile(root_k) and os.path.getsize(root_k) != ksz:

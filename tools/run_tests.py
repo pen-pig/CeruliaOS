@@ -61,7 +61,7 @@ LAYERS = {
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns", "fetch"],
-    "gui":  ["vi", "vi_color", "uefi3", "exitmode"],
+    "gui":  ["vi", "vi_color", "uefi3", "exitmode", "html"],
     # corrupt：故意把盘改坏后断言内核不卡死（6 FS，黄金盘 + 随机翻位 +
     # 定向损坏，约 45 分钟）
     "deep": ["step7_sock", "step7_tcp", "corrupt"],
@@ -75,7 +75,12 @@ LAYERS = {
     # 内核只 fninit 不开 CR4.OSFXSR，撞上就是 #UD（已实测踩过）
     # vmx：VMware 配置闸门（tools/check_vmx.py）——缺 virtualHW.version /
     # config.version 时 VMware 26 只给一句 "Internal error"，极难定位
-    "static": ["check_stack", "stack", "encoding", "help", "check_cpu", "check_vmx"],
+    # html：HTML 解析/断行对拍（tests/test_html_probe.py）——生产 Rust
+    # 实现 vs 独立 Python 参考实现逐字节比。放在 static 是因为它只编译
+    # 一个宿主探针、跑几十条向量，几秒钟，不碰 QEMU。改 html.rs / ref_html.py
+    # 必须跑它，否则"两边一起错"没人发现。
+    "static": ["check_stack", "stack", "encoding", "help", "check_cpu",
+               "check_vmx", "html"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。
@@ -107,6 +112,11 @@ WATCH = [
     # exitmode 守的是"进桌面只有 desktop 一条路"：shell.c 的 cmd_exit /
     # kernel.c 的主循环一改就可能把隐式通道放回来
     ("exitmode", "gui"),
+    # 浏览器链路：解析在 Rust、排版在 webview.c，两边任一改都可能红。
+    # "html" 走 static（宿主对拍，几秒），webview/gfxwin 要真跑 QEMU。
+    ("html.rs", "static"), ("ref_html", "static"),
+    ("webview", "gui html"), ("browser", "gui"), ("http.c", "net gui"),
+    ("rust_bridge", "static"),
 ]
 
 # 单项超时（秒）。慢的（网络真对拍、GUI 像素）单独放宽。

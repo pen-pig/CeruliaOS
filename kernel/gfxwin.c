@@ -17,8 +17,6 @@
 
 #include "gfx.h"
 #include "port.h"
-#include "webview.h"
-#include "keyboard.h"
 
 #define TERM_ROWS 24
 #define TERM_COLS 80
@@ -2349,10 +2347,32 @@ static void br_draw_cactus(int x, int gy, int kind)
     }
 }
 
-static int dino_active;             /* Dino 正在跑（窗口聚焦时） */
-
-static void dino_draw(int px0, int py0, int pw, int ph)
+static void browser_draw(gw_window_t *w)
 {
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+
+    /* ---- Chrome 风格工具栏 ---- */
+    gw_fill(ox, oy, iw, BR_TOOLBAR_H, 0xDEE1E6u);
+    gfx_draw_text(ox + 6, oy + 8, "<", 0x08, (uint8_t)0x0F);
+    gfx_draw_text(ox + 20, oy + 8, ">", 0x0F, (uint8_t)0x0F);
+    int ab_w = iw - 64;
+    if (ab_w > 40) {
+        gw_fill(ox + 36, oy + 4, ab_w, 16, 0xFFFFFFu);
+        gw_frame(ox + 36, oy + 4, ab_w, 16, 0xC8C8C8u);
+        /* 小锁（https 意象） */
+        gw_fill(ox + 42, oy + 11, 6, 5, 0x535353u);
+        gw_fill(ox + 43, oy + 8, 4, 1, 0x535353u);
+        gw_fill(ox + 43, oy + 9, 1, 2, 0x535353u);
+        gw_fill(ox + 46, oy + 9, 1, 2, 0x535353u);
+        gfx_draw_text(ox + 52, oy + 8, "ezos://dino", 0x00, 0x0F);
+    }
+    gfx_draw_text(ox + iw - 20, oy + 8, "R", 0x08, (uint8_t)0x0F);
+    gw_fill(ox, oy + BR_TOOLBAR_H, iw, 1, 0xB8BCC4u);
+
+    /* ---- 页面区（白底） ---- */
+    int px0 = ox, py0 = oy + BR_TOOLBAR_H + 1;
+    int pw = iw, ph = ih - BR_TOOLBAR_H - 1;
     br_page_w = pw;
     gw_fill(px0, py0, pw, ph, 0xFFFFFFu);
     int gy = py0 + ph - 24;            /* 地面线（脚底基准） */
@@ -2361,7 +2381,7 @@ static void dino_draw(int px0, int py0, int pw, int ph)
      * dt 上限 250ms：慢渲染（如 QEMU TCG 单帧 >16ms）允许每帧追赶，
      * 游戏速度保持墙钟正确；长时间暂停恢复也最多追 250ms（无跳变） */
     uint32_t now = g_pit_ticks;
-    if (br_state == BR_STATE_RUN && dino_active) {
+    if (br_state == BR_STATE_RUN && w->focused) {
         uint32_t dt = now - br_last_ms;
         if (dt > 250) dt = 250;
         while (dt >= 16) { br_step(); dt -= 16; if (br_state != BR_STATE_RUN) break; }
@@ -2414,8 +2434,9 @@ static void dino_draw(int px0, int py0, int pw, int ph)
     }
 }
 
-static void dino_key(int key)
+static void browser_key(gw_window_t *w, int key)
 {
+    (void)w;
     if (key == ' ' || key == KEY_UP || key == 'w' || key == 'W' || key == '\n') {
         br_action();
     } else if (key == KEY_DOWN || key == 's' || key == 'S') {
@@ -2426,82 +2447,11 @@ static void dino_key(int key)
     }
 }
 
-static void dino_click(void)
-{
-    br_action();
-}
-
-/* ==================================================================
- * 浏览器窗口（真正的网页浏览器）
- *
- * 窗口 = Chrome 风格工具栏（后退 / 前进 / 地址栏 / 状态）+ 页面区。
- * 渲染全在 webview.c：那边已经把"抓 -> 解析 -> 排版"做完并缓存成行，
- * 这里只负责按滚动偏移画出来、把点击/按键转成 wv_* 调用。
- *
- * `ezos://dino` 是内置页面（谷歌小恐龙），由上面那套 dino_* 代码渲染 ——
- * 保留它是因为它是目前唯一不需要网络的"能玩的东西"，但它不再是浏览器
- * 的全部：默认首页是真网页。
- * ================================================================== */
-static int br_bar_x, br_bar_y, br_bar_w, br_bar_h;
-
-static void browser_draw(gw_window_t *w)
-{
-    int ox = gw_ox(w), oy = gw_oy(w);
-    int iw = w->inner_w, ih = w->inner_h;
-
-    /* ---- 工具栏 ---- */
-    gw_fill(ox, oy, iw, BR_TOOLBAR_H, WV_C_TOOLBAR);
-    wv_draw_bar(ox, oy, iw, BR_TOOLBAR_H, &br_bar_x, &br_bar_y,
-                &br_bar_w, &br_bar_h);
-
-    /* ---- 页面区 ---- */
-    int py0 = oy + BR_TOOLBAR_H;
-    int ph = ih - BR_TOOLBAR_H;
-    if (ph < 20) ph = 20;
-    dino_active = wv_is_dino_url();
-    if (dino_active) {
-        dino_draw(ox, py0, iw, ph);
-    } else {
-        wv_draw_page(ox, py0, iw, ph);
-    }
-}
-
-static void browser_key(gw_window_t *w, int key)
-{
-    (void)w;
-    if (wv_is_dino_url()) {
-        /* Dino 页：地址栏聚焦时先给地址栏，否则全部交给游戏 */
-        if (!wv_bar_has_focus()) { dino_key(key); return; }
-    }
-    if (wv_bar_has_focus()) { wv_bar_key(key); return; }
-    if (key == KEY_LEFT || key == KEY_RIGHT) {
-        /* 左右键留给历史（上下键给滚动） */
-        if (key == KEY_LEFT) { wv_back(); return; }
-        wv_forward();
-        return;
-    }
-    wv_page_key(key);
-}
-
 static void browser_click(gw_window_t *w, int lx, int ly)
 {
-    (void)w;
-    if (ly < BR_TOOLBAR_H) {
-        /* 工具栏：后退 / 前进 / 地址栏 */
-        if (lx >= 2 && lx < 14) { wv_back(); return; }
-        if (lx >= 15 && lx < 27) { wv_forward(); return; }
-        if (lx >= br_bar_x && lx < br_bar_x + br_bar_w) wv_bar_set_focus(1);
-        return;
-    }
-    if (wv_is_dino_url()) { dino_click(); return; }
-    /* 页面区：命中链接就跟随 */
-    uint16_t href = wv_hit_link(lx, ly + wv_scroll_get());
-    if (href) wv_follow(href);
-}
-
-static void browser_mousedown(gw_window_t *w, int lx, int ly)
-{
-    (void)w; (void)lx; (void)ly;
+    (void)w; (void)lx;
+    if (ly > BR_TOOLBAR_H)             /* 页面区点击 = 跳跃/开始/重开 */
+        br_action();
 }
 
 /* ==================================================================
@@ -2602,7 +2552,7 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_SETTINGS: ww = gw_scale_x(340); wh = gw_scale_y(300); break;
     case GW_APP_ABOUT:    ww = gw_scale_x(320); wh = gw_scale_y(180); break;
     case GW_APP_PAINT:    ww = PT_TB_W + PT_CW + 8; wh = PT_CH + GW_TITLE_H + 7; break;
-    case GW_APP_BROWSER:  ww = gw_scale_x(500); wh = gw_scale_y(360); break;
+    case GW_APP_BROWSER:  ww = gw_scale_x(440); wh = gw_scale_y(320); break;
     default: break;
     }
     gw_window_t *w = gw_create(title, wx, wy, ww, wh, flags);
@@ -2650,7 +2600,6 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_BROWSER:
         w->draw = browser_draw; w->key = browser_key;
         w->click = browser_click;
-        w->mousedown = browser_mousedown;
         break;
     default:
         break;

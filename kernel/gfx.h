@@ -33,18 +33,9 @@ void gfx_load_font(void);       // 从 VGA 字体 ROM 读取 8x8 字体
 void gfx_putpixel(int x, int y, uint8_t color);
 void gfx_fill_rect(int x, int y, int w, int h, uint8_t color);
 void gfx_draw_rect(int x, int y, int w, int h, uint8_t color);
-/* 裁剪矩形：所有绘制都生效（浏览器滚动页面必需，否则文字画到窗口外）。
- * gfx_set_clip(-1,-1,0,0) 取消裁剪。 */
-void gfx_set_clip(int x, int y, int w, int h);
-void gfx_get_clip(int *x, int *y, int *w, int *h);
 void gfx_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg);
 void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg);
 void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int scale);
-/* UTF-8 文本绘制：多字节序列画成占位方块（内置 8x8 字模只有 ASCII，
- * 真画不出汉字）。返回结束后的 x —— 调用方需要它算宽度。 */
-int  gfx_draw_text_utf8(int x, int y, const char *s, uint32_t n,
-                        uint8_t fg, uint8_t bg);
-int  gfx_text_width_utf8(const char *s, uint32_t n);   /* 显示宽度（像素） */
 void gfx_clear(uint8_t color);
 void gfx_menu(void);          // 图形界面菜单（原 shell.c cmd_gfx迁移）
 int gfx_eval(const char *s, int *ok); // 表达式求值器（图形计算器与 shell calc 共用）
