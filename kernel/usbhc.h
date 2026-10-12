@@ -26,8 +26,14 @@
 #define USBHC_UHCI  0u
 #define USBHC_EHCI  1u
 
-/* 统一端口表容量：UHCI 根口 + EHCI 根口，教学 OS 足够 */
-#define USBHC_MAX_PORTS 16
+/* 统一端口表容量：UHCI 根口 + EHCI 根口。
+ *
+ * **必须是两者上限之和**，不是拍脑袋的数：UHCI 规范最多 8 根口，
+ * EHCI 最多 16 根口，两者是独立控制器，总共可达 24。取 16 的话，
+ * 多控制器真机上超出的端口会被 `g_ports_n < USBHC_MAX_PORTS` 那个
+ * 循环条件静默丢弃 —— 枚举层看不到任何异常，只表现为"某个设备死活
+ * 不认出来"，而汇总日志还照打nu/ne，看不出丢了东西。 */
+#define USBHC_MAX_PORTS (8 + 16)
 
 /*
  * 一个"已连接端口"的句柄。枚举层（usbenum）拿它去做标准请求，

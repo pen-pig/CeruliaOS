@@ -25,6 +25,19 @@ const char *usbhc_name(uint8_t hc) {
     return (hc == USBHC_EHCI) ? "EHCI" : "UHCI";
 }
 
+/* 追加十进制表示，返回新的写入位置。内核无 sprintf。 */
+static int usbhc_put_dec(char *buf, int n, int lim, uint32_t v) {
+    char t[10];
+    int m = 0;
+    if (v == 0u) {
+        if (n < lim) buf[n++] = '0';
+        return n;
+    }
+    while (v && m < (int)sizeof(t)) { t[m++] = (char)('0' + v % 10u); v /= 10u; }
+    while (m && n < lim) buf[n++] = t[--m];
+    return n;
+}
+
 void usbhc_scan(void) {
     g_ports_n = 0;
 
@@ -56,28 +69,41 @@ void usbhc_scan(void) {
         g_ports_n++;
     }
 
+    /* 登记数与控制器实际口数应当一致。不一致说明表被截断了（容量不足或
+     * port_get 失败被跳过），必须打出来 —— 否则表现只是"某个设备不认"，
+     * 事后无从判断是设备没插还是我们丢了。 */
+    if (g_ports_n < nu + ne) {
+        char w[128];
+        int m = 0;
+        int wl = (int)sizeof(w) - 1;
+        const char *t = "USB-HC: WARNING port table truncated (";
+        while (*t && m < wl) w[m++] = *t++;
+        m = usbhc_put_dec(w, m, wl, (uint32_t)g_ports_n);
+        t = " of ";
+        while (*t && m < wl) w[m++] = *t++;
+        m = usbhc_put_dec(w, m, wl, (uint32_t)(nu + ne));
+        t = " dropped)";
+        while (*t && m < wl) w[m++] = *t++;
+        w[m] = 0;
+        dmesg_write(w);
+    }
+
     {
         char line[128];
         int n = 0;
         int lim = (int)sizeof(line) - 1;
         const char *s = "USB-HC: ";
         while (*s && n < lim) line[n++] = *s++;
-        /* 手写十进制（内核无 sprintf） */
-        if (g_ports_n == 0) {
-            if (n < lim) line[n++] = '0';
-        } else {
-            char t[8];
-            int m = 0;
-            uint32_t v = (uint32_t)g_ports_n;
-            while (v) { t[m++] = (char)('0' + v % 10); v /= 10; }
-            while (m && n < lim) line[n++] = t[--m];
-        }
+        /* 手写十进制（内核无 sprintf）。用同一个辅助函数，别再写
+         * `(char)('0' + (n > 9 ? 9 : n))` —— 那样 16 口会打成 "9"，
+         * 日志比不打印还误导。 */
+        n = usbhc_put_dec(line, n, lim, (uint32_t)g_ports_n);
         s = " connected port(s) (UHCI ";
         while (*s && n < lim) line[n++] = *s++;
-        if (n < lim) line[n++] = (char)('0' + (nu > 9 ? 9 : nu));
+        n = usbhc_put_dec(line, n, lim, (uint32_t)nu);
         s = " / EHCI ";
         while (*s && n < lim) line[n++] = *s++;
-        if (n < lim) line[n++] = (char)('0' + (ne > 9 ? 9 : ne));
+        n = usbhc_put_dec(line, n, lim, (uint32_t)ne);
         if (n < lim) line[n++] = ')';
         if (n < lim) line[n] = 0; else line[lim] = 0;
         dmesg_write(line);

@@ -98,6 +98,16 @@ static uint32_t g_io_sq_tail;
 static uint32_t g_io_cq_head;
 static uint8_t  g_io_cq_phase;
 
+/* 实际生效的队列深度（= min(编译期上限, 控制器 MQES)）。
+ *
+ * **必须与 AQA / CREATE_IO_SQ 写进去的值严格一致**：n_submit/n_complete
+ * 用它取模算 tail/head 环绕。一旦这里用编译期常量而控制器按 AQA 里的
+ * 实际深度判定，软件 tail 会越过控制器队列容量 -> SQ/CQ 错位、
+ * 完成项错乱。QEMU 的 MQES=0xFF 永远触发不到，只有真实控制器会踩。
+ * nvme_init 在建队列时赋值，用前必已就绪（g_ready 门控）。 */
+static uint32_t g_admin_depth = NV_ADMIN_DEPTH;
+static uint32_t g_io_depth    = NV_IO_DEPTH;
+
 /* 已认领的 namespace：ns 下标 -> NSID / 容量（扇区数，uint32 截断） */
 static uint32_t g_ns_nsid[NVME_MAX_NS];
 static uint32_t g_ns_sect[NVME_MAX_NS];
@@ -175,11 +185,22 @@ static int n_complete(volatile uint32_t *cq, uint32_t depth, uint32_t *head,
             uint16_t cid = (uint16_t)(dw3 & 0xFFFFu);
             if (res) *res = ce[0];
             if (status_out) *status_out = status;
-            /* 推进 head；绕回则翻转期望相位，并通知控制器回收该项 */
+            /* 推进 head；绕回则翻转期望相位，并通知控制器回收该项。
+             *
+             * **必须回收**：不敲 doorbell 的话控制器会一直以为该项没被取走，
+             * 之后所有完成项都堵在队列里，整条队列死锁。所以这里无条件推进。 */
             *head = *head + 1u;
             if (*head >= depth) { *head = 0; *phase = (uint8_t)(*phase ^ 1u); }
             nw(cq_db, *head);
-            if (cid != want_cid) return -1;            /* 乱序：fail closed */
+            if (cid != want_cid) {
+                /* 乱序完成：这一项已经被消费掉了（上面推进过），而它对应的
+                 * 命令状态就此永久丢失 —— 不能只返回 -1 让它看起来像"命令失败"。
+                 * 留一条日志，否则这种错在真机上表现为"偶发的一次读写失败"，
+                 * 事后无从追查。单命令在途时正常路径不会到这里。 */
+                dmesg_write("NVME: CQE cid mismatch (queue desync)");
+                if (status_out) *status_out = 0xFFFFFFFFu;
+                return -1;
+            }
             return (status == 0u) ? 0 : -1;
         }
         if ((uint32_t)(g_pit_ticks - t0) >= ms) {
@@ -200,9 +221,9 @@ static int n_admin(uint8_t opc, uint32_t nsid, uint64_t prp1,
     c[7] = (uint32_t)(prp1 >> 32);
     c[10] = cdw10;
     c[11] = cdw11;
-    uint16_t cid = n_submit((volatile uint32_t *)g_asq, NV_ADMIN_DEPTH,
+    uint16_t cid = n_submit((volatile uint32_t *)g_asq, g_admin_depth,
                             &g_sq_tail, NV_DB_BASE, c);
-    return n_complete((volatile uint32_t *)g_acq, NV_ADMIN_DEPTH, &g_cq_head,
+    return n_complete((volatile uint32_t *)g_acq, g_admin_depth, &g_cq_head,
                       &g_cq_phase, NV_DB_BASE + (uint32_t)(4u << g_dstrd),
                       cid, NV_ADMIN_MS, res, 0);
 }
@@ -233,10 +254,10 @@ static int n_io_sector(uint8_t ns, uint32_t lba, uint8_t *buffer, int write) {
     c[11] = 0;
     c[12] = 0u;                  /* CDW12[15:0] = NLB（0 基）-> 1 个块 */
 
-    uint16_t cid = n_submit((volatile uint32_t *)g_iosq, NV_IO_DEPTH,
+    uint16_t cid = n_submit((volatile uint32_t *)g_iosq, g_io_depth,
                             &g_io_sq_tail, g_db_sq1, c);
     uint32_t status = 0;
-    int r = n_complete((volatile uint32_t *)g_iocq, NV_IO_DEPTH, &g_io_cq_head,
+    int r = n_complete((volatile uint32_t *)g_iocq, g_io_depth, &g_io_cq_head,
                        &g_io_cq_phase, g_db_cq1, cid, NV_IO_MS, 0, &status);
     if (r != 0) {
         char line[128]; int n = 0; int lim = (int)sizeof(line) - 1;
@@ -434,6 +455,9 @@ int nvme_init(void) {
         nw64(NV_ASQ, (uint64_t)(unsigned long)g_asq);
         nw64(NV_ACQ, (uint64_t)(unsigned long)g_acq);
 
+        /* 软件侧的环绕深度必须与刚写进 AQA 的一致 */
+        g_admin_depth = adepth;
+
         g_sq_tail = 0; g_cq_head = 0; g_cq_phase = 1;       /* 期望相位从 1 起 */
         g_cid = 0;
 
@@ -511,6 +535,8 @@ int nvme_init(void) {
             dmesg_write("NVME: CREATE_IO_SQ failed, skip");
             break;
         }
+        /* 与上面写进 CREATE_IO_SQ 的 QSIZE 保持一致（此时控制器才认这条队列） */
+        g_io_depth = iodepth;
 
         uint32_t stride = 4u << g_dstrd;
         g_db_sq1 = NV_DB_BASE + 2u * stride;                 /* SQ1TDBL */

@@ -155,7 +155,18 @@ static int bot_command_retry(msc_dev_t *u, const uint8_t *cb, int cblen,
 
 /* ---------- SCSI 命令子集 ---------- */
 
-/* READ CAPACITY(10)：拿总扇区数与扇区大小（都来自设备，按不可信处理） */
+/* READ CAPACITY(10)：拿总扇区数与扇区大小（都来自设备，按不可信处理）。
+ *
+ * 两个 fail-closed 拒绝点，都必须在**这里**做，不能留给调用方夹紧：
+ *
+ *  1. last LBA == 0xFFFFFFFF 是规范规定的"容量未知"哨兵。`last + 1u`
+ *     会回绕成 0，若调用方再 `if (sectors < 1u) sectors = 1u`，一台容量
+ *     未知的盘就被注册成"1 个扇区"，读写出错还返回成功。
+ *  2. 块大小必须是 512。下面的读写全走 READ(10)/WRITE(10)，数据阶段固定
+ *     512 字节；设备报 4096（部分 USB SSD / 新 U 盘）时，按 4K 扇区算出的
+ *     sectors 与实际 LBA 差 8 倍 —— 容量映射错、BOT 相位错，会读/写坏
+ *     别的扇区却报成功。宁可整个设备不认。
+ */
 static int scsi_read_capacity(msc_dev_t *u, uint32_t *sectors, uint32_t *blksize) {
     uint8_t cb[10] = {0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t data[8];
@@ -166,6 +177,12 @@ static int scsi_read_capacity(msc_dev_t *u, uint32_t *sectors, uint32_t *blksize
                   | ((uint32_t)data[2] << 8)  |  (uint32_t)data[3];
     uint32_t bs   = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16)
                   | ((uint32_t)data[6] << 8)  |  (uint32_t)data[7];
+
+    /* 哨兵：容量未知。没有它，last+1u 回绕成 0。 */
+    if (last == 0xFFFFFFFFu) return -1;
+    /* 块大小只认 512（READ/WRITE(10) 数据阶段的硬约定） */
+    if (bs != 512u) return -1;
+
     *sectors  = last + 1u;               /* last LBA 是 0 基的最大合法 LBA */
     *blksize  = bs;
     return 0;
@@ -267,7 +284,10 @@ int usbmsc_init(void) {
             u->d = NULL;
             continue;
         }
-        /* 不可信上界夹紧：扇区大小只认 512（块层约定），总扇区数至少 1 */
+        /* scsi_read_capacity 已经在函数里拒绝了容量未知哨兵与非 512 块，
+         * 走到这里 blksize 必为 512 且 sectors >= 1。下面两行只是纵深
+         * 防御（万一将来有人放宽上面的检查），**不能**当成把非法值
+         * "修正"成合法值的手段 —— 夹紧成 1 扇区恰恰是原来那个 bug。 */
         if (blksize == 0u) blksize = 512u;
         if (sectors < 1u) sectors = 1u;
         u->sectors = sectors;

@@ -381,9 +381,16 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     }
 
     /* 取数据阶段实际长度（control/status dword bit0-10）并拷回（IN） */
-    /* UHCI 实际长度字段同样编码为 length-1；0x7FF 表示零字节。 */
+    /* UHCI 实际长度字段同样编码为 length-1；0x7FF 表示零字节。
+     *
+     * blen==0 时**根本没有 DATA TD**：SETUP 直接链到 STATUS(TD2)，
+     * 于是 s1 就是 STATUS TD 的 dword，其低 11 位是状态码而非长度。
+     * 照样按"length-1"去解读，会把 STATUS 的位模式读成"传了 al 个字节"
+     * —— 无数据阶段的控制传输（如 SET_ADDRESS）会凭空报actlen>=1。
+     * 对照 EHCI侧 ehci.c 是用 `if (blen > 0)` 包住的。 */
     uint32_t al_field = s1 & 0x7FFu;
-    int al = (al_field == 0x7FFu) ? 0 : (int)al_field + 1;
+    int al = (blen <= 0) ? 0
+           : ((al_field == 0x7FFu) ? 0 : (int)al_field + 1);
     if (actlen) *actlen = al;
     if (dir_in && buf && al > 0) {
         int n = al; if (n > blen) n = blen;          /* 上界保护 */
@@ -400,8 +407,8 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
  *  - DATA toggle 必须软件维护（UHCI TD token bit19），且**只有真正收到数据
  *    才翻转**：NAK/零长度传输不算完成一次数据包，翻了就会与设备失步，
  *    表现为"第一次能读到报告，之后永远读不到"。
- *  - 轮询窗口 UHCI_INTR_TO_MS（6ms）：低速设备每帧最多一次事务，1ms/帧，
- *    6ms 足够 HC 重试完；超时 fail closed 返回 -1，绝不挂死。
+ *  - 轮询窗口 UHCI_INTR_TO_MS（3ms）：低速设备每帧最多一次事务，1ms/帧，
+ *    3 帧足够 HC 重试完；超时 fail closed 返回 -1，绝不挂死。
  */
 int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
                       uint8_t *buf, int blen, int lowspeed, int *actlen) {
@@ -598,7 +605,8 @@ void uhci_bulk_tog_reset(uint8_t addr) {
 }
 
 /* 确保 HC 处于运行态（见 uhci.h 注释）：GRESET/端口复位之后、发起传输之前
- * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */int uhci_hc_start(uint16_t io) {
+ * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */
+int uhci_hc_start(uint16_t io) {
     u_outl(io, 0x08, UHCI_FRAME_PHYS);   /* 重锁存帧列表物理地址 */
     uint16_t cmd = u_inw(io, 0x00);
     u_outw(io, 0x00, (uint16_t)(cmd | 0x0001u | 0x0100u));  /* RS=1, CF=1 */

@@ -167,6 +167,10 @@ def main():
         except Exception:
             kill_all_qemu()
         wait_port_free(QMP_PORT, 20)
+        # 收尾清理是 best-effort：删不掉不该让整项测试变成 FAIL。
+        # 之前这里 os.remove(WORK) 被环境里的删除钩子拦下并终止进程，
+        # 断言明明全过（stdout 里有 4/4）却被判rc=1。文件留在 tests/ 下，
+        # 下次运行会覆盖，代价只是几十 KB 的磁盘占用。
         try:
             os.remove(WORK)
         except OSError:

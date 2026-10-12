@@ -60,6 +60,11 @@
 
 #define AHCI_CMD_TIMEOUT 2000000u
 
+/* BIOS/OS 所有权交接（BOQC.OS）的等待上限（毫秒）。规范给的是"最多 2 秒
+ * 无响应即放弃"，这里给 1 秒：启动路径上等太久不如直接继续，让后面的
+ * HBA Reset 去暴露控制器状态。 */
+#define AHCI_BOQC_HANDSHAKE_MS 1000u
+
 /* ---- 真实时间上限（毫秒）----
  * 曾经全部用"迭代次数"当时间：等 SSTS.DET 的上限是 500 万次 MMIO 读，
  * 5 个空口每次都跑满 = 2500 万次读 ≈ 2.9 秒开机延迟（实测 PCI->FS 从
@@ -495,8 +500,15 @@ int ahci_init(void) {
     uint32_t boqc = ar(GHC_BOQC);
     if ((boqc & 1u) && !(boqc & 2u)) {
         aw(GHC_BOQC, boqc | 1u);
-        for (uint32_t t = 0; t < 200000u; t++)
+        /* 用 g_pit_ticks 计时，不用迭代次数。固定 20万次空转的墙钟时间
+         * 取决于 CPU 频率、cache 状态、是否被中断打断 —— 同一个数在
+         * 一台机器上可能是 2ms 也可能是 200ms，不能当超时用。
+         * 这也是本文件头的自订原则：等硬件一律用真实时间基准。 */
+        uint32_t bt0 = g_pit_ticks;
+        for (;;) {
             if (ar(GHC_BOQC) & 2u) break;
+            if ((uint32_t)(g_pit_ticks - bt0) >= AHCI_BOQC_HANDSHAKE_MS) break;
+        }
     }
 
     /* 5) AHCI Enable + HBA Reset */

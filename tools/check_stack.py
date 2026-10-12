@@ -60,11 +60,10 @@ def main():
         base = os.path.basename(s)[:-2]
         obj = os.path.join(OUT, base + ".o")
         su = obj[:-2] + ".su"
-        if os.path.exists(su):
-            try:
-                os.remove(su)
-            except OSError:
-                pass
+        # 不要先 os.remove(su)：`-fstack-usage` 每次都会重新生成它，
+        # gcc 自己覆盖。删它没有意义，却会在带删除钩子的环境里被拦下，
+        # os.remove 抛错后虽然被except 吞掉，但某些钩子是直接终止进程的，
+        # 整项测试就被砍成 rc=1、stdout 半截 —— 曾因此误判成"栈预算超标"。
         cmd = [cc] + CFLAGS + ["-fstack-usage", "-c", s, "-o", obj]
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:

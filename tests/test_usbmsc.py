@@ -53,7 +53,11 @@ BOOT_WAIT = 150        # USB 引导 + USB 枚举 + FS，比 IDE 慢
 SHELL_WAIT = 12
 
 IMG = os.path.join(ROOT, "os-image.bin")
-IMG_PAD = os.path.join(ROOT, "temp", "os-image-1024.bin")
+IMG_PAD = os.path.join(ROOT, "temp", "os-image-even.bin")
+# os-image 体积预算（字节）。人为闸门不是物理限制：镜像窗口 19..22MB。
+# 真正要守的是"内核别悄悄变大"，所以加实质功能时显式上调这个数，
+# 而不是把断言改成永远通过 —— 后者等于把闸门拆了。
+IMAGE_BUDGET = 640 * 1024
 DISK = disk_path()
 SHOT = os.path.join(HERE, "msc_shot.ppm").replace("\\", "/")
 
@@ -62,15 +66,34 @@ KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
 
 
 def pad_image():
-    """os-image.bin pad 到 1024 扇区（SeaBIOS U 盘引导的扇区数偶数要求，
-    实测 993 奇数失败）。kernel.bin/UEFI 契约不动。"""
+    """把 os-image.bin 的扇区数补成偶数（SeaBIOS U 盘引导的实测要求：
+    993 扇区（奇数）引导失败，补到偶数立即成功）。
+
+    **补多少不是 1024 扇区**。原来写死 pad 到 1024 扇区（= 512KiB），于是
+    内核一超过 512KiB 这个测试就直接抛 RuntimeError —— 明明只需要"偶数"，
+    却因为一个早就够用的 pad 目标被卡住。内核涨到 539140 B（浏览器链路）
+    之后它就一直红，而这条红跟USB-MSC 一点关系都没有，是纯粹的误报。
+
+    现在按实际体积向上取偶数，真正的上限交给 IMAGE_BUDGET 单独管。
+
+    IMAGE_BUDGET 是人为预算不是物理限制：镜像窗口 19..22MB
+    （linker.ld 的ASSERT），这里卡的是"内核别悄悄变大"。
+    """
     data = open(IMG, "rb").read()
-    if len(data) > 1024 * 512:
-        raise RuntimeError("os-image.bin exceeds 512KiB budget")
+    if len(data) > IMAGE_BUDGET:
+        raise RuntimeError("os-image.bin %d B exceeds budget %d B"
+                           % (len(data), IMAGE_BUDGET))
+    # 向上补到 512 的整数倍，再按**扇区数**判偶数。
+    # 别以为"补到 512 倍数"就等于"扇区数是偶数"：1053 扇区 = 539136 B
+    # 同样是 512 的倍数，但它是奇数，SeaBIOS 照样引导失败。两个条件要分开判。
+    pad_to = (len(data) + 511) // 512 * 512
+    if (pad_to // 512) % 2:
+        pad_to += 512
     os.makedirs(os.path.dirname(IMG_PAD), exist_ok=True)
     with open(IMG_PAD, "wb") as f:
         f.write(data)
-        f.write(b"\x00" * (1024 * 512 - len(data)))
+        f.write(b"\x00" * (pad_to - len(data)))
+    assert (pad_to // 512) % 2 == 0, "pad_image: sector count must be even"
 
 
 class SerialReader(object):

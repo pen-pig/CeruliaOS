@@ -571,9 +571,10 @@ static void ehci_bios_handoff(int ctl) {
     if (capid != 0x01u) return;        /* 不是 USBLEGSUP */
 
     if ((sem & (1u << 16)) == 0u) {    /* BIOS 没占着，无需交接 */
-        /* 顺手关掉 SMI（bit31:16 里的 SMI 使能位），避免真机 SMM 打断 */
+        /* 顺手关掉 SMI（bit31:16 里的 SMI 使能位），避免真机 SMM 打断。
+         * `~0xFFFFu` 是多余的：0xFFFF0000u 已经把低 16 位清零了。 */
         *(volatile uint32_t *)(unsigned long)(g_ctl[ctl].cap + eecp) =
-            sem & 0xFFFF0000u & ~(0xFFFFu);
+            sem & 0xFFFF0000u;
         return;
     }
 
@@ -586,7 +587,13 @@ static void ehci_bios_handoff(int ctl) {
         e_delay_ms(5);
     }
     uint32_t after = *(volatile uint32_t *)(unsigned long)(g_ctl[ctl].cap + eecp);
-    /* 关掉全部 SMI 使能（低 16 位），保留高 16 位的信号量状态 */
+    /* 走到这里说明 BIOS 200ms 内没交出所有权。仍然清掉 BIOS Owned Semaphore
+     * —— 这**不是规范推荐的握手兜底，而是强夺**：规范做法是超时后放弃该
+     * 控制器并报错，由固件/用户决定。之所以在这里强夺，是因为 EZOS 是唯一
+     * 会用到 EHCI 的软件，等下去只会让启动卡死；风险是若 BIOS 的 SMM 代码
+     * 仍在访问控制器，可能与我们的访问撞车。真机上如遇枚举异常，这里是第一
+     * 个要怀疑的地方。
+     * 关掉全部 SMI 使能（低 16 位），保留高 16 位的信号量状态。 */
     *(volatile uint32_t *)(unsigned long)(g_ctl[ctl].cap + eecp) = after & 0xFFFF0000u;
     {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
