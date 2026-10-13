@@ -98,6 +98,12 @@ static uint32_t g_io_sq_tail;
 static uint32_t g_io_cq_head;
 static uint8_t  g_io_cq_phase;
 
+/* 实际生效的队列深度：init 时按 CAP.MQES+1 夹紧后写入。submit/complete
+ * 的环指针取模必须与注册给控制器的 AQA/QSIZE 同源——硬编码 16/32 在
+ * MQES<16 的控制器上会让 tail 越过硬件队列深度，SQ/CQ 直接错位。 */
+static uint32_t g_adepth = NV_ADMIN_DEPTH;
+static uint32_t g_idepth = NV_IO_DEPTH;
+
 /* 已认领的 namespace：ns 下标 -> NSID / 容量（扇区数，uint32 截断） */
 static uint32_t g_ns_nsid[NVME_MAX_NS];
 static uint32_t g_ns_sect[NVME_MAX_NS];
@@ -200,9 +206,9 @@ static int n_admin(uint8_t opc, uint32_t nsid, uint64_t prp1,
     c[7] = (uint32_t)(prp1 >> 32);
     c[10] = cdw10;
     c[11] = cdw11;
-    uint16_t cid = n_submit((volatile uint32_t *)g_asq, NV_ADMIN_DEPTH,
+    uint16_t cid = n_submit((volatile uint32_t *)g_asq, g_adepth,
                             &g_sq_tail, NV_DB_BASE, c);
-    return n_complete((volatile uint32_t *)g_acq, NV_ADMIN_DEPTH, &g_cq_head,
+    return n_complete((volatile uint32_t *)g_acq, g_adepth, &g_cq_head,
                       &g_cq_phase, NV_DB_BASE + (uint32_t)(4u << g_dstrd),
                       cid, NV_ADMIN_MS, res, 0);
 }
@@ -233,10 +239,10 @@ static int n_io_sector(uint8_t ns, uint32_t lba, uint8_t *buffer, int write) {
     c[11] = 0;
     c[12] = 0u;                  /* CDW12[15:0] = NLB（0 基）-> 1 个块 */
 
-    uint16_t cid = n_submit((volatile uint32_t *)g_iosq, NV_IO_DEPTH,
+    uint16_t cid = n_submit((volatile uint32_t *)g_iosq, g_idepth,
                             &g_io_sq_tail, g_db_sq1, c);
     uint32_t status = 0;
-    int r = n_complete((volatile uint32_t *)g_iocq, NV_IO_DEPTH, &g_io_cq_head,
+    int r = n_complete((volatile uint32_t *)g_iocq, g_idepth, &g_io_cq_head,
                        &g_io_cq_phase, g_db_cq1, cid, NV_IO_MS, 0, &status);
     if (r != 0) {
         char line[128]; int n = 0; int lim = (int)sizeof(line) - 1;
@@ -429,6 +435,7 @@ int nvme_init(void) {
         uint32_t adepth = NV_ADMIN_DEPTH;
         if (mqes < adepth) adepth = mqes;
         if (adepth < 2u) { dmesg_write("NVME: MQES too small"); g_bar = 0; continue; }
+        g_adepth = adepth;   /* 环指针取模与 AQA 注册值必须同源 */
 
         nw(NV_AQA, ((adepth - 1u) << 16) | (adepth - 1u));
         nw64(NV_ASQ, (uint64_t)(unsigned long)g_asq);
@@ -496,6 +503,7 @@ int nvme_init(void) {
         uint32_t iodepth = NV_IO_DEPTH;
         if (mqes < iodepth) iodepth = mqes;
         if (iodepth < 2u) { dmesg_write("NVME: MQES too small for I/O queue"); break; }
+        g_idepth = iodepth;  /* 环指针取模与 QSIZE 注册值必须同源 */
 
         uint32_t cdw10_cq = ((iodepth - 1u) << 16) | 1u;     /* QID=1, QSIZE */
         uint32_t cdw11_cq = 1u;                              /* PC=1, IEN=0 */

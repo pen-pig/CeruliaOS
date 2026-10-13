@@ -267,9 +267,22 @@ int usbmsc_init(void) {
             u->d = NULL;
             continue;
         }
-        /* 不可信上界夹紧：扇区大小只认 512（块层约定），总扇区数至少 1 */
-        if (blksize == 0u) blksize = 512u;
-        if (sectors < 1u) sectors = 1u;
+        /* 扇区大小只认 512（块层约定）：READ(10)/WRITE(10) 的数据阶段固定
+         * 512B，硬注册 4K 扇区设备会把 LBA 映射全搞错还返回成功——静默
+         * 数据损坏，必须拒绝。sectors==0 是 READ CAPACITY 回 0xFFFFFFFF
+         * （容量未知哨兵）后 last+1 回绕的结果，同样拒绝。 */
+        if (blksize != 512u || sectors < 1u) {
+            char line[128];
+            int n = 0, lim = (int)sizeof(line) - 1;
+            m_str(line, &n, lim, "USB-MSC: unit");
+            m_dec(line, &n, lim, (uint32_t)g_msc_n);
+            m_str(line, &n, lim, " blksize=");
+            m_dec(line, &n, lim, blksize);
+            m_str(line, &n, lim, " unsupported, skip");
+            m_emit(line, n, lim);
+            u->d = NULL;
+            continue;
+        }
         u->sectors = sectors;
         u->ready = 1;
         g_msc_n++;
