@@ -206,9 +206,20 @@ def kill_stale_qemu():
     ——看起来像测试坏了，其实是上一轮没收拾干净。串行跑时上一项正常退出会
     回收，但被 kill/超时打断的那一项不会。
     """
-    for exe in ("qemu-system-x86_64.exe", "qemu-system-i386.exe"):
-        subprocess.run(["taskkill", "/F", "/IM", exe],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.name == "nt":
+        for exe in ("qemu-system-x86_64.exe", "qemu-system-i386.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", exe],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+    else:
+        # Linux CI：taskkill 不存在，直接 FileNotFoundError 崩在回归开跑前。
+        # 模式锚定 argv[0]（^[^ ]*name）：裸 pkill -f 会匹配**完整命令行**，
+        # 启动回归的那条 shell（带 EZOS_QEMU=.../qemu-system-x86_64 前缀）
+        # 会被当成 QEMU 杀掉自己——症状是回归秒退、零输出、退出码 0。
+        for exe in ("qemu-system-x86_64", "qemu-system-i386"):
+            subprocess.run(["pkill", "-f", "^[^ ]*" + exe],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
 
 
 def main():

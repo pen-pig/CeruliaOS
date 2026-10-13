@@ -127,7 +127,16 @@ def kill_stale_qemu(exe="qemu-system-x86_64.exe"):
     if SLOT != 0:
         return 0
     import subprocess
-    return subprocess.call(["taskkill", "/F", "/IM", exe],
+    if os.name == "nt":
+        return subprocess.call(["taskkill", "/F", "/IM", exe],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+    # Linux：调用方都按 Windows 名字传参（带 .exe），剥掉后缀。
+    # 模式锚定 argv[0]（^[^ ]*name），别用裸 pkill -f——那匹配的是完整
+    # 命令行，启动测试的 shell（环境变量前缀里含 qemu 路径）会被误杀，
+    # 症状是整个回归秒退、零输出。
+    name = exe[:-4] if exe.endswith(".exe") else exe
+    return subprocess.call(["pkill", "-f", "^[^ ]*" + name],
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
 

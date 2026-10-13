@@ -85,7 +85,10 @@ def main():
          "-drive", "format=raw,file=" + IMG,
          "-drive", "format=raw,file=" + WORK,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT,
-         "-serial", "tcp:127.0.0.1:%d,server,nowait" % SER_PORT],
+         # 串口必须阻塞等客户端连接（无 nowait）：QEMU 一启动 vCPU 就全速
+         # 跑，引导输出在 SerialReader 连上之前就冲完被丢弃，wait_for 永远
+         # 等不到，QEMU 残留。和 nvme/uhci 系列同一修复。
+         "-serial", "tcp:127.0.0.1:%d,server" % SER_PORT],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
     try:

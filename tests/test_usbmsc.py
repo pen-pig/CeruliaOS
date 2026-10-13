@@ -214,7 +214,7 @@ def kill_all_qemu():
 def launch(extra_args):
     return subprocess.Popen(
         [QEMU, "-icount", "shift=auto", "-vga", "std",
-         "-serial", "tcp:127.0.0.1:%d,server,nowait" % SERIAL_PORT,
+         "-serial", "tcp:127.0.0.1:%d,server" % SERIAL_PORT,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT] + extra_args,
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

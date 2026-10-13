@@ -253,7 +253,7 @@ def boot(extra_args):
         [QEMU, "-icount", "shift=auto", "-vga", "std",
          "-drive", "format=raw,file=" + IMG,
          "-drive", "format=raw,file=" + DISK,
-         "-serial", "tcp:127.0.0.1:%d,server,nowait" % SERIAL_PORT,
+         "-serial", "tcp:127.0.0.1:%d,server" % SERIAL_PORT,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT] + extra_args,
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc

@@ -136,8 +136,12 @@ if [ ! -f "$RUST_LIB" ]; then
 fi
 
 echo "[ci] ZIG ezos_zig.o"
+# -mcpu i686 不能省（与 build.ninja 的 zig_obj 规则对齐）：默认 baseline
+# 允许 SSE2，向量化会生成 movdqa/movaps。内核只 fninit 不设 CR4.OSFXSR，
+# 这些指令必然 #UD——实测 levenshtein_zig 的定长数组清零被编成 6 条
+# movdqa，一进 rstest 就 panic（vector 06）。tools/check_cpu.py 负责核实。
 if ! ( cd rust/ezos_zig && "$ZIG" build-obj -target x86-freestanding \
-        -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
+        -mcpu i686 -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
     echo "[ci] FATAL: zig build-obj failed, tail:" >&2
     tail -40 ci-zig.log >&2
     ann_log ci-zig.log zig

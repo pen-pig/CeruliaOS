@@ -172,7 +172,7 @@ def run_case(name, extra_args, expect_conn):
          "-drive", "format=raw,file=" + IMG,
          "-drive", "format=raw,file=" + DISK,
          "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0",
-         "-serial", "tcp:127.0.0.1:%d,server,nowait" % SERIAL_PORT,
+         "-serial", "tcp:127.0.0.1:%d,server" % SERIAL_PORT,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT] + extra_args,
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
