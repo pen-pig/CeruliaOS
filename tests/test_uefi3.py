@@ -197,12 +197,16 @@ def main():
         print("MISSING %s - build kernel/EFI first (see uefi/build.sh)"
               % ", ".join(missing))
         return 2
-    # 镜像大小现在是动态的，只能校验"非空 + 512 对齐 + 不超 496KB 上限"，
-    # 再和仓库根的 kernel.bin 比对，防止 esp 里留着上一轮的陈旧内核。
+    # 上限与 uefi/main.c 的 KERNEL_SIZE_MAX(0x300000)/linker.ld 对齐——
+    # 旧的 507904(496KB) 是 SeaBIOS INT13h 直读窗口的遗产，UEFI 加载器按
+    # 文件真实大小读，从来没有这个限制；写死它会让内核长过 496KB 的每次
+    # 构建都被误判红。非空 + 512 对齐照旧，再和仓库根的 kernel.bin 比对，
+    # 防止 esp 里留着上一轮的陈旧内核。
+    kMAX = 0x300000
     ksz = os.path.getsize(KERNEL_BIN)
-    if ksz == 0 or ksz % 512 != 0 or ksz > 507904:
-        print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= 507904)"
-              % ksz)
+    if ksz == 0 or ksz % 512 != 0 or ksz > kMAX:
+        print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= %d)"
+              % (ksz, kMAX))
         return 2
     root_k = os.path.join(ROOT, "kernel.bin")
     if os.path.isfile(root_k) and os.path.getsize(root_k) != ksz:

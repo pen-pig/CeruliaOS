@@ -28,6 +28,10 @@ extern void ezos_console_print_dec(uint32_t num);
 #define CMD_BUFFER_SIZE 1024
 #define HISTORY_SIZE 8
 
+/* shell 欢迎横幅：开机首印 + 从桌面（cmd_desktop）返回终端时重印，
+ * 两处共用一个常量——写两份字符串迟早改漂移，串口断言会跟着遭殃。 */
+#define SHELL_BANNER "EZOS Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n"
+
 static char cmd_buffer[CMD_BUFFER_SIZE];
 static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
@@ -892,7 +896,7 @@ static void shell_redraw_line(void) {
 }
 
 void shell_run(void) {
-    terminal_writestring("EZOS Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
+    terminal_writestring(SHELL_BANNER);
     shell_prompt();
 
     cmd_pos = 0;
@@ -2034,6 +2038,9 @@ static void cmd_desktop(const char *args) {
     terminal_initialize();
     gw_start();
     terminal_initialize();
+    /* 返回终端后重印 banner：清屏后屏幕全空，重印一行让用户确认已回到
+     * shell；test_uefi3 正是靠串口里第二次 "EZOS Shell" 断言回切成功。 */
+    terminal_writestring(SHELL_BANNER);
 }
 
 /* theme [n]: list or switch GUI theme (also selectable in Settings) */

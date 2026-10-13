@@ -164,13 +164,16 @@ def _list_darwin():
 # --------------------------------------------------------------------------
 # 镜像校验
 # --------------------------------------------------------------------------
-# 写入目标：pad 到 1024 扇区（512KB 整）。
-# 实测（QEMU SeaBIOS 1.16.3）：993 扇区（奇数）的镜像 U 盘引导失败
-# （BIOS 认出设备但读盘报错），pad 到 1024 立即成功；真机 BIOS 实现各有
-# 怪癖，对齐整 KB 是零成本保险。多写的 15KB 全是零，不影响引导。
-# kernel.bin / UEFI 契约不受影响：UEFI 加载器（uefi/main.c）读的是文件真实
-# 大小，不是这个 pad；BIOS 路径的扇区数由 tools/make_image.py 写进引导扇区
-# 0x1FC，与这里的 1024 扇区无关。
+# 老式裸镜像（os-image.bin 直写，无分区表）：实测（QEMU SeaBIOS 1.16.3）
+# 993 扇区（奇数）U 盘引导失败（BIOS 认出设备但读盘报错），pad 到 1024
+# 扇区立即成功；真机 BIOS 实现各有怪癖，对齐整 KB 是零成本保险。这个 pad
+# 只对 < 512KiB 的小镜像生效。
+# 现在的默认镜像 usb-image.bin 是 hybrid MBR 布局（内核窗口 3MB + VBR +
+# FAT32 ESP，约 44MB），整镜像 512 对齐、尾部是完整 ESP——**没有预算上限**，
+# 多大写多大；旧的"超过 1024 扇区就拒绝"会把它整个拒掉（写盘工具从此
+# 永远红），那是 SeaBIOS 直读窗口时代的遗产。UEFI 契约不受 pad 影响：
+# UEFI 加载器（uefi/main.c）按文件真实大小读 KERNEL.BIN；BIOS 路径的
+# 扇区数由 tools/make_image.py 写进引导扇区 0x1FC。
 PAD_SECTORS = 1024
 
 
@@ -180,9 +183,6 @@ def validate_image(image_path):
     size = os.path.getsize(image_path)
     if size % 512 != 0:
         return None, "镜像大小 %d 不是 512 的倍数（引导扇区必须 512 对齐）" % size
-    if size > PAD_SECTORS * 512:
-        return None, ("镜像 %d 字节超过 %d 扇区预算（%d 字节）——内核超预算了，"
-                      "先回链接脚本查" % (size, PAD_SECTORS, PAD_SECTORS * 512))
     with open(image_path, "rb") as f:
         first = f.read(512)
     if len(first) < 512 or first[510] != 0x55 or first[511] != 0xAA:
@@ -191,7 +191,7 @@ def validate_image(image_path):
 
 
 # --------------------------------------------------------------------------
-# 写入（1 MiB 块；末尾自动补零到 PAD_SECTORS 扇区）
+# 写入（1 MiB 块；小于 512KiB 的老式裸镜像末尾补零到 PAD_SECTORS 扇区）
 # --------------------------------------------------------------------------
 def write_image(image_path, device_path, verify):
     flags = os.O_WRONLY

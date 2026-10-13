@@ -9,15 +9,19 @@
   3. BOT 写路径可用
      -> write USBTEST.TXT ... / cat 回读
 
+引导链：OVMF(IA32) -> \\EFI\\BOOT\\BOOTIA32.EFI -> KERNEL.BIN（UEFI 通道，
+无 SeaBIOS 的 512KiB 直读预算——内核按文件真实大小加载，3MB 窗口封顶）。
+A 用例引导盘 = uefi/esp 目录的 vvfat 盘挂 usb-storage（OVMF 的 UHCI 驱动
+从它引导，内核起来后 UHCI 驱动重新枚举并把它认成 unit0）；B 用例引导盘 =
+usb-image.bin 挂 IDE（OVMF 扫其 FAT32 ESP），场景里没有任何 usb-storage。
+
 铁律「警惕弱断言」+「两组结果必须相反」：
   A（两个 usb-storage：引导盘+数据盘）：必须出现 2 个 unit ready、
-     2 drive(s) registered，且 setdrive 13 后 ls/cat/readme 全通。
+     2 drive(s) registered，EZEFI 标记证明真的走了 UEFI 通道，且
+     setdrive 13 后 ls/cat/write 回读全通（全部走串口，零 OCR——UEFI 引导
+     后 shell 在 GOP 桌面里，720x400 文本模式的 OCR 断言必然失明）。
   B（不挂 U 盘）            ：必须打印 "no mass storage device"，且**绝不**
      出现 "registered as drive" / "unit*.ready"（fail closed）。
-
-背景（本步最大发现）：SeaBIOS 从 U 盘引导要求镜像扇区数为偶数？实测 993
-扇区（奇数）引导失败（"Booting from Hard Disk" 后读盘失败），pad 到 1024
-扇区立即成功。本测试用动态 pad 好的镜像（temp/os-image-1024.bin）。
 
 端口 4503(QMP) / 4504(serial)。
 """
@@ -34,6 +38,7 @@ from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,34 +48,73 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 KERNEL_DIR = os.path.join(ROOT, "kernel")
-sys.path.insert(0, HERE)
-import ezocr  # noqa: E402
 
-QEMU = qemu_exe()
+QEMU = qemu32_exe()
+FD = ovmf_fd()
 QMP_PORT = alloc_port()
 SERIAL_PORT = alloc_port()
-BOOT_WAIT = 150        # USB 引导 + USB 枚举 + FS，比 IDE 慢
+BOOT_WAIT = 180        # OVMF 引导（-icount 下枚举 USB 盘）比 SeaBIOS 慢
 SHELL_WAIT = 12
 
 IMG = os.path.join(ROOT, "os-image.bin")
-IMG_PAD = os.path.join(ROOT, "temp", "os-image-1024.bin")
-DISK = disk_path()
-SHOT = os.path.join(HERE, "msc_shot.ppm").replace("\\", "/")
+KERNEL_BIN = os.path.join(ROOT, "kernel.bin")
+USB_IMAGE = os.path.join(ROOT, "usb-image.bin")
+ESP = os.path.join(ROOT, "uefi", "esp")
+ESP_KERNEL = os.path.join(ESP, "kernel.bin")
+BOOT_EFI = os.path.join(ESP, "EFI", "BOOT", "BOOTIA32.EFI")
+# 数据盘写测试会改盘内容——绝不拿 disk.vhd 本体开刀（test_nvme 同款纪律），
+# 每次 A 用例跑完基线盘保持干净，绝不给下一次跑留污染。
+DISK = os.path.join(HERE, "msc_data.vhd")
+DISK_SRC = disk_path()
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
-          '/': 'slash', '*': 'kp_multiply', '+': 'kp_add', ':': 'shift-semicolon'}
+          '/': 'slash', ':': 'shift-semicolon'}
 
 
-def pad_image():
-    """os-image.bin pad 到 1024 扇区（SeaBIOS U 盘引导的扇区数偶数要求，
-    实测 993 奇数失败）。kernel.bin/UEFI 契约不动。"""
-    data = open(IMG, "rb").read()
-    if len(data) > 1024 * 512:
-        raise RuntimeError("os-image.bin exceeds 512KiB budget")
-    os.makedirs(os.path.dirname(IMG_PAD), exist_ok=True)
-    with open(IMG_PAD, "wb") as f:
-        f.write(data)
-        f.write(b"\x00" * (1024 * 512 - len(data)))
+def ovmf_pflash_args():
+    """OVMF 固件参数：兼容单文件固件（edk2-i386-code.fd）与 CODE/VARS 分体
+    （OVMF32_CODE_4M.fd）。分体式的 VARS 必须可写且每次用副本，不然两个
+    用例并发跑会互相写花同一个文件。"""
+    args = ["-drive", "if=pflash,format=raw,readonly=on,file=" + FD]
+    vars_guess = FD.replace("CODE", "VARS")
+    if "CODE" in FD and os.path.isfile(vars_guess):
+        vars_copy = os.path.join(ROOT, "temp", "msc_ovmf_vars.fd")
+        os.makedirs(os.path.dirname(vars_copy), exist_ok=True)
+        shutil.copy(vars_guess, vars_copy)
+        args += ["-drive", "if=pflash,format=raw,file=" + vars_copy]
+    return args
+
+
+def uefi_preflight():
+    """UEFI 引导的前置物料：同步 esp/kernel.bin、必要时重建 usb-image.bin。
+    返回 (missing 列表)。kernel.bin 与 ESP 里的副本不同步时 EZEFI 会加载
+    旧内核——直接红在"EZEFI 标记有了但行为是旧的"，极难排查，所以这里
+    主动同步而不是只报错。"""
+    missing = []
+    if not os.path.isfile(FD):
+        missing.append("OVMF 固件（EZOS_OVMF）")
+    if not os.path.isfile(BOOT_EFI):
+        missing.append("uefi/esp/EFI/BOOT/BOOTIA32.EFI（跑 uefi/build.sh）")
+    if missing:
+        return missing
+    if os.path.isfile(KERNEL_BIN):
+        if (not os.path.isfile(ESP_KERNEL)
+                or open(KERNEL_BIN, "rb").read() != open(ESP_KERNEL, "rb").read()):
+            shutil.copy(KERNEL_BIN, ESP_KERNEL)
+    else:
+        missing.append("kernel.bin（先 ninja）")
+        return missing
+    # B 用例引导盘：内核/引导盘任一比 usb-image.bin 新就重建（几秒，幂等）
+    newest = max(os.path.getmtime(IMG), os.path.getmtime(ESP_KERNEL))
+    if (not os.path.isfile(USB_IMAGE)
+            or os.path.getmtime(USB_IMAGE) < newest):
+        r = subprocess.run([sys.executable,
+                            os.path.join(ROOT, "tools", "make_usb_image.py")],
+                           cwd=ROOT, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            missing.append("tools/make_usb_image.py 失败: " + r.stdout[-200:])
+    return missing
+
 
 
 class SerialReader(object):
@@ -163,30 +207,11 @@ class Qmp(object):
             time.sleep(0.05)
         self.hmc("sendkey ret")
 
-    def screendump(self):
-        self.cmd("screendump", filename=SHOT)
-        time.sleep(0.3)
-
     def quit(self):
         try:
             self.cmd("quit")
         except Exception:
             pass
-
-
-def ocr_text():
-    try:
-        with open(SHOT, "rb") as f:
-            dims = f.read(64).split(b"\n", 2)[1].decode()
-    except Exception:
-        return ""
-    if dims.strip() != "720 400":
-        return ""
-    return ezocr.ocr_text(SHOT, KERNEL_DIR)
-
-
-def flat(s):
-    return " ".join(s.lower().split())
 
 
 def port_in_use(port):
@@ -208,12 +233,17 @@ def wait_port_free(port, timeout=15):
 
 
 def kill_all_qemu():
-    kill_stale_qemu("qemu-system-x86_64.exe")
+    # 本测试跑 qemu-system-i386（UEFI 惯例，与 test_uefi3 一致）——按当前
+    # 二进制名杀。老写法写死 x86_64：切 i386 后残留进程永远杀不掉，端口
+    # 占用会把下一个用例直接卡死在 wait_port_free。
+    kill_stale_qemu(os.path.basename(QEMU))
 
 
 def launch(extra_args):
     return subprocess.Popen(
-        [QEMU, "-icount", "shift=auto", "-vga", "std",
+        [QEMU, "-machine", "pc", "-m", "256", "-vga", "std",
+         "-display", "none",
+         "-icount", "shift=auto"] + ovmf_pflash_args() + [
          "-serial", "tcp:127.0.0.1:%d,server" % SERIAL_PORT,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT] + extra_args,
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -226,10 +256,11 @@ def serial_lines(snap):
 
 
 def run_case_a():
-    """A：引导 U 盘 + 数据 U 盘，全链路（BOT 读容量 / FS 挂载 / 读 / 写）"""
-    if not (os.path.isfile(IMG_PAD) and os.path.isfile(DISK)):
-        print("MISSING %s / %s" % (IMG_PAD, DISK))
+    """A：UEFI 引导 U 盘 + 数据 U 盘，全链路（BOT 读容量 / FS 挂载 / 读 / 写）"""
+    if not os.path.isfile(DISK_SRC):
+        print("MISSING %s" % DISK_SRC)
         return False
+    shutil.copy(DISK_SRC, DISK)           # 写测试绝不污染基线盘
 
     if port_in_use(QMP_PORT) or port_in_use(SERIAL_PORT):
         kill_all_qemu()
@@ -237,8 +268,12 @@ def run_case_a():
             print("PORT occupied - abort")
             return False
 
+    # 引导盘 = uefi/esp 目录虚拟成 vvfat FAT 盘挂 usb-storage（OVMF 从它
+    # 读 \EFI\BOOT\BOOTIA32.EFI + KERNEL.BIN）；数据盘 = disk.vhd 副本。
+    # 两者都挂 UHCI：OVMF 的 UHCI 驱动先把引导盘读走，ExitBootServices 后
+    # 内核自己的 UHCI 驱动重新枚举，两块盘都注册进 MSC 层。
     proc = launch([
-        "-drive", "format=raw,file=" + IMG_PAD.replace("\\", "/") + ",if=none,id=usbos",
+        "-drive", "if=none,format=raw,file=fat:rw:" + ESP.replace("\\", "/") + ",id=usbos",
         "-device", "piix3-usb-uhci,id=uhci",
         "-device", "usb-storage,drive=usbos,bus=uhci.0,port=1,bootindex=0",
         "-drive", "format=raw,file=" + DISK.replace("\\", "/") + ",if=none,id=usbdata",
@@ -259,7 +294,16 @@ def run_case_a():
             return False
         time.sleep(SHELL_WAIT)
 
-        lines = serial_lines(serial.snapshot())
+        boot = serial.snapshot()
+
+        # ---- UEFI 通道正面证明（警惕弱断言：不是"起来了就算"，要证明
+        # 走的是 OVMF/EZEFI，而不是溜回 legacy BIOS）
+        for m in ("EZEFI:uefi magic", "GOP: UEFI boot"):
+            if m not in boot:
+                print("  FAIL A: UEFI boot marker missing: %r" % m)
+                ok = False
+
+        lines = serial_lines(boot)
         for ln in lines:
             print("  klog> " + ln)
 
@@ -276,37 +320,35 @@ def run_case_a():
             print("  FAIL A: expected '2 drive(s) registered as drive 12..13'")
             ok = False
 
-        # ---- FS 全链路（OCR 断言）----
-        time.sleep(3.0)                       # 等 shell 提示符稳定
+        # ---- FS 全链路（串口断言；GOP 桌面下 OCR 720x400 必然失明）----
+        # test_uefi3 的教训：OVMF 引导后键盘控制器有残留字节，第一条
+        # sendkey 命令会被吃掉——先发一条无害命令清空缓冲。
+        qmp.type_line("ver")
+        time.sleep(2.0)
         qmp.type_line("setdrive 13")
-        time.sleep(6.0)                       # exFAT 挂载 = 一串 BOT 读
-        qmp.type_line("ls")
-        time.sleep(4.0)
-        qmp.type_line("cat README.TXT")
-        time.sleep(4.0)
-        qmp.screendump()
-        txt = flat(ocr_text())
-        if "readme.txt" not in txt:
-            print("  FAIL A: ls after setdrive 13 lacks readme.txt")
-            print("  ocr> " + txt[:400])
+        if not serial.wait_for("FS drive set to 13", 20):
+            print("  FAIL A: setdrive 13 rejected (exFAT mount failed?)")
+            print("---- serial tail ----\n" + serial.snapshot()[-600:])
             ok = False
-        if "welcome to ezos" not in txt:
+        qmp.type_line("ls")
+        if not serial.wait_for("README.TXT", 15):
+            print("  FAIL A: ls after setdrive 13 lacks README.TXT")
+            print("---- serial tail ----\n" + serial.snapshot()[-600:])
+            ok = False
+        qmp.type_line("cat readme.txt")
+        if not serial.wait_for("Welcome to EZOS", 15):
             print("  FAIL A: cat README.TXT lacks content (BOT read path)")
+            print("---- serial tail ----\n" + serial.snapshot()[-600:])
             ok = False
 
         # ---- BOT 写路径 ----
         qmp.type_line("write USBTEST.TXT hello-usb-msc-e2e")
-        time.sleep(6.0)
-        qmp.type_line("cat USBTEST.TXT")
-        time.sleep(4.0)
-        qmp.screendump()
-        txt = flat(ocr_text())
-        if "hello-usb-msc-e2e" not in txt:
+        if not serial.wait_for("hello-usb-msc-e2e", 20):
             print("  FAIL A: BOT write/read-back roundtrip failed")
-            print("  ocr> " + txt[:400])
+            print("---- serial tail ----\n" + serial.snapshot()[-600:])
             ok = False
-        if "panic" in txt:
-            print("  FAIL A: panic on screen")
+        if "kernel panic" in serial.snapshot():
+            print("  FAIL A: kernel panic in serial")
             ok = False
 
         return ok
@@ -331,10 +373,10 @@ def run_case_b():
             print("PORT occupied - abort")
             return False
 
-    # 无 U 盘场景：内核只能从 IDE 引导（本用例不带 usb-storage，
-    # 没有可启动设备 SeaBIOS 会直接报 no bootable device）
+    # 无 U 盘场景：引导盘 = usb-image.bin 挂 IDE（OVMF 扫其 FAT32 ESP，
+    # 本用例不带任何 usb-storage，测的就是 MSC 层 fail closed）
     proc = launch([
-        "-drive", "format=raw,file=" + IMG.replace("\\", "/"),
+        "-drive", "format=raw,file=" + USB_IMAGE.replace("\\", "/"),
         "-device", "piix3-usb-uhci,id=uhci",
     ])
 
@@ -381,12 +423,17 @@ def main():
     wait_port_free(QMP_PORT, 15)
     wait_port_free(SERIAL_PORT, 15)
 
-    if not (os.path.isfile(IMG) and os.path.isfile(DISK)):
-        print("MISSING %s / %s - run ninja first" % (IMG, DISK))
+    if not os.path.isfile(IMG):
+        print("MISSING %s - run ninja first" % IMG)
         return 2
-    pad_image()
+    missing = uefi_preflight()
+    if missing:
+        print("UEFI preflight failed:")
+        for m in missing:
+            print("  - " + m)
+        return 2
 
-    print("=== case: A-two-sticks ===")
+    print("=== case: A-two-sticks(UEFI boot) ===")
     ok_a = run_case_a()
     print("  => %s" % ("PASS" if ok_a else "FAIL"))
     time.sleep(0.5)
