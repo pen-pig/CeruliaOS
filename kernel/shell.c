@@ -475,6 +475,7 @@ static const command_t commands[] = {
     {"ps",        cmd_ps},
     {"stackchk",  cmd_stackchk},
     {"systest",   cmd_systest},
+    {"oomtest",   cmd_oomtest},
     {"pci",       cmd_pci},
     {"nic",       cmd_nic},
     {"ping",      cmd_ping},

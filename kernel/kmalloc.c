@@ -80,6 +80,14 @@ void kmalloc_init(void) {
 
 void *kmalloc(uint32_t size) {
     if (size == 0) return NULL;
+    /* **上界检查必须在做加法之前**：下面要算 size + KM_HDR + KM_TAIL，
+     * 32 位下 size 接近 0xFFFFFFFF 时这个和会回绕成一个很小的数 ——
+     * 实测 size=0xFFFFFFF0 时 need 回绕成 0，于是"任何空闲块都够用"，
+     * 返回一个根本装不下请求的块：调用方一写就越界，直接踩坏后面的块，
+     * 而 km_arm 还会把 canary 写到算错的位置上。堆就这么被自己的
+     * 分配器破坏了（oomtest 抓到的）。
+     * 池只有 KM_POOL_SIZE，超过这个数的请求必然给不出，直接拒绝。 */
+    if (size > KM_POOL_SIZE) return NULL;
     /* +KM_TAIL：尾部 canary 也要占位，否则用户区末尾正好顶到下一个块的头 */
     uint32_t need = round_up(size + KM_HDR + KM_TAIL, KM_ALIGN);
 

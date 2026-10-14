@@ -51,6 +51,7 @@ void cmd_ktask(const char *args);
 void cmd_ps(const char *args);
 void cmd_stackchk(const char *args);
 void cmd_systest(const char *args);
+void cmd_oomtest(const char *args);
 void cmd_pci(const char *args);
 void cmd_nic(const char *args);
 void cmd_ping(const char *args);

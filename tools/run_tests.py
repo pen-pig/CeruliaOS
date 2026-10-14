@@ -54,7 +54,7 @@ PY = sys.executable
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
-             "termwrap", "stackchk", "systest"],
+             "termwrap", "stackchk", "systest", "oomtest"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
              "fsck"],
@@ -126,6 +126,7 @@ WATCH = [
     ("html.rs", "static check_html"), ("ref_html", "static check_html"),
     ("webview", "gui check_html"), ("browser", "gui"), ("http.c", "net gui"),
     ("kmalloc", "static"), ("pmm", "static"),
+    # 堆的耗尽演练（oomtest）：改 kmalloc.c 必须跑
     # 栈守卫：改 task.c 的栈池布局或 stackchk.c 的判据，都会让"写穿了没人
     # 报出来"，所以两端都要跑（E2E 验行为、static 验源码判据）
     ("stackchk", "core"), ("task.c", "core"),

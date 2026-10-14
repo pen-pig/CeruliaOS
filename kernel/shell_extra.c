@@ -39,6 +39,7 @@
 #include "acpi.h"
 #include "ata.h"
 #include "stackchk.h"   /* 任务内核栈守卫：stackchk / stackchk selftest */
+#include "oomtest.h"    /* OOM 演练：oomtest */
 #include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
 #include "rust_bridge.h"    /* Rust / Zig 侧实现 */
 #include "mouse.h"          /* mouse_selftest / mouse_protocol / 指针状态 */
@@ -2349,6 +2350,10 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "ps") == 0) {
         return "ps - list tasks (PID / state / switches / name)\n  usage: ps";
     }
+    if (x_strcasecmp(cmd, "oomtest") == 0) {
+        return "oomtest - exercise the heap allocator under memory pressure\n"
+               "  usage: oomtest";
+    }
     if (x_strcasecmp(cmd, "systest") == 0) {
         return "systest - feed malicious arguments to the syscall entry "
                "(kernel pages / unmapped / length wraparound)\n"
@@ -3041,6 +3046,13 @@ void cmd_systest(const char *args) {
 
     ezos_console_write("SYSTEST: result: ");
     ezos_console_write(fail == 0 ? "PASS\n" : "FAIL\n");
+}
+
+/* oomtest：主动把堆耗尽，验分配器在压力下的契约仍然成立。
+ * 详细用例在 kernel/oomtest.c，这里只负责接线。 */
+void cmd_oomtest(const char *args) {
+    (void)args;
+    oom_selftest(ezos_console_write);
 }
 
 void cmd_stackchk(const char *args) {
