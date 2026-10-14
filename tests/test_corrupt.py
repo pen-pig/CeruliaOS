@@ -194,6 +194,19 @@ def port_in_use(port):
         return False
 
 
+def wait_port_listen(port, timeout=30):
+    """等端口**开始被监听**（与 wait_port_free 相反的方向）。
+
+    用于"刚 Popen 了 QEMU，等它的 QMP 起来"，别拿 wait_port_free 凑——
+    那是等端口空闲，语义正好相反。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if port_in_use(port):
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def wait_port_free(port, timeout=15):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -221,6 +234,18 @@ def launch(disk):
         "-qmp", "tcp:127.0.0.1:%d,server,nowait" % PORT,
         "-serial", "file:" + LOG,
     ], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 必须先等 QEMU **真的开始监听**再 connect。
+    # Popen 返回只意味着进程起来了，QMP 监听要晚几十到几百毫秒；负载高时
+    # （并行回归，两个 QEMU 同时启动 + 磁盘 IO 打满）这个间隔会更长。
+    # 不等就直接 Qmp(PORT) 会被 ConnectionRefused 打穿 —— 实测 core/fs 层
+    # 并行跑时 autofmt / fsck / reformat 三个用例（都复用本 launch）在 1.9s
+    # 内就崩在这里，而串行跑三个全 PASS。失败来得太快反而容易误判成
+    # "测试逻辑有问题"，其实是启动竞争。
+    if not wait_port_listen(PORT, 30):
+        p.kill()
+        p.wait(timeout=15)
+        raise RuntimeError("QMP never started listening on port %d" % PORT)
     qmp = Qmp(PORT)
     if not wait_for(PROMPT, BOOT_TIMEOUT):
         p.kill()
