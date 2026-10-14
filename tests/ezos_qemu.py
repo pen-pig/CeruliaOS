@@ -105,13 +105,43 @@ def image_path():
     return _slot_copy("os-image.bin")
 
 
-def disk_path():
-    """disk.vhd 的路径（slot>0 时是本 slot 的私有副本）。
+_disk_cache = [None]
 
-    多个 QEMU 同时打开同一个 raw 文件在 Windows 上会失败，而且这些盘会被
-    写脏——各写各的副本才不会互相污染。
+
+def disk_path():
+    """disk.vhd 的路径：每个**测试进程**一份从源盘新复制的私有副本。
+
+    为什么不再"slot 0 直接用仓库原文件"：disk.vhd 是**会被测试写脏**的
+    （格式化、写文件、故意损坏做 fsck）。不管串行还是并行，只要两个测试
+    共用同一个文件，前一个写脏的盘就会污染后一个 —— 实测 core/fs 层跑
+    `fsck` 与 `autofmt` 时因此 FAIL（1.8s 就退出，是前置条件不满足而不是
+    超时），而这两个测试单独跑都是 PASS：单独跑时源盘恰好是干净的。
+    症状很有迷惑性：报的是"fsck 在健康卷上不该报错"，实际是它拿到的是
+    上一个用例留下的坏卷。
+
+    所以每个进程进来都从仓库根的源盘复制一份（16MB，一次约 0.1s）。
+    进程内缓存：同一个测试里多次调用返回同一路径，**不会**中途把盘重置
+    回干净状态——有些用例是"重启后检查上一步写进去的东西"。
+
+    多 QEMU 同时打开同一个 raw 文件在 Windows 上会失败，副本也顺带解决了
+    这个（各 slot 目录不同）。
     """
-    return _slot_copy("disk.vhd")
+    if _disk_cache[0] is not None:
+        return _disk_cache[0]
+    src = os.path.join(ROOT, "disk.vhd")
+    d = os.path.join(ROOT, "temp", "slot%d" % SLOT)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    dst = os.path.join(d, "disk.vhd")
+    try:
+        shutil.copyfile(src, dst)
+    except OSError:
+        _disk_cache[0] = src.replace("\\", "/")
+        return _disk_cache[0]
+    _disk_cache[0] = dst.replace("\\", "/")
+    return _disk_cache[0]
 
 
 def kill_stale_qemu(exe="qemu-system-x86_64.exe"):
