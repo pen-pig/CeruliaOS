@@ -2349,6 +2349,11 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "ps") == 0) {
         return "ps - list tasks (PID / state / switches / name)\n  usage: ps";
     }
+    if (x_strcasecmp(cmd, "systest") == 0) {
+        return "systest - feed malicious arguments to the syscall entry "
+               "(kernel pages / unmapped / length wraparound)\n"
+               "  usage: systest";
+    }
     if (x_strcasecmp(cmd, "stackchk") == 0) {
         return "stackchk - task kernel stack guards (peak usage / canary / guard)\n"
                "  usage: stackchk            - per-task peak usage and guard state\n"
@@ -2976,6 +2981,68 @@ static int arg_is(const char *args, const char *word)
  * PEAK 是**历史**峰值（0xA5 填充被写过多少），不是当前用量 —— 用来看
  * "离 16KB 还有多远"，而不是看此刻栈有多深。
  */
+/* systest：系统调用的恶意参数（安全边界 fuzz）
+ *
+ * 为什么要这条：user_range_ok 是"用户态能不能借系统调用读写内核内存"的
+ * 唯一闸门，而它的漏判在测试机上永远看不出来 —— 要等有人真的传一个内核
+ * 地址进来。这里把常见的恶意形态**在内核态直接喂给 syscall_handler**
+ * （不用真的起一个用户程序去传，省掉整条 ELF 装载链路），断言一律被拒。
+ *
+ * 判据是每个用例都必须返回负值（-1）。返回 0 或正数意味着内核**接受**了
+ * 恶意参数，那是漏洞不是小毛病。系统还得活着（命令能跑完、后续有提示符）。
+ */
+void cmd_systest(const char *args) {
+    (void)args;
+    /* 三类地址（与 cmd_utest 的约定一致）：
+     *   KERNEL_PAGE  已映射但无 PTE_US —— 内核数据，绝不能让用户碰到
+     *   UNMAPPED     完全没映射 —— 内核解引用就是 #PF
+     *   USER_PAGE    合法用户页（只在"长度恶意"用例里当基址用） */
+    const uint32_t KERNEL_PAGE = 0x00100000u;
+    const uint32_t UNMAPPED    = 0x05000000u;
+    const uint32_t USER_PAGE    = 0x00400000u;
+    int fail = 0;
+
+    struct { const char *name; uint32_t num, a1, a2, a3; } cases[] = {
+        { "write buf=kernel page",   SYS_WRITE,    1u, KERNEL_PAGE, 8u },
+        { "write buf=unmapped",      SYS_WRITE,    1u, UNMAPPED,    8u },
+        { "read buf=kernel page",    SYS_READ,     0u, KERNEL_PAGE, 8u },
+        { "read buf=unmapped",       SYS_READ,     0u, UNMAPPED,    8u },
+        /* 长度恶意：0xFFFFFFFF 会让 va+len 环绕，必须在算术之前被拒 */
+        { "write len=0xFFFFFFFF",    SYS_WRITE,    1u, USER_PAGE,   0xFFFFFFFFu },
+        { "read len=0xFFFFFFFF",     SYS_READ,     0u, USER_PAGE,   0xFFFFFFFFu },
+        { "open name=kernel page",   SYS_OPEN,     KERNEL_PAGE, 0u, 0u },
+        { "open name=unmapped",      SYS_OPEN,     UNMAPPED,    0u, 0u },
+        { "pipe fds=kernel page",    SYS_PIPE,     KERNEL_PAGE, 0u, 0u },
+        { "waitpid status=kernel",   SYS_WAITPID,  -1, KERNEL_PAGE, 0u },
+        { "sockcall args=kernel",    SYS_SOCKCALL, 0u, KERNEL_PAGE, 0u },
+        { "unknown syscall number",  9999u,        0u, 0u, 0u },
+    };
+    const uint32_t n = sizeof(cases) / sizeof(cases[0]);
+
+    ezos_console_write("systest: malicious syscall arguments "
+                       "(all must be rejected)\n");
+    for (uint32_t i = 0; i < n; i++) {
+        int rc = syscall_handler(cases[i].num, cases[i].a1,
+                                 cases[i].a2, cases[i].a3);
+        int ok = (rc < 0);
+        if (!ok) fail++;
+        ezos_console_write("SYSTEST: ");
+        ezos_console_write(cases[i].name);
+        ezos_console_write(": ");
+        ezos_console_write(ok ? "PASS" : "FAIL");
+        ezos_console_write("\n");
+    }
+    /* 边界：fd 号越界也不能当成有效 fd */
+    int rc_bad = syscall_handler(SYS_CLOSE, 9999u, 0u, 0u);
+    if (rc_bad >= 0) fail++;
+    ezos_console_write("SYSTEST: close fd=9999: ");
+    ezos_console_write(rc_bad < 0 ? "PASS" : "FAIL");
+    ezos_console_write("\n");
+
+    ezos_console_write("SYSTEST: result: ");
+    ezos_console_write(fail == 0 ? "PASS\n" : "FAIL\n");
+}
+
 void cmd_stackchk(const char *args) {
     while (*args == ' ') args++;
     if (arg_is(args, "selftest")) {

@@ -54,7 +54,7 @@ PY = sys.executable
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
-             "termwrap", "stackchk"],
+             "termwrap", "stackchk", "systest"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
              "fsck"],
@@ -129,6 +129,8 @@ WATCH = [
     # 栈守卫：改 task.c 的栈池布局或 stackchk.c 的判据，都会让"写穿了没人
     # 报出来"，所以两端都要跑（E2E 验行为、static 验源码判据）
     ("stackchk", "core"), ("task.c", "core"),
+    # 安全边界：syscall 的恶意参数 fuzz（systest）+ 栈守卫（stackchk）
+    ("syscall.c", "core"),
     ("rust_bridge", "static"),
 ]
 
