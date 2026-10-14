@@ -152,6 +152,9 @@ void schedule(void);
 
 /* 查询接口（shell 的 ps 命令 / 自检用） */
 task_t *task_current(void);
+/* 栈守卫（panic 屏用）：第一个损坏的槽位+1；0 = 全部完好 */
+int task_stack_first_bad(void);
+
 const task_t *task_table(uint32_t *out_count);
 uint32_t task_count_running(void);
 

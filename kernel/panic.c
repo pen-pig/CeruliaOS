@@ -19,6 +19,7 @@
 #include "port.h"
 #include "isr.h"
 #include "serial.h"
+#include "task.h"       /* task_stack_first_bad：崩溃现场先看栈有没有写穿 */
 
 extern void *isr_stub_table[];    /* kernel_entry.asm */
 
@@ -173,6 +174,20 @@ static void dump(isr_regs_t *r) {
     pputs("\n    CR0=0x"); phex(cr0, 8);
     pputs(" CR2=0x"); phex(cr2, 8);
     pputs(" CR3=0x"); phex(cr3, 8);
+
+    /* 栈守卫：写穿的症状（某个看起来无关的静态数据被改）跟"文件系统坏了"
+     * "内存坏了"一模一样，没有这一行的话每次都得重新推理一遍。放在寄存器
+     * 之后、停机提示之前——它回答的是"这次崩溃有没有更深层的原因"。 */
+    {
+        int bad = task_stack_first_bad();
+        if (bad > 0) {
+            pputs("\n\n  STACK: guard/canary broken on slot ");
+            phex((uint32_t)(bad - 1), 2);
+            pputs(" - a task kernel stack was written past its end.\n");
+            pputs("         (the corrupted data may be unrelated to this "
+                  "fault; see 'stackchk')");
+        }
+    }
     pputs("\n\n  System halted. Power off or reboot (QEMU: Ctrl-Alt-G / reset).\n");
 
     panic_halt();

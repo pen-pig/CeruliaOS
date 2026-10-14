@@ -627,6 +627,20 @@ static void wq_remove(wait_queue_t *wq, int idx) {
     }
 }
 
+/* panic 屏用：第一个守卫损坏的槽位（返回 slot+1），0 = 全部完好。
+ *
+ * 崩溃现场最该先知道的就是"是不是栈写穿了"—— 写穿的症状（某个看起来
+ * 无关的静态数据被改）和"文件系统坏了""内存坏了"完全一样，没有这一行
+ * 的话，每次都得重新推理一遍。 */
+int task_stack_first_bad(void) {
+    for (uint32_t i = 0; i < MAX_TASKS; i++) {
+        if (g_tasks[i].kstack == 0) continue;
+        if (stackchk_broken_layer(g_tasks[i].kstack, TASK_KSIZE) != -1)
+            return (int)i + 1;
+    }
+    return 0;
+}
+
 void task_timer_tick(void) {
     if (!g_ready) return;
     uint32_t now = g_pit_ticks;
