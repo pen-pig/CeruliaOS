@@ -27,6 +27,7 @@
 #include "dmesg.h"
 #include "serial.h"
 #include "irqflags.h"
+#include "isr.h"        /* g_pit_ticks：日志时间戳 */
 
 #define DM_BUF_SIZE  32768u
 #define DM_MAX_LINES 256u
@@ -37,7 +38,7 @@
 static char dm_buf[DM_BUF_SIZE] DM_HIBUF;
 static uint64_t dm_seq;                      /* 逻辑流游标：下一字节的位置 */
 
-typedef struct { uint64_t start; uint32_t len; } dm_line_t;
+typedef struct { uint64_t start; uint32_t len; uint32_t tick; } dm_line_t;
 static dm_line_t dm_line[DM_MAX_LINES] DM_HIBUF;  /* FIFO 行索引 */
 static uint32_t dm_first;                    /* 最旧行下标 */
 static uint32_t dm_cnt;
@@ -71,6 +72,7 @@ static void dm_push_line(void) {
     uint32_t slot = (dm_first + dm_cnt) % DM_MAX_LINES;
     dm_line[slot].start = dm_seq;
     dm_line[slot].len = need;
+    dm_line[slot].tick = g_pit_ticks;   /* 时间戳：见 dump 的说明 */
 
     for (uint32_t k = 0; k < dm_cur_len; k++)
         dm_buf[(dm_seq + k) % DM_BUF_SIZE] = dm_cur[k];
@@ -152,6 +154,63 @@ static void dm_snapshot(uint32_t *first_out, uint32_t *start_out,
     irq_restore(f);
 }
 
+/* 取某行的 tick（临界区内读，与 dm_copy_line 同一套做法） */
+static uint32_t dm_line_tick(uint32_t idx) {
+    uint32_t f = irq_save_disable();
+    uint32_t t = dm_line[idx].tick;
+    irq_restore(f);
+    return t;
+}
+
+/* 时间戳 "[  12.345] " —— 内核无 printf，手写十进制。
+ *
+ * 为什么只在**回看**（dmesg_dump / dmesg_tail，也就是 shell 的 dmesg 和
+ * panic 屏）加，不给实时串口镜像加：E2E 全靠按行断言串口输出，而多数断言
+ * 是 `startswith("XXX:")`；行首插前缀会把它们一起打碎。回看路径没有这种
+ * 约束（测试用的是"包含"），而排障时真正要看时间线的也正是回看和 panic 屏。
+ *
+ * PIT 是 1000Hz，g_pit_ticks 单位即毫秒。 */
+static void dm_ts_put(void (*put)(char), uint32_t tick) {
+    uint32_t ms = tick % 1000u;
+    uint32_t sec = tick / 1000u;
+    char b[12];
+    int m = 0;
+    if (sec == 0u) b[m++] = '0';
+    while (sec && m < (int)sizeof(b)) { b[m++] = (char)('0' + sec % 10u); sec /= 10u; }
+    put('[');
+    put(' ');
+    for (int i = m; i < 4; i++) put(' ');      /* 与 klog 一致：秒右对齐到 4 位 */
+    while (m) put(b[--m]);
+    put('.');
+    uint32_t usec = ms * 1000u;          /* 与 klog 一致：秒.6 位 */
+    for (uint32_t d = 100000u; d; d /= 10u)
+        put((char)('0' + (usec / d) % 10u));
+    put(']');
+    put(' ');
+}
+
+static uint32_t dm_ts_buf(char *out, uint32_t o, uint32_t lim, uint32_t tick) {
+    uint32_t ms = tick % 1000u;
+    uint32_t sec = tick / 1000u;
+    char b[12];
+    int m = 0;
+    if (sec == 0u) b[m++] = '0';
+    while (sec && m < (int)sizeof(b)) { b[m++] = (char)('0' + sec % 10u); sec /= 10u; }
+    if (o + 1 < lim) out[o++] = '[';
+    if (o + 1 < lim) out[o++] = ' ';
+    for (int i = m; i < 4; i++) if (o + 1 < lim) out[o++] = ' ';
+    while (m) if (o + 1 < lim) out[o++] = b[--m];
+    if (o + 1 < lim) out[o++] = '.';
+    uint32_t usec = ms * 1000u;          /* 与 klog 一致：秒.6 位 */
+    for (uint32_t d = 100000u; d; d /= 10u) {
+        if (o + 1 >= lim) break;
+        out[o++] = (char)('0' + (usec / d) % 10u);
+    }
+    if (o + 1 < lim) out[o++] = ']';
+    if (o + 1 < lim) out[o++] = ' ';
+    return o;
+}
+
 int dmesg_dump(void (*putchar_fn)(char), int n) {
     if (!putchar_fn) return 0;
     uint32_t first, start, cnt;
@@ -162,6 +221,9 @@ int dmesg_dump(void (*putchar_fn)(char), int n) {
     for (uint32_t i = start; i < cnt; i++) {
         uint32_t idx = (first + i) % DM_MAX_LINES;
         uint32_t len = dm_copy_line(idx, row, DM_MAX_LINE + 1);
+        /* klog 系（kernel.c 的 dm_mirror）的行**自带** `[ 秒.微秒]` 前缀，
+         * 再补一个就成了 `[    1.331] [ 1.331133] ...`。只给没有前缀的行补。 */
+        if (len == 0 || row[0] != '[') dm_ts_put(putchar_fn, dm_line_tick(idx));
         for (uint32_t k = 0; k < len; k++) putchar_fn(row[k]);
         out++;
     }
@@ -178,6 +240,8 @@ int dmesg_tail(char *out, uint32_t outsz, int n) {
     for (uint32_t i = start; i < cnt && o + 1 < outsz; i++) {
         uint32_t idx = (first + i) % DM_MAX_LINES;
         uint32_t len = dm_copy_line(idx, row, DM_MAX_LINE + 1);
+        if (len == 0 || row[0] != '[')
+            o = dm_ts_buf(out, o, outsz, dm_line_tick(idx));
         for (uint32_t k = 0; k < len && o + 1 < outsz; k++) out[o++] = row[k];
     }
     out[o] = 0;

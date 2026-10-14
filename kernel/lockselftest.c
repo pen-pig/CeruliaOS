@@ -207,17 +207,27 @@ static int lt_dmesg_irq_nested(void) {
 /* 读路径回归：dmesg_dump/tail 被改成了"快照 + 逐行加锁拷贝"，这里验证
  * 改写后仍能按原顺序读回完整行（抓的是 dm_first 漏快照、idx 算错、
  * 拷贝截断这类把读路径改坏的错误）。 */
-static int lt_expect2(const char *buf, const char *a, const char *b) {
-    int i = 0;
-    for (int k = 0; a[k]; k++) {
-        if (buf[i] == 0 || buf[i] != a[k]) return 1;
-        i++;
-    }
-    for (int k = 0; b[k]; k++) {
-        if (buf[i] == 0 || buf[i] != b[k]) return 1;
-        i++;
+static const char *lt_find(const char *hay, const char *needle) {
+    for (int i = 0; hay[i]; i++) {
+        int k = 0;
+        while (needle[k] && hay[i + k] == needle[k]) k++;
+        if (needle[k] == 0) return hay + i;
     }
     return 0;
+}
+
+/* 判"两行都回来了、顺序对、内容对"。
+ *
+ * 原来是逐字节从 buf[0] 比到结尾 —— 加了 dmesg 时间戳之后每行前面多出
+ * "[  12.345] "，那样比必然失败（实测开机自检 lock 子系统因此 FAIL）。
+ * 改成"包含 + 先后顺序"：丢行、错序、内容损坏照样抓得住，只是不再把
+ * 行首前缀当成内容的一部分。别改成"只要有一行就算过"——那才是放宽。 */
+static int lt_expect2(const char *buf, const char *a, const char *b) {
+    const char *pa = lt_find(buf, a);
+    if (!pa) return 1;
+    const char *pb = lt_find(buf, b);
+    if (!pb) return 1;
+    return (pb > pa) ? 0 : 1;
 }
 
 static int lt_dmesg_tail_readback(void) {
