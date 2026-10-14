@@ -38,6 +38,7 @@
 #include "serial.h"
 #include "acpi.h"
 #include "ata.h"
+#include "stackchk.h"   /* 任务内核栈守卫：stackchk / stackchk selftest */
 #include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
 #include "rust_bridge.h"    /* Rust / Zig 侧实现 */
 #include "mouse.h"          /* mouse_selftest / mouse_protocol / 指针状态 */
@@ -2348,6 +2349,13 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "ps") == 0) {
         return "ps - list tasks (PID / state / switches / name)\n  usage: ps";
     }
+    if (x_strcasecmp(cmd, "stackchk") == 0) {
+        return "stackchk - task kernel stack guards (peak usage / canary / guard)\n"
+               "  usage: stackchk            - per-task peak usage and guard state\n"
+               "         stackchk selftest   - prove the guards actually detect damage\n"
+               "         stackchk burn       - TEST ONLY: damage one slot's guard so the\n"
+               "                               IRQ0 patrol must report it (ruins that slot)";
+    }
     if (x_strcasecmp(cmd, "rstest") == 0) {
         return "rstest - cross-check the C / Rust / Zig checksum implementations\n  usage: rstest";
     }
@@ -2955,6 +2963,103 @@ static int arg_is(const char *args, const char *word)
     while (word[i] && args[i] && x_tolower(args[i]) == x_tolower(word[i])) i++;
     if (word[i]) return 0;
     return args[i] == '\0' || args[i] == ' ';
+}
+
+/* stackchk：任务内核栈的守卫状态与水位（见 kernel/stackchk.h）
+ *
+ * 为什么要有这条命令：静态栈预算（tools/check_stack.py）只看编译期估算值，
+ * 抓不到运行期真实深度，更抓不到写穿。真出事时症状是"某个看起来完全无关
+ * 的静态数据坏了" —— cmd_ls 的 entries[64] 曾把 fs.c 的 ro_cwd 写坏，表现
+ * 是提示符变成 `[A.TXT]`，看着像文件系统坏了。这里把"每个任务用了多少、
+ * 有没有写穿"直接摆出来，让这类问题在第一现场就能定位。
+ *
+ * PEAK 是**历史**峰值（0xA5 填充被写过多少），不是当前用量 —— 用来看
+ * "离 16KB 还有多远"，而不是看此刻栈有多深。
+ */
+void cmd_stackchk(const char *args) {
+    while (*args == ' ') args++;
+    if (arg_is(args, "selftest")) {
+        stackchk_selftest(ezos_console_write);
+        return;
+    }
+    if (arg_is(args, "burn")) {
+        /* 故意破坏一个槽位的 guard，用来验证 IRQ0 巡检真的在跑。
+         *
+         * 只有破坏真实任务栈才能证明"巡检会报警"—— 在 scratch 上验的只是
+         * stackchk_broken_layer 这个函数，验不到"有没有人周期性去调它"。
+         * 代价：这个槽位的守卫此后就是坏的，所以 burn 只能放在最后跑，
+         * 也**绝不**在正常操作里用。
+         */
+        uint32_t n = 0;
+        const task_t *tab = task_table(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (tab[i].kstack == 0) continue;
+            volatile uint8_t *gp = (volatile uint8_t *)(unsigned long)
+                (tab[i].kstack - KS_GUARD + 4u);
+            *gp = 0x00u;
+            ezos_console_write("STACKCHK: burn armed on slot=");
+            ezos_console_print_dec(i);
+            ezos_console_write(" (IRQ0 patrol should report it within 1s)\n");
+            return;
+        }
+        ezos_console_write("STACKCHK: burn: no guarded slot "
+                           "(run ktask first)\n");
+        return;
+    }
+    if (args[0] != '\0') {
+        ezos_console_write("usage: stackchk [selftest|burn]\n");
+        return;
+    }
+    uint32_t n = 0;
+    const task_t *tab = task_table(&n);
+    static const char *st[] = { "unused", "ready", "running",
+                                "blocked", "zombie" };
+    uint32_t checked = 0;
+    uint32_t bad = 0;
+
+    ezos_console_write("  SLOT  PID   PEAK / LIMIT   GUARD  STATE    NAME\n");
+    for (uint32_t i = 0; i < n; i++) {
+        /* 只跳过从未装载过栈的槽位（kstack==0，含 0 号任务：它跑在启动栈
+         * 上，不在栈池里，没有守卫）。
+         * **已退出的槽位照样显示**：任务退出不清 kstack，栈里的 0xA5 痕迹
+         * 还在，于是能看到"这个槽位上跑过的任务最多用了多少"—— 这正是
+         * 定位"某个任务偶发写穿"最想知道的数。 */
+        if (tab[i].kstack == 0) continue;
+        checked++;
+        int layer = stackchk_broken_layer(tab[i].kstack, TASK_KSIZE);
+        uint32_t peak = stackchk_peak(tab[i].kstack, TASK_KSIZE);
+        if (layer != -1) {
+            bad++;
+            ezos_console_write("STACKCHK: CORRUPTION slot=");
+            ezos_console_print_dec(i);
+            ezos_console_write(" layer=");
+            ezos_console_write(layer == 1 ? "guard" : "canary");
+            ezos_console_write("\n");
+        }
+        ezos_console_write("  ");
+        ezos_console_print_dec(i);
+        ezos_console_write("     ");
+        ezos_console_print_dec(tab[i].pid);
+        ezos_console_write("    ");
+        ezos_console_print_dec(peak);
+        ezos_console_write(" / ");
+        ezos_console_print_dec((uint32_t)(TASK_KSIZE - KS_CANARY));
+        ezos_console_write("   ");
+        ezos_console_write(layer == -1 ? "OK  " : "BAD ");
+        ezos_console_write("   ");
+        ezos_console_write(st[(uint32_t)tab[i].state]);
+        ezos_console_write("   ");
+        ezos_console_write(tab[i].name[0] ? tab[i].name : "(unnamed)");
+        ezos_console_write("\n");
+    }
+    ezos_console_write("STACKCHK: ");
+    ezos_console_print_dec(checked);
+    ezos_console_write(" slot(s) checked, ");
+    if (bad == 0) ezos_console_write("all guards intact\n");
+    else {
+        ezos_console_print_dec(bad);
+        ezos_console_write(" CORRUPTED (stack overflow - see slot(s) above)\n");
+    }
 }
 
 void cmd_htmltest(const char *args) {

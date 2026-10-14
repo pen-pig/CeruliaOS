@@ -10,13 +10,38 @@
 #include "paging.h"     /* PAGING_PD_ADDR / paging_switch_cr3（6c 地址空间切换） */
 #include "pmm.h"        /* 进程退出时按账回收物理页 */
 #include "syscall.h"    /* USER_STACK_TOP / USER_STACK_PAGES：task_fork 复制用户栈用 */
+#include "stackchk.h"   /* 任务内核栈守卫（水位 + canary + guard） */
+#include "dmesg.h"      /* 栈守卫巡检告警 */
 
 /* ---------- 内核栈池 ----------
  * 每任务 16KB，位于 linker.ld 的 .bss.kstack（物理 0x904000 起）。
  * 为什么不放 .bss.hi：那里已用 ~1.97MB（上限 2MB），8 个 16KB 会顶穿。
- * 栈向低地址生长，kstack_top = kstack + TASK_KSIZE。 */
-static uint8_t g_kstacks[MAX_TASKS][TASK_KSIZE]
+ * 栈向低地址生长，kstack_top = kstack + TASK_KSIZE。
+ *
+ * **每个 slot 前面（低地址侧）多留 KS_GUARD 字节**：栈向下生长，越界最先
+ * 踩到的就是这里。越界写穿的后果是改掉相邻任务的栈或别的静态数据 —— 曾经
+ * cmd_ls 的 entries[64] 就是这么把 fs.c 的 ro_cwd 写坏的，症状是提示符变成
+ * `[A.TXT]`，看着像文件系统坏了。守卫见 kernel/stackchk.c。
+ * 代价 8*64B=512B，相对 0x904000..0xA00000 的窗口可以忽略。 */
+static uint8_t g_kstack_area[MAX_TASKS][KS_GUARD + TASK_KSIZE]
     __attribute__((section(".bss.kstack"), aligned(16)));
+
+/* slot 的可用栈底 = 该 slot 区域起点 + guard 长度 */
+static uint32_t ks_base(uint32_t slot) {
+    return (uint32_t)(unsigned long)&g_kstack_area[slot][KS_GUARD];
+}
+
+/* ---- 栈守卫巡检（IRQ0）----
+ * 只在 shell 里手动敲 stackchk 的话，"跑着跑着写穿了"没人知道——等到发现
+ * 时现场早没了。所以 IRQ0 每 STACKCHK_TICK_MS 巡检一次全部已装载的槽位。
+ * 开销：每槽几十字节比较（8 槽 ≈ 640B 读），相对 1ms 一次的 IRQ0 可忽略。
+ *
+ * 这里**只报告、不停机**：中断上下文里 panic 会把一次"某个任务的栈快满了"
+ * 变成整机不可用，还掩盖第一现场。处置交给 shell 的 stackchk（它能给出
+ * 槽位、峰值、是哪一层坏了）。每槽只报一次，避免刷屏。 */
+#define STACKCHK_TICK_MS 1000u
+static uint32_t g_stackchk_tick;
+static int      g_stackchk_reported[MAX_TASKS];
 
 /* g_tasks 迁 .bss.hi（步骤 8a）：低 .bss 在 0x90000 栈区断言前只剩
  * ~160B，等待队列新字段（wait_next/wake_tick/wait_q）加上必然顶爆
@@ -168,8 +193,10 @@ int task_create(const char *name, void (*fn)(void *), void *arg) {
     if (slot < 0) return -1;
 
     task_t *t = &g_tasks[slot];
-    t->kstack     = (uint32_t)g_kstacks[slot];
+    t->kstack     = ks_base(slot);
     t->kstack_top = t->kstack + TASK_KSIZE;
+    stackchk_arm(t->kstack, TASK_KSIZE);   /* 守卫：见 stackchk.h */
+    g_stackchk_reported[slot] = 0;   /* 槽位复用：告警状态归零 */
     t->pid        = g_next_pid++;
     t->state      = TASK_READY;
     t->ticks      = TASK_TIMESLICE;
@@ -231,8 +258,10 @@ int task_create_process(const char *name, uint32_t entry, uint32_t user_esp,
     if (slot < 0) return -1;
 
     task_t *t = &g_tasks[slot];
-    t->kstack     = (uint32_t)g_kstacks[slot];
+    t->kstack     = ks_base(slot);
     t->kstack_top = t->kstack + TASK_KSIZE;
+    stackchk_arm(t->kstack, TASK_KSIZE);   /* 守卫：见 stackchk.h */
+    g_stackchk_reported[slot] = 0;   /* 槽位复用：告警状态归零 */
     t->pid        = g_next_pid++;
     t->state      = TASK_READY;
     t->ticks      = TASK_TIMESLICE;
@@ -497,8 +526,10 @@ int task_fork(void *syscall_frame) {
 
     /* 4) 登记子任务，复制 fd 表（pipe 递增引用计数在 fd_table_dup 内完成） */
     task_t *c = &g_tasks[slot];
-    c->kstack     = (uint32_t)g_kstacks[slot];
+    c->kstack     = ks_base(slot);
     c->kstack_top = c->kstack + TASK_KSIZE;
+    stackchk_arm(c->kstack, TASK_KSIZE);   /* 守卫：见 stackchk.h */
+    g_stackchk_reported[slot] = 0;   /* 槽位复用：告警状态归零 */
     c->pid        = g_next_pid++;
     c->state      = TASK_READY;
     c->ticks      = TASK_TIMESLICE;
@@ -606,6 +637,23 @@ void task_timer_tick(void) {
         if (t->wait_q != 0) wq_remove(t->wait_q, (int)i);
         t->wake_tick = 0;
         t->state = TASK_READY;     /* 真唤醒还是超时，由等待循环自查条件 */
+    }
+
+    /* 栈守卫巡检（见文件头的守卫说明） */
+    if ((uint32_t)(now - g_stackchk_tick) >= STACKCHK_TICK_MS) {
+        g_stackchk_tick = now;
+        for (uint32_t i = 0; i < MAX_TASKS; i++) {
+            if (g_tasks[i].kstack == 0) continue;      /* 没装载过 */
+            if (g_stackchk_reported[i]) continue;      /* 已报过 */
+            int layer = stackchk_broken_layer(g_tasks[i].kstack, TASK_KSIZE);
+            if (layer == -1) continue;
+            g_stackchk_reported[i] = 1;
+            dmesg_write(layer == 1
+                ? "STACKCHK: guard broken (a task wrote past its kernel "
+                  "stack base)"
+                : "STACKCHK: canary broken (a task kernel stack is nearly "
+                  "exhausted)");
+        }
     }
 }
 

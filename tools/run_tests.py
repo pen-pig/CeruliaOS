@@ -54,7 +54,7 @@ PY = sys.executable
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
-             "termwrap"],
+             "termwrap", "stackchk"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
              "fsck"],
@@ -86,7 +86,7 @@ LAYERS = {
     # 在带删除钩子的环境里还会被拦成 FAIL），而 check_html.py 从来没被执行过。
     # 所以对拍闸门形同虚设，static 层每次都在跑 E2E。
     "static": ["check_stack", "stack", "encoding", "help", "check_cpu",
-               "check_vmx", "check_html", "usbmsc_rules"],
+               "check_vmx", "check_html", "usbmsc_rules", "check_alloc"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。
@@ -125,6 +125,10 @@ WATCH = [
     # 对拍走 static 的 check_html（宿主探针，几秒），webview/gfxwin 要真跑 QEMU。
     ("html.rs", "static check_html"), ("ref_html", "static check_html"),
     ("webview", "gui check_html"), ("browser", "gui"), ("http.c", "net gui"),
+    ("kmalloc", "static"), ("pmm", "static"),
+    # 栈守卫：改 task.c 的栈池布局或 stackchk.c 的判据，都会让"写穿了没人
+    # 报出来"，所以两端都要跑（E2E 验行为、static 验源码判据）
+    ("stackchk", "core"), ("task.c", "core"),
     ("rust_bridge", "static"),
 ]
 

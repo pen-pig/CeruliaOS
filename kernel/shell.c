@@ -473,6 +473,7 @@ static const command_t commands[] = {
     {"mouseproto", cmd_mouseproto},
     {"ktask",     cmd_ktask},
     {"ps",        cmd_ps},
+    {"stackchk",  cmd_stackchk},
     {"pci",       cmd_pci},
     {"nic",       cmd_nic},
     {"ping",      cmd_ping},
