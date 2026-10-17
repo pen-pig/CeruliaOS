@@ -1,0 +1,6 @@
+# Shell 脚本必须 LF：CRLF 的 sh 在 Linux/WSL 下会把 shebang 读成
+# `/usr/bin/env bash^M`，报 "bad interpreter" 而不是正常执行。
+# core.autocrlf=true 时 git 会把 *.sh 在 checkout 时翻成 CRLF，ci/*.sh 之前
+# 只能靠人工维持 LF（易碎，release/setup_and_run.sh 就已经是 CRLF 了）。
+# 这里显式钉住，跟 .bat 必须纯 ASCII 是同一类约束。
+*.sh text eol=lf
