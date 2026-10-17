@@ -58,6 +58,26 @@ def read(name):
         return f.read()
 
 
+def build_stamp():
+    """生成 built= 的日期：取输入（user/*.elf）里最新的 mtime。
+
+    降级路径：一个 elf 都读不到时返回 "unknown" 而不是当天日期 —— 宁可让
+    built= 没意义，也不要让它在每次重建时都变（会污染 diff）。
+    """
+    newest = 0
+    for n in BIN_FILES:
+        p = os.path.join(ROOT, "user", n)
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m > newest:
+            newest = m
+    if newest == 0:
+        return "unknown"
+    return time.strftime("%Y-%m-%d", time.localtime(newest))
+
+
 def main():
     entries = []          # (path, bytes)
     blob = bytearray()
@@ -67,7 +87,14 @@ def main():
         entries.append(("/bin/" + n, data))
 
     # /system 下放两个纯文本元信息文件，方便 shell/E2E 直接 cat 验证
-    stamp = time.strftime("%Y-%m-%d")
+    # built= 用**输入**的时间戳，不用"现在"。
+    #
+    # 为什么：本文件是入库的生成文件（kernel/sysvol_data.c）。用 time.strftime
+    # 的话每次重建都写当天日期，于是"什么都没改、只跑了一次 ninja"也会在
+    # git status 里留一行 M，真实改动被噪声淹没，而且构建不可复现。
+    # 取 user/*.elf 里最新的 mtime：内容没变 → 日期不变 → 无 diff；
+    # 内容变了 → 日期跟着变，仍然是"这个卷是哪天编的"的有效信息。
+    stamp = build_stamp()
     names = "".join(n + "\n" for n in BIN_FILES)
     sys.path.insert(0, ROOT)
     import ezos_env  # noqa: E402
