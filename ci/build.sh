@@ -136,8 +136,11 @@ if [ ! -f "$RUST_LIB" ]; then
 fi
 
 echo "[ci] ZIG ezos_zig.o"
+# -mcpu i686 不能省：默认 x86 基线带 SSE2，编出来的 .o 进内核就是 #UD
+# （内核只 fninit、不设 CR4.OSFXSR）。开发机 build.ninja 一直带着这个开关，
+# CI 这份漏了——check_cpu 闸门上岗后立刻抓到。两边参数必须对齐。
 if ! ( cd rust/ezos_zig && "$ZIG" build-obj -target x86-freestanding \
-        -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
+        -mcpu i686 -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
     echo "[ci] FATAL: zig build-obj failed, tail:" >&2
     tail -40 ci-zig.log >&2
     ann_log ci-zig.log zig
