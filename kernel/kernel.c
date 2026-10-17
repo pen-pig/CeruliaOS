@@ -684,12 +684,12 @@ void kernel_main(void) {
     /* 开机 ASCII 横幅：CERULIA。品牌改名时 EZOS 字画被漏掉过一次——
      * 字画是字符拼出来的，rename_brand.py 的 \bEZOS\b 文本匹配够不着。 */
     terminal_writestring("\n");
-    terminal_writestring("    ____     _____     _____      _    _    | |        _____        __\n");
-    terminal_writestring("   / ___|   |  ___|   |  __ \\    | |  | |   | |       |_   _|      / /\n");
-    terminal_writestring("  | |       | |__     | |  | |   | |  | |   | |         | |       / /\n");
-    terminal_writestring("  | |       |  __|    | |  | |   | |  | |   | |         | |      / /____\n");
-    terminal_writestring("  | |___    | |___    | |__/ /   | |__| |   | |___      | |     / /____/\n");
-    terminal_writestring("   \\____|   |_____|   |_____/     \\____/    |_____|   |_____|   \\_____/\n");
+    terminal_writestring("    ____     _____     _____      _    _    __         _____         /  \\\n");
+    terminal_writestring("   / ___|   |  ___|   | |__ \\    | |  | |   | |       |_   _|       / /\\ \\\n");
+    terminal_writestring("  | |       | |__     | |__/ /   | |  | |   | |         | |        / /__\\ \\\n");
+    terminal_writestring("  | |       |  __|    | |  _/    | |  | |   | |         | |       / /____\\ \\\n");
+    terminal_writestring("  | |___    | |___    | | \\ \\    | |__| |   | |___      | |      / /______\\ \\\n");
+    terminal_writestring("  \\____|   |_____|   |_|  \\_\\    \\_____/   |_____|   |_____|   /_/        \\ \\\n");
     terminal_writestring("             by luogu @_Sparse_Table_ and @XPH_csc\n");
     terminal_writestring("\n");
 //	klog_ok("Cerulia Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
