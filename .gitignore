@@ -117,6 +117,12 @@ vmware/*.vmxf
 vmware/nvram
 vmware/vmware.log
 
-# Rust 构建产物（target/ 与 cargo registry 缓存；源码与 Cargo.lock 入库）
-rust/ezos_rs/target/
+# Rust 构建产物（target/ 下的中间产物不入库；源码与 Cargo.lock 入库）
+rust/ezos_rs/target/*
+!rust/ezos_rs/target/i686-ezos/
+rust/ezos_rs/target/i686-ezos/*
+!rust/ezos_rs/target/i686-ezos/release/
+rust/ezos_rs/target/i686-ezos/release/*
+!rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 rust/ezos_zig/*.o
+!rust/ezos_zig/ezos_zig.o
