@@ -105,7 +105,7 @@ jobs:
         run: python3 tools/check_vmx.py
 
       - name: Generate data disk
-        run: python3 temp/gen_diskimg.py disk.img
+        run: python3 tools/gen_diskimg.py disk.img
 
       # 宿主机侧只读体检：Boot Checksum（主/备）、备份 VBR、位图↔FAT 一致性、
       # Up-case 校验和、根目录次级条目标志位、MBR。这几个地方写错的话，内核
@@ -129,7 +129,7 @@ jobs:
         run: |
           mkdir -p dist
           cp os-image.bin disk.img dist/
-          cp temp/gen_diskimg.py dist/
+          cp tools/gen_diskimg.py dist/
           cp release/setup_and_run.bat release/setup_and_run.sh dist/
           # 附上构建配置清单，方便用户在真机复现
           cp linker.ld dist/ 2>/dev/null || true
