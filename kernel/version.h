@@ -13,6 +13,6 @@
 #ifndef EZOS_VERSION_H
 #define EZOS_VERSION_H
 
-#define EZOS_VERSION "1.1.2"
+#define EZOS_VERSION "1.1.1"
 
 #endif /* EZOS_VERSION_H */

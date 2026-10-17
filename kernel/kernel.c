@@ -681,14 +681,16 @@ void kernel_main(void) {
         }
     }
     /* 启动日志到此打完，banner 直接跟在 verbose boot log 之后 */
-    //ascii art
-	terminal_writestring("\n");
-    terminal_writestring("  _____   ______  _____   _____\n");
-    terminal_writestring(" |  ___| |___  / |  _  | /  ___|\n");
-    terminal_writestring(" | |__      / /  | | | | \\ `--. \n");
-    terminal_writestring(" |  __|    / /   | | | |  `--. \\\n");
-    terminal_writestring(" | |___  ./ /___ | |_| | /\\__/ /\n");
-    terminal_writestring(" \\____/  \\_____/ \\_____/ \\____/ \n");
+    /* 开机 ASCII 横幅：CERULIA。品牌改名时 EZOS 字画被漏掉过一次——
+     * 字画是字符拼出来的，rename_brand.py 的 \bEZOS\b 文本匹配够不着。 */
+    terminal_writestring("\n");
+    terminal_writestring("     ____    _____    _____     _    _    _       _____       __\n");
+    terminal_writestring("    / ___|  |  ___|  |  __ \\   | |  | |  | |     |_   _|     / /\n");
+    terminal_writestring("   | |      | |__    | |  | |  | |  | |  | |       | |      / /\n");
+    terminal_writestring("   | |      |  __|   | |  | |  | |  | |  | |       | |     / /\n");
+    terminal_writestring("   | |___   | |___   | |__/ |  | |__| |  | |___    | |    / /____\n");
+    terminal_writestring("    \\____|  |_____|  |_____/    \\____/   |____|  |_____|  \\______|\n");
+    terminal_writestring("             by luogu @_Sparse_Table_ and @XPH_csc\n");
     terminal_writestring("\n");
 //	klog_ok("Cerulia Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
 

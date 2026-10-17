@@ -39,7 +39,7 @@ start:
     jmp short reloc
     nop
 
-oem_name:   db "EZOSMBR "
+oem_name:   db "CERULIA "
 
 ; ---------- BPB (0x0B .. 0x23) ----------
 bps:            dw 512
@@ -60,7 +60,7 @@ drive_num:      db 0x80
 reserved_bpb:   db 0
 boot_sig:       db 0x29
 volume_id:      dd 0x1BADB002
-volume_label:   db "EZOS USB   "
+volume_label:   db "CERULIA USB"
 fs_type:        db "FAT32   "
 
 times 0x5A-($-$$) db 0
@@ -142,7 +142,7 @@ print_str:
 .done:
     ret
 
-err_msg:        db "EZOS: cannot read boot sector", 0
+err_msg:        db "Cerulia: cannot read boot sector", 0
 
 dbg:
     ; Write AL to the QEMU debug console (port 0xE9). Cheaper and far more
