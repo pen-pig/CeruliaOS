@@ -33,6 +33,22 @@ LINES = {
 
 
 def build(root, src, out, skip_rustzig):
+    # Rust 的宿主目标（build-std / proc-macro / 探针）要为 Windows PE 链接，
+    # 需要 MSVC 的 link.exe。这里**只改当前进程的环境**，让 build.ninja 里
+    # 那条 `cargo build` 能编过；ninja 文件本身不写死 MSVC 路径，否则换机器
+    # 就编不过（正是这个文件开头要消灭的那类写死）。
+    # 不写进命令行是有意的：ninja 按命令行判 dirty，加一段路径进去就等于
+    # 让 libezos_rs.a 每次重新生成 ninja 都变脏。
+    if not skip_rustzig:
+        if ezos_env.prepend_host_linker_path():
+            sys.stderr.write("[gen_ninja] host linker: %s\n" %
+                             ezos_env.host_linker_dir())
+        else:
+            sys.stderr.write(
+                "[gen_ninja] WARN: 未找到 MSVC link.exe，Rust 增量可能编不过"
+                "（设 EZOS_LINKER_DIR 指向 ...\\VC\\Tools\\MSVC\\<ver>"
+                "\\bin\\Hostx64\\x64）\n")
+
     with open(src, "rb") as f:
         data = f.read()
 
