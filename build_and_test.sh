@@ -102,7 +102,7 @@ if [[ "$MODE" == "build-only" || "$MODE" == "no-run" ]]; then
 fi
 
 echo "正在重建 disk.vhd（exFAT 布局）..."
-"$PYTHON" "$(dirname "$0")/temp/gen_diskimg.py" disk.vhd
+"$PYTHON" "$(dirname "$0")/tools/gen_diskimg.py" disk.vhd
 
 echo "正在启动 QEMU..."
 "$QEMU" -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd

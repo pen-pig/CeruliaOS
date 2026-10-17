@@ -4,7 +4,7 @@ rem ============================================================
 rem  EZOS - Windows 一键启动脚本（QEMU）
 rem  要求: os-image.bin 与本脚本同目录
 rem  若未安装 QEMU 会自动尝试 winget 安装（包 ID: SoftwareFreedomConservancy.QEMU）
-rem  数据盘 disk.vhd 缺失时用同目录 gen_diskimg.py 重新生成
+rem  数据盘 disk.vhd 缺失时用 tools\gen_diskimg.py 重新生成
 rem ============================================================
 setlocal
 cd /d "%~dp0"
@@ -46,7 +46,7 @@ if errorlevel 1 (
 rem ---- ensure data disk ----
 if not exist "disk.vhd" (
     echo [INFO] disk.vhd missing, regenerating with gen_diskimg.py...
-    python "%~dp0gen_diskimg.py" "disk.vhd"
+    python "%~dp0..\tools\gen_diskimg.py" "disk.vhd"
     if errorlevel 1 (
         echo [ERROR] failed to generate disk.vhd. Check Python installation.
         pause

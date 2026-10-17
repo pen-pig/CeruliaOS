@@ -48,6 +48,16 @@ def build(root, src, out, skip_rustzig):
         except SystemExit as e:
             sys.stderr.write("[ERROR] %s\n" % e)
             return 2
+        # 探测结果会原样写进 ninja 的命令行字符串，而 ninja **按命令行
+        # 判 dirty**：字符串只要变了，哪怕只是 .EXE/.exe 的大小写不同，
+        # 对应目标就被判脏、触发全量重编。Rust 那条尤其致命——
+        # libezos_rs.a 重编要 MSVC 的 host linker，机器上一没有就会把
+        # 整个构建链打断（实测：rustup 给的 cargo.EXE 与 build.ninja 里
+        # 写的 cargo.exe 差一个大小写，重新生成一次 build_auto.ninja 就让
+        # 763KB 的 .a 变成 dirty，然后链接失败）。Windows 文件系统不区分
+        # 大小写，所以统一成小写 .exe 功能等价、输出稳定。
+        if val.lower().endswith(".exe"):
+            val = val[:-4] + ".exe"
         pat = re.compile(rb"^%s(\s*)=.*$" % key.encode(), re.M)
         if not pat.search(data):
             sys.stderr.write("[WARN] build.ninja 里没有 %s 行，跳过\n" % key)

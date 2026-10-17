@@ -109,7 +109,7 @@ rule make_disk
     # disk.vhd 既能被 Windows 双击挂载（需 UAC 提权），也能给 QEMU 当 raw 盘
     # ——尾巴那 512 字节内核永远读不到。想单独转换一个 raw 镜像时用
     # tools/make_vhd.py。
-    command = cmd /c python temp/gen_diskimg.py disk.vhd
+    command = cmd /c python tools/gen_diskimg.py disk.vhd
     description = BUILD disk.vhd
 
 rule make_usb
@@ -231,7 +231,7 @@ build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.
 
 build kernel.bin os-image.bin: make_image boot/boot.bin boot/stage2.bin kernel_raw.bin tools/make_image.py boot/layout.inc
 
-build disk.vhd: make_disk temp/gen_diskimg.py
+build disk.vhd: make_disk tools/gen_diskimg.py
 
 build boot/mbr_usb.bin: asm_bin boot/mbr_usb.asm
 build usb-image.bin: make_usb os-image.bin kernel.bin boot/mbr_usb.bin tools/make_usb_image.py
