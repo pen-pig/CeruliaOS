@@ -687,9 +687,9 @@ void kernel_main(void) {
     terminal_writestring("    ____     _____     _____      _    _    | |        _____        __\n");
     terminal_writestring("   / ___|   |  ___|   |  __ \\    | |  | |   | |       |_   _|      / /\n");
     terminal_writestring("  | |       | |__     | |  | |   | |  | |   | |         | |       / /\n");
-    terminal_writestring("  | |       |  __|    | |  | |   | |  | |   | |         | |      / /\n");
-    terminal_writestring("  | |___    | |___    | |__/ |   | |__| |   | |___      | |     / /____\n");
-    terminal_writestring("   \\____|   |_____|   |_____/     \\____/    |_____|   |_____|   \\______|\n");
+    terminal_writestring("  | |       |  __|    | |  | |   | |  | |   | |         | |      / /____\n");
+    terminal_writestring("  | |___    | |___    | |__/ /   | |__| |   | |___      | |     / /____/\n");
+    terminal_writestring("   \\____|   |_____|   |_____/     \\____/    |_____|   |_____|   \\_____/\n");
     terminal_writestring("             by luogu @_Sparse_Table_ and @XPH_csc\n");
     terminal_writestring("\n");
 //	klog_ok("Cerulia Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
