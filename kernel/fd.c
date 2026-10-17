@@ -506,8 +506,11 @@ int fd_selftest(void (*out)(const char *)) {
     }
     uint8_t buf[64];
     int n = fd_read(&t, fd, buf, sizeof(buf));
-    int ok1 = (n == 46) && buf[0] == 'W' && buf[7] == ' ';   /* "Welcome " 第 8 字节 */
-    out("  open+read README.TXT (46B): ");
+    /* 钉契约"README.TXT 以 'Welcome ' 开头"，**不钉字节数**：
+     * README 文案一改（品牌名、盘类型）长度就变，硬编码 46B 会让自检假红
+     * （实测 EZOS→Cerulia 后 46B→49B，fd 自检直接 FAIL）。 */
+    int ok1 = (n >= 8) && buf[0] == 'W' && buf[7] == ' ';   /* "Welcome " 第 8 字节 */
+    out("  open+read README.TXT (prefix): ");
     out(ok1 ? "yes [OK]\n" : "NO [FAIL]\n");
     if (!ok1) fail++;
 
@@ -520,10 +523,11 @@ int fd_selftest(void (*out)(const char *)) {
     out(ok2 ? "yes [OK]\n" : "NO [FAIL]\n");
     if (!ok2) fail++;
 
-    /* 3) lseek SEEK_END 返回文件大小 */
+    /* 3) lseek SEEK_END 返回文件大小 —— 与首次读回长度自洽（同样不依赖文案长度：
+     *    读满缓冲区时只能要求 pos >= n，否则要求精确相等） */
     int pos = fd_lseek(&t, fd, 0, SEEK_END);
-    int ok3 = (pos == 46);
-    out("  lseek END == size (46): ");
+    int ok3 = (pos >= n) && (n == (int)sizeof(buf) || pos == n);
+    out("  lseek END == file size: ");
     out(ok3 ? "yes [OK]\n" : "NO [FAIL]\n");
     if (!ok3) fail++;
     fd_close(&t, fd);

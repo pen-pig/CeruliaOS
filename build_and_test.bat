@@ -41,7 +41,7 @@ set "ARG=%~1"
 if /i "%ARG%"=="clean" goto clean
 
 echo ============================================
-echo Building EZOS...
+echo Building Cerulia...
 echo ============================================
 
 if /i "%ARG%"=="build-only" goto build_only

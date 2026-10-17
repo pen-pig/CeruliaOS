@@ -107,7 +107,7 @@ def main():
         # ---- B. 系统卷 cwd 下的相对路径 ----
         check("cd /system", "cd /system", "")
         check("relative cat inside /system", "cat version",
-              "EZOS built-in system volume")
+              "built-in system volume")
         check("relative write inside /system rejected", "write v2 hi",
               "Failed to write file.")
         check("leave system volume", "cd ..", "")

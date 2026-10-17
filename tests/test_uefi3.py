@@ -266,7 +266,7 @@ def main():
         # ---- boot: OVMF -> EZEFI loader -> kernel -> shell ----
         deadline = time.time() + BOOT_WAIT
         while time.time() < deadline:
-            if "EZOS Shell" in serial():
+            if "Shell - Type 'help'" in serial():
                 break
             time.sleep(1)
         else:
@@ -333,7 +333,7 @@ def main():
         time.sleep(3)
         shot(SHOT)
         check("exit GUI: back to 720x400 text mode", ppm_dims(SHOT) == "720 400")
-        check("exit GUI: shell banner reprinted", serial().count("EZOS Shell") >= 2)
+        check("exit GUI: shell banner reprinted", serial().count("Shell - Type 'help'") >= 2)
 
         # ---- shell still alive after round trip ----
         qmp.type_line("ver")

@@ -318,8 +318,8 @@ def phase_httpd():
         assert data.startswith(b"HTTP/1.0 200 OK"), \
             "bad response head: %r" % data[:40]
         body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
-        assert b"EZOS" in body and b"i686" in body, "unexpected body: %r" % body[:120]
-        print("  [OK] HTTP 200 + EZOS page (%d bytes)" % len(data))
+        assert b"<h1>" in body and b"i686" in body, "unexpected body: %r" % body[:120]
+        print("  [OK] HTTP 200 + system page (%d bytes)" % len(data))
         time.sleep(1.5)                     # 给 guest 时间处理我方 ACK/FIN
         txt = g.screen_text("temp/netapp_httpd.ppm").lower()
         assert "panic" not in txt, "kernel panic on screen"

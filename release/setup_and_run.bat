@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 rem ============================================================
-rem  EZOS - Windows 一键启动脚本（QEMU）
+rem  Cerulia - Windows 一键启动脚本（QEMU）
 rem  要求: os-image.bin 与本脚本同目录
 rem  若未安装 QEMU 会自动尝试 winget 安装（包 ID: SoftwareFreedomConservancy.QEMU）
 rem  数据盘 disk.vhd 缺失时用 tools\gen_diskimg.py 重新生成
@@ -11,7 +11,7 @@ cd /d "%~dp0"
 
 if not exist "os-image.bin" (
     echo [ERROR] os-image.bin not found next to this script.
-    echo         Please download the full EZOS release zip.
+    echo         Please download the full Cerulia release zip.
     pause
     exit /b 1
 )
@@ -54,6 +54,6 @@ if not exist "disk.vhd" (
     )
 )
 
-echo [INFO] Booting EZOS in QEMU...
+echo [INFO] Booting Cerulia in QEMU...
 qemu-system-x86_64 -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd
 endlocal

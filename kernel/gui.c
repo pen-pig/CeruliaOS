@@ -1,5 +1,5 @@
 /*
- * gui.c - EZOS 文本界面（Win10 风格字符界面 v0.5）
+ * gui.c - Cerulia 文本界面（Win10 风格字符界面 v0.5）
  * 整块重构：窗口边框 + 蓝色标题栏 + 反显菜单 + 实时时钟
  * 功能不变：About / Show Time / Exit 三项文本菜单
  */
@@ -88,9 +88,9 @@ static void gui_about(void)
     terminal_initialize();
     draw_box(wx, wy, ww, wh);
     fill_range(wy + 1, wx + 1, ww - 2, C_TITLE, ' ');
-    puts_at(wy + 1, wx + 3, C_TITLE, "About EZOS");
+    puts_at(wy + 1, wx + 3, C_TITLE, "About Cerulia");
     fill_range(wy + 2, wx + 1, ww - 2, C_ACCENT, BOX_H[0]);
-    puts_at(wy + 4, wx + 5, C_TEXT, "EZOS v0.3-gui");
+    puts_at(wy + 4, wx + 5, C_TEXT, "Cerulia v0.3-gui");
     puts_at(wy + 5, wx + 5, C_NORMAL, "A simple OS written from scratch.");
     puts_at(wy + 7, wx + 5, C_DIM, "Press Enter to return.");
     wait_enter();
@@ -130,9 +130,9 @@ void gui_start(void) {
     terminal_initialize();
     terminal_setcolor(C_NORMAL);
 
-    const char *title = "EZOS GUI  (Text Mode)";
+    const char *title = "Cerulia GUI  (Text Mode)";
     const char *menu[] = {
-        "1. About EZOS",
+        "1. About Cerulia",
         "2. Show Time",
         "3. Exit to Shell"
     };

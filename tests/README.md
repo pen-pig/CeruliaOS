@@ -1,4 +1,4 @@
-# EZOS E2E 回归套件
+# Cerulia E2E 回归套件
 
 > **真机启动与 U 盘制作见 [`docs/USB_BOOT.md`](../docs/USB_BOOT.md)**：把 `os-image.bin`
 > 整盘写进 U 盘（禁止拷成文件）、三平台步骤、BIOS 设置与"无屏只有串口"的排查清单。

@@ -1794,7 +1794,7 @@ int f2fs_delete_file(const char *name) {
 typedef struct { int empty; } f2_empty_ctx;
 static int f2_empty_cb(const char *name, uint32_t ino, int is_dir, void *ctx) {
     (void)ino; (void)is_dir;
-    /* EZOS 子目录不含 . / .. 项；即使有也忽略 */
+    /* Cerulia 子目录不含 . / .. 项；即使有也忽略 */
     if (name[0] == '.' && (name[1] == 0 ||
         (name[1] == '.' && name[2] == 0))) return 0;
     ((f2_empty_ctx *)ctx)->empty = 0;

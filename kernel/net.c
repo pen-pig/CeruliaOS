@@ -2004,8 +2004,8 @@ int net_httpd_once(void) {
         "Content-Type: text/html\r\n"
         "Connection: close\r\n"
         "\r\n"
-        "<html><head><title>EZOS</title></head><body>"
-        "<h1>EZOS " EZOS_VERSION "</h1>"
+        "<html><head><title>Cerulia</title></head><body>"
+        "<h1>Cerulia " EZOS_VERSION "</h1>"
         "<p>Hello from a hand-written i686 kernel - "
         "TCP/IP stack included, no libc required.</p>"
         "</body></html>";

@@ -182,7 +182,7 @@ def main():
             ("ver",              ("version " + VER), 2.5),
             ("ps",               "pid",           2.5),
             ("ls",               "readme.txt",    3.0),
-            ("cat README.TXT",   "welcome to ezos", 3.0),
+            ("cat README.TXT",   "welcome to", 3.0),
             ("calc 6*7",         "42",            2.5),
             ("exec HELLO.ELF",   "hello from elf user program", 6.0),
             ("nic",              "rtl8139",       3.0),

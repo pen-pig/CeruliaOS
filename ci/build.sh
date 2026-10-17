@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# ci/build.sh - EZOS CI 构建脚本（系统 gcc -m32 + nasm + ld）
+# ci/build.sh - Cerulia CI 构建脚本（系统 gcc -m32 + nasm + ld）
 #
 # 与 worker/local 的 i686-elf-tools 方案等价：
 #   - 用系统 gcc -m32 -ffreestanding 编译（Ubuntu 的 gcc-multilib）

@@ -2,7 +2,7 @@
 #define GAMES_H
 
 /*
- * games.h - EZOS 游戏合集（自 sinwindows games.cpp 移植，纯 C 版）
+ * games.h - Cerulia 游戏合集（自 sinwindows games.cpp 移植，纯 C 版）
  *
  * 入口：shell 命令 "games" 打开游戏菜单（7 个游戏）；
  *       GUI 桌面模式经 games_set_gfx + games_play 在终端窗口中运行。

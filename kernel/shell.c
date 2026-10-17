@@ -903,7 +903,7 @@ static void shell_redraw_line(void) {
  * 回到了 shell 还是界面崩了。 */
 static void shell_banner(void)
 {
-    terminal_writestring("EZOS Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
+    terminal_writestring("Cerulia Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
 }
 
 void shell_run(void) {
@@ -1187,7 +1187,7 @@ static void cmd_echo(const char *args) {
 
 static void cmd_version(const char *args) {
     (void)args;
-    terminal_writestring("EZOS v0.3-gui\n");
+    terminal_writestring("Cerulia v0.3-gui\n");
 }
 
 static void cmd_time(const char *args) {
@@ -1453,7 +1453,7 @@ static void cmd_beep(const char *args) {
 
 static void cmd_about(const char *args) {
     (void)args;
-    terminal_writestring("EZOS v0.3-gui - A hobby operating system\n");
+    terminal_writestring("Cerulia v0.3-gui - A hobby operating system\n");
     terminal_writestring("Written in C and Assembly\n");
 }
 
@@ -2658,9 +2658,9 @@ static int vi_read_command(char *buf, int max) {
 
 static void cmd_uname(const char *args) {
     if (args[0] == '-') {
-        terminal_writestring("EZOS localhost 0.3-gui i686\n");
+        terminal_writestring("Cerulia localhost 0.3-gui i686\n");
     } else {
-        terminal_writestring("EZOS\n");
+        terminal_writestring("Cerulia\n");
     }
 }
 

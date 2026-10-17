@@ -4,7 +4,7 @@
 #include "types.h"      /* 下面 mem_range_mapped 的声明用到 uint32_t */
 
 /*
- * shell_extra.h - EZOS 命令行增强模块（借鉴 MikanOS 参数解析与命令语义）
+ * shell_extra.h - Cerulia 命令行增强模块（借鉴 MikanOS 参数解析与命令语义）
  *
  * 由 shell.c 命令表注册的新命令实现放在 shell_extra.c，
  * 通过本头文件暴露给 shell.c 与外部调用方。

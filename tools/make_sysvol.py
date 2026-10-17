@@ -103,7 +103,7 @@ def main():
         sys.stderr.write("make_sysvol: cannot read version from "
                          "kernel/version.h\n")
         sys.exit(1)
-    version = ("EZOS built-in system volume\n"
+    version = ("Cerulia built-in system volume\n"
                "version=%s\n"
                "mount=/system /bin\n"
                "readonly=yes\n"

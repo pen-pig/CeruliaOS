@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  EZOS - Linux/macOS 一键启动脚本（QEMU）
+#  Cerulia - Linux/macOS 一键启动脚本（QEMU）
 #  要求: os-image.bin 与本脚本同目录
 #  未装 QEMU 时 Debian/Ubuntu 系尝试 apt 自动安装
 # ============================================================
@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 [ -f "os-image.bin" ] || {
     echo "[ERROR] os-image.bin not found next to this script."
-    echo "        Please download the full EZOS release zip."
+    echo "        Please download the full Cerulia release zip."
     exit 1
 }
 
@@ -32,5 +32,5 @@ if [ ! -f "disk.vhd" ]; then
         || python gen_diskimg.py disk.vhd
 fi
 
-echo "[INFO] Booting EZOS in QEMU..."
+echo "[INFO] Booting Cerulia in QEMU..."
 "$QEMU" -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd

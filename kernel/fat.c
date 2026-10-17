@@ -1,5 +1,5 @@
 /*
- * fat.c - FAT12/16/32 read-write driver for EZOS
+ * fat.c - FAT12/16/32 read-write driver for Cerulia
  *
  * 支持标准 MBR 分区内的 FAT 卷与整盘 FAT（superfloppy）：
  *   - FAT12/16/32 自动识别（按簇数：<4085 / <65525 / >=65525）

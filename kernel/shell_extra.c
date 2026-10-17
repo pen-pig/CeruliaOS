@@ -1,11 +1,11 @@
 /*
- * shell_extra.c - EZOS 命令行增强模块
+ * shell_extra.c - Cerulia 命令行增强模块
  *
  * 借鉴来源：MikanOS (https://github.com/uchan-nos/mikanOS, Apache-2.0)
  *   - MakeArgVector(): 把整行命令按空白拆分为 argv/argc 的参数解析框架
  *   - ls 详细模式 / hexdump / mem / echo / help 等命令语义
  *
- * 适配层：ezos_console_* 把 EZOS tty 文本终端与键盘驱动桥接为
+ * 适配层：ezos_console_* 把 Cerulia tty 文本终端与键盘驱动桥接为
  * 轻量 console 接口，使上层命令实现与具体终端解耦（最小改动兼容）。
  *
  * 编译环境：i686-elf-gcc，-ffreestanding，无 libc。
@@ -238,7 +238,7 @@ const char *shell_extra_lookup_alias(const char *name) {
 /* ver: 显示内核版本 */
 void cmd_ver(const char *args) {
     (void)args;
-    ezos_console_write("EZOS Kernel version " EZOS_VERSION " (i386)\n");
+    ezos_console_write("Cerulia Kernel version " EZOS_VERSION " (i386)\n");
 }
 
 /* sysinfo: 汇总系统信息（CPU / 内存 / 时间 / 版本） */
@@ -265,7 +265,7 @@ static void x_print_cpu_vendor(void) {
 void cmd_sysinfo(const char *args) {
     (void)args;
 
-    ezos_console_write("EZOS System Information\n");
+    ezos_console_write("Cerulia System Information\n");
     ezos_console_write("------------------------\n");
     ezos_console_write("Version : " EZOS_VERSION " (i386)\n");
     ezos_console_write("CPU     : ");
@@ -1243,7 +1243,7 @@ void cmd_mouseproto(const char *args) {
 
 void cmd_selftest(const char *args) {
     (void)args;
-    ezos_console_write("EZOS full self-test:\n");
+    ezos_console_write("Cerulia full self-test:\n");
 
     struct { const char *name; int run; uint32_t ms; const char *detail; } r[24];
     /* detail 要活到最后的汇总循环，不能指向块内局部数组 */

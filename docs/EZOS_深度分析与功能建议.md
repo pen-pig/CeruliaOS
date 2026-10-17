@@ -1,4 +1,4 @@
-# EZOS 深度源码分析与功能建议报告
+# Cerulia 深度源码分析与功能建议报告
 
 > 分析日期：2026-09-13 · 代码基线：D:\MyOS\src（约 21,300 行 C + 2 个 NASM 文件）
 > 项目定位（据项目说明）：手搓系统、可能用于生产级环境、代码需严谨
@@ -153,7 +153,7 @@ HISTORY_SIZE 8→64 存入 SCORES.DAT 同款持久化机制，`!n` 重复执行�
 - 这是"手搓 OS"走向"能跑用户程序 OS"的分水岭
 
 **12. ELF 加载器 + 用户程序工具链**
-- EZOS 自带 ld（binutils），内核能跑后交叉编译 hello.elf 放进数据盘
+- Cerulia 自带 ld（binutils），内核能跑后交叉编译 hello.elf 放进数据盘
 - shell 加 `exec hello.elf` 命令
 - 配合 11 的分界线方案：所有应用（vi/games/计算器）可渐进迁出内核，镜像 384KB 上限问题同时缓解
 

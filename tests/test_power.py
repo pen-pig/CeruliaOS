@@ -76,7 +76,8 @@ def main():
                 ser = f.read()
         except OSError:
             pass
-        check("EZOS Kernel" in ser, "serial: kernel banner mirrored to COM1")
+        check("Kernel" in ser and "loaded at 0x" in ser,
+              "serial: kernel banner mirrored to COM1")
         check("SERIAL: COM1 115200 8N1 loopback OK" in ser,
               "serial: loopback self-test logged")
         check("ACPI:" in ser, "serial: ACPI status line mirrored")

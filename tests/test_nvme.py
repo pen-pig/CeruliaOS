@@ -327,7 +327,7 @@ def case_nvme():
         if not ok:
             print("  ls out: " + out)
 
-        ok, out = run_cmd(qmp, serial, "cat README.TXT", "welcome to ezos")
+        ok, out = run_cmd(qmp, serial, "cat README.TXT", "welcome to")
         results.append(("cat over NVMe reads content", ok))
         if not ok:
             print("  cat out: " + out)

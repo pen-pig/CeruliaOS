@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# build_and_test.sh - EZOS Linux/WSL 构建入口
+# build_and_test.sh - Cerulia Linux/WSL 构建入口
 #
 # 用法:
 #   ./build_and_test.sh                # 构建并启动 QEMU

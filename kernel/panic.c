@@ -125,7 +125,7 @@ static void dump(isr_regs_t *r) {
     for (int i = 0; i < 80 * 25; i++) vga[i] = blank;
 
     terminal_set_cursor(0, 0);
-    pputs("EZOS kernel panic\n\n");
+    pputs("Cerulia kernel panic\n\n");
     pputs("  exception: ");
     terminal_setcolor(PANIC_COLOR);
     terminal_writestring(vec_name(r->vec));

@@ -352,7 +352,7 @@ static void fs_wipe_head(uint8_t drive, uint32_t start) {
  * fs_init() returns -2 for "disk present but no filesystem recognized", which
  * covers two very different situations:
  *   (a) the disk is empty / freshly erased  -> auto-format is fine
- *   (b) it holds a filesystem EZOS does not know (btrfs, XFS, an encrypted
+ *   (b) it holds a filesystem Cerulia does not know (btrfs, XFS, an encrypted
  *       volume, ...)                        -> auto-format destroys the data
  * Only (a) may be auto-formatted. A blank disk reads as all-0x00 or all-0xFF
  * for a good stretch at both LBA 0 and the partition start. Anything else is

@@ -83,7 +83,7 @@ fi
 
 echo "[smoke] ---- assertions ----"
 # 1) 真的进了内核（不是卡在 BIOS/引导扇区）
-check "内核横幅" "EZOS Kernel .* loaded at 0x1300000"
+check "内核横幅" "Cerulia Kernel .* loaded at 0x1300000"
 # 2) stage2 真的跑了：用 INT13h 把镜像读进 bounce 缓冲，又在保护模式下搬到
 #    19MB。旧断言只认"引导扇区直接读内核"，stage2 上马后必须换成这一条
 #    ——否则 CI 会绿在一条永远打不出来的日志上（679f9c3 就红在这里）。

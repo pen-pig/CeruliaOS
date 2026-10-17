@@ -589,7 +589,7 @@ static void ehci_bios_handoff(int ctl) {
     uint32_t after = *(volatile uint32_t *)(unsigned long)(g_ctl[ctl].cap + eecp);
     /* 走到这里说明 BIOS 200ms 内没交出所有权。仍然清掉 BIOS Owned Semaphore
      * —— 这**不是规范推荐的握手兜底，而是强夺**：规范做法是超时后放弃该
-     * 控制器并报错，由固件/用户决定。之所以在这里强夺，是因为 EZOS 是唯一
+     * 控制器并报错，由固件/用户决定。之所以在这里强夺，是因为 Cerulia 是唯一
      * 会用到 EHCI 的软件，等下去只会让启动卡死；风险是若 BIOS 的 SMM 代码
      * 仍在访问控制器，可能与我们的访问撞车。真机上如遇枚举异常，这里是第一
      * 个要怀疑的地方。

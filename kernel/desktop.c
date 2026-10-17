@@ -1,5 +1,5 @@
 /*
- * desktop.c - EZOS 桌面文件管理器（Win10 风格字符界面 v0.5）
+ * desktop.c - Cerulia 桌面文件管理器（Win10 风格字符界面 v0.5）
  * 整块重构：蓝色顶栏 + 路径栏 + 列表/滚动 + 底部状态栏 + 查看文件页
  * 功能不变：列表 / 进入目录 / 查看文件 / 返回
  */
@@ -124,7 +124,7 @@ static void desktop_render(void)
 
     /* 顶部标题栏 */
     fill_range(0, 0, 80, C_TITLE, ' ');
-    puts_at(0, 2, C_TITLE, " EZOS Desktop - File Manager");
+    puts_at(0, 2, C_TITLE, " Cerulia Desktop - File Manager");
 
     /* 路径栏（浅灰底黑字） */
     fill_range(1, 0, 80, C_BAR, ' ');

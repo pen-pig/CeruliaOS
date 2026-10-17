@@ -1,5 +1,5 @@
 /*
- * webview.c - EZOS 浏览器渲染层（C 侧）
+ * webview.c - Cerulia 浏览器渲染层（C 侧）
  *
  * 定位：**排版 + 绘制 + 交互**，不做解析。解析与断行在 Rust
  * （rust/ezos_rs/src/html.rs），理由见那里——纯计算、易错、要对拍，
@@ -315,7 +315,7 @@ static void wv_layout(void)
     y += WV_MARGIN;
     if (wv_truncated) {
         /* 明确告诉用户"没显示完"，别让人以为这就是全文 */
-        static const char msg[] = "... [page truncated: EZOS limit]";
+        static const char msg[] = "... [page truncated: Cerulia limit]";
         wv_emit(y, WV_MARGIN, 0, WV_FX_MUTED | WV_FX_LITERAL, 1,
                 (uint32_t)(unsigned long)msg, (uint32_t)(sizeof(msg) - 1), 0);
         y += WV_LH + 2;

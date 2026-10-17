@@ -3,7 +3,7 @@
 """check_vmx.py - VMware vmx 配置完整性闸门。
 
 起因是2026-10-10 的一次真实故障：Workstation 弹
-`Could not open virtual machine "EZOS": Internal error. Remove from library?`
+`Could not open virtual machine "Cerulia": Internal error. Remove from library?`
 
 排查结论是**生成器少写了一个字段**。tools/make_vmware.py 早期只写
 displayName/guestOS/memsize/numvcpus 等少数几项，缺
@@ -43,7 +43,7 @@ REQUIRED = {
     "memsize": "内存大小，MB",
     "numvcpus": "vCPU 数",
     "firmware": "bios=legacy，efi=UEFI。必须显式写，别依赖默认值",
-    # EZOS 特有：内核只有 ATA(IDE) 驱动，磁盘必须挂 IDE
+    # Cerulia 特有：内核只有 ATA(IDE) 驱动，磁盘必须挂 IDE
     "ide0:0.present": "IDE 磁盘开关。内核只有 ATA(IDE) 与 AHCI 驱动",
     "ide0:0.fileName": "磁盘镜像路径",
     # 串口 -> 文件：内核 COM1 的全部诊断输出在这里，E2E 也按行抓它

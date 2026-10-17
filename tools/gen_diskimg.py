@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""gen_diskimg.py - EZOS 数据盘镜像生成器（exFAT / FAT12 / FAT16 / FAT32）
+"""gen_diskimg.py - Cerulia 数据盘镜像生成器（exFAT / FAT12 / FAT16 / FAT32）
 
 用法:
     python gen_diskimg.py <path> [exfat|fat12|fat16|fat32|ext4]
@@ -224,7 +224,7 @@ def exfat_files():
     E2E 里的 `exec HELLO.ELF` / `SPIN.ELF &` 等裸名由 sysvol_lookup 大小写
     不敏感地落到 /bin/*.elf，不依赖盘上副本。"""
     return [
-        ('README.TXT', b"Welcome to EZOS!\nThis is the exFAT data disk.\n"),
+        ('README.TXT', b"Welcome to Cerulia!\nThis is the exFAT data disk.\n"),
         (LFN_NAME, b"Long filename (LFN) test file on exFAT.\n"),
     ]
 
@@ -543,7 +543,7 @@ def gen_fat(path, fat_type):
         root_clus, c_readme, c_lfn = 2, 3, 4
     else:
         root_clus, c_readme, c_lfn = 0, 2, 3
-    readme = ("Welcome to EZOS!\nThis is the FAT%d data disk.\n" % fat_type).encode()
+    readme = ("Welcome to Cerulia!\nThis is the FAT%d data disk.\n" % fat_type).encode()
     lfn_data = ("Long filename (LFN) test file on FAT%d.\n" % fat_type).encode()
 
     fat = make_fat_table(p, ([root_clus] if fat_type == 32 else []) + [c_readme, c_lfn])
@@ -667,7 +667,7 @@ def gen_ext4(path):
         off = PART_START * 512 + blk * BLK
         img[off:off + len(data)] = data
 
-    readme = b"Welcome to EZOS!\nThis is the ext4 data disk.\n"
+    readme = b"Welcome to Cerulia!\nThis is the ext4 data disk.\n"
     lfn_data = b"Long filename (LFN) test file on ext4.\n"
 
     # 固定布局

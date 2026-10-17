@@ -1,17 +1,17 @@
 /*
- * games.c - EZOS 游戏合集（自 sinwindows games.cpp 移植，C++ -> 纯 C）
+ * games.c - Cerulia 游戏合集（自 sinwindows games.cpp 移植，C++ -> 纯 C）
  *
  * 来源：temp/sindows/sindows/src/games.cpp（741 行，7 个游戏）：
  *   1. 猜数字 2. 井字棋AI 3. 贪吃蛇 4. 2048 5. 扫雷 6. 石头剪刀布 7. 记忆翻牌
  *
- * 移植原则：游戏逻辑保持原样，仅 I/O 适配 EZOS 接口：
+ * 移植原则：游戏逻辑保持原样，仅 I/O 适配 Cerulia 接口：
  *   - 文本输出  ：ezos_console_write / ezos_console_print_dec / ezos_console_putchar
  *   - 行输入    ：ezos_console_readline（Esc 按空串处理）
  *   - 键盘      ：keyboard_getchar()（非阻塞，0 表示无键，取代 sinwindows poll_key）
  *   - 清屏/光标 ：terminal_initialize / terminal_set_cursor / terminal_clear_line
- *   - 滚动      ：terminal_scroll_up / terminal_scroll_down（EZOS 方向键为 KEY_UP/KEY_DOWN，
+ *   - 滚动      ：terminal_scroll_up / terminal_scroll_down（Cerulia 方向键为 KEY_UP/KEY_DOWN，
  *                 Shift+方向键映射 KEY_PGUP/KEY_PGDN，取代 sinwindows handle_scroll_key）
- *   - 随机数    ：本地 LCG + RDTSC 播种（EZOS 无全局 rand/seed）
+ *   - 随机数    ：本地 LCG + RDTSC 播种（Cerulia 无全局 rand/seed）
  *   - 计时      ：RDTSC（QEMU 下约 1GHz，180e6 ticks ≈ 0.18s，取代 PIT tick）
  *
  * 编译：i686-elf-gcc -ffreestanding -O2 -Wall -Wextra -Ikernel
@@ -191,7 +191,7 @@ static int games_readline_gfx(char *buf, int maxlen) {
 #define terminal_get_row games_get_row_gfx
 
 /* ==================================================================
- * 小型工具（freestanding，无 libc；EZOS 内核不自带全局 rand/atoi 等）
+ * 小型工具（freestanding，无 libc；Cerulia 内核不自带全局 rand/atoi 等）
  * ================================================================== */
 
 static uint32_t games_rng_state = 0x9E3779B9u;
@@ -205,7 +205,7 @@ static uint32_t games_rand_next(void) {
     return games_rng_state;
 }
 
-/* RDTSC 低 32 位时间源（EZOS 无 PIT tick 计数，参照 shell.c delay_ticks） */
+/* RDTSC 低 32 位时间源（Cerulia 无 PIT tick 计数，参照 shell.c delay_ticks） */
 static uint32_t games_rdtsc(void) {
     uint32_t lo;
     __asm__ __volatile__("rdtsc" : "=a"(lo) : : "edx");
@@ -294,7 +294,7 @@ static void game_guess(void) {
 }
 
 /* ---------------- 游戏 2：井字棋 ----------------
- * 原 sinwindows 直接写 VGA 显存做局部刷新；EZOS tty 封装显存，
+ * 原 sinwindows 直接写 VGA 显存做局部刷新；Cerulia tty 封装显存，
  * 改为 terminal_set_cursor + putchar 单格定位更新，行为等价：
  * 首次 tic_render 整盘绘制，之后落子只调 tic_update_cell 更新单格。 */
 static char tic_board[9];
@@ -536,7 +536,7 @@ static void game_snake(void) {
     int quit = 0;
     while (alive && !quit) {
         // 非阻塞处理按键：W/A/S/D 只改变方向，Q 退出；
-        // Shift+Up/Shift+Down（EZOS 映射 KEY_PGUP/KEY_PGDN）滚动屏幕
+        // Shift+Up/Shift+Down（Cerulia 映射 KEY_PGUP/KEY_PGDN）滚动屏幕
         int c;
         /* 鼠标点击窗口四区改方向（0上 1下 2左 3右） */
         {
@@ -1212,7 +1212,7 @@ static void game_memory(void) {
 static int games_menu_select(void) {
     games_clear();
     for (;;) {
-        ezos_console_write("=== EZOS Games ===\n");
+        ezos_console_write("=== Cerulia Games ===\n");
         ezos_console_write("1. Guess the Number\n");
         ezos_console_write("2. Tic-Tac-Toe\n");
         ezos_console_write("3. Snake\n");

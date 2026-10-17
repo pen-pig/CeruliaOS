@@ -375,7 +375,7 @@ uint32_t stack_total(void) {
 
 void kernel_main(void) {
     stack_paint();          /* 必须最先：之后的所有栈使用才可能有水印 */
-    /* 关掉本地 APIC：EZOS 走的是传统 8259 PIC 中断路由。
+    /* 关掉本地 APIC：Cerulia 走的是传统 8259 PIC 中断路由。
      * QEMU 默认 LAPIC enabled 且 LVT0(ExtINT) masked，键盘/鼠标的 PIC 中断
      * 就全没了；关掉 LAPIC 后 LINT0 恢复成 INTR，直通 PIC。 */
     {
@@ -418,7 +418,7 @@ void kernel_main(void) {
     /* 加载地址不再写死：镜像由 boot/stage2.asm 搬到 linker.ld 的
      * __image_start（现在是 19MB）。抄成常量必然和 linker 走偏（0.9.0 时代的
      * 教训），所以直接打印符号值。 */
-    klog_hex32("EZOS Kernel " EZOS_VERSION " loaded at 0x",
+    klog_hex32("Cerulia Kernel " EZOS_VERSION " loaded at 0x",
                (uint32_t)(unsigned long)__image_start, ", i686 protected mode");
     /* 扇区数不再写死：tools/make_image.py 按 kernel_raw.bin 真实大小算出后写进
      * 引导扇区 0x1FC，boot/stage2.asm 运行时读取（0 或超上限时兜底成上限）。 */
@@ -579,7 +579,7 @@ void kernel_main(void) {
     int ret = fs_init();
     if (ret == -2) {
         /* -2 only means "no filesystem recognized". That covers a blank disk
-         * AND a disk holding something EZOS does not know (btrfs, XFS, ...).
+         * AND a disk holding something Cerulia does not know (btrfs, XFS, ...).
          * Auto-formatting the latter would destroy the user's data, so the
          * disk has to be proven blank first. */
         if (!fs_drive_blank()) {
@@ -590,7 +590,7 @@ void kernel_main(void) {
             klog("FS: no filesystem on data drive, auto-formatting exFAT...");
             if (fs_format(FS_EXFAT) == 0) {
                 klog_ok("FS: formatted, creating README.TXT");
-                const char *example = "Hello from EZOS exFAT!\n";
+                const char *example = "Hello from Cerulia exFAT!\n";
                 fs_create_file("README.TXT", (const uint8_t*)example,
                                my_strlen(example));
             } else {
@@ -690,7 +690,7 @@ void kernel_main(void) {
     terminal_writestring(" | |___  ./ /___ | |_| | /\\__/ /\n");
     terminal_writestring(" \\____/  \\_____/ \\_____/ \\____/ \n");
     terminal_writestring("\n");
-//	klog_ok("EZOS Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
+//	klog_ok("Cerulia Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
 
     /* shell 是系统控制台，它不会因 'exit' 返回；进入图形桌面只有一条路：
      * 'desktop' 命令（cmd_desktop -> gw_start）。下面的循环只是兜底：

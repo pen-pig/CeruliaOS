@@ -1,5 +1,5 @@
 /*
- * webview.h - EZOS 浏览器渲染层
+ * webview.h - Cerulia 浏览器渲染层
  *
  * 分工（为什么这么切）：
  *   http.c      HTTP/1.1 传输（字节）

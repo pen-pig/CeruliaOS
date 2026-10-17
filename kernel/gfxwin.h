@@ -4,9 +4,9 @@
 #include "types.h"
 
 /*
- * gfxwin.h - EZOS 窗口框架
+ * gfxwin.h - Cerulia 窗口框架
  * 移植自 RetrOS-32 (joexbayer/RetrOS-32, MIT) 的 gfxlib/window/component/theme
- * 上层 GUI 逻辑，适配到 EZOS 现有 gfx.h/gfx.c 底层接口
+ * 上层 GUI 逻辑，适配到 Cerulia 现有 gfx.h/gfx.c 底层接口
  * (VBE 640x480x256 LFB / VGA mode 0x13 320x200x256)
  *
  * v0.5 Win10 主题版（UI 抄 RetrOS-32 成品窗口系统，配色改 Win10）：

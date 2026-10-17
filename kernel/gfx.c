@@ -840,7 +840,7 @@ void gfx_menu(void) {
         gfx_clear(0x00);
 
         if (page == 0) {
-            gfx_draw_text(20, 8, "EZOS GUI", 0x0F, 0x00);
+            gfx_draw_text(20, 8, "Cerulia GUI", 0x0F, 0x00);
             gfx_draw_text(20, 20, "v0.3-gui", 0x0A, 0x00);
             gfx_draw_text(20, 36, "Select an app:", 0x07, 0x00);
             const char *items[] = { "Calculator", "Hex", "Rand", "Guess", "TicTacToe", "Snake", "Windows", "Viewer", "About", "Exit" };
@@ -917,10 +917,10 @@ void gfx_menu(void) {
             }
             gfx_draw_text(20, GFX_H - 12, "[Esc] back", 0x08, 0x00);
         } else if (page == 3) {
-            gfx_draw_text(20, 16, "EZOS GUI", 0x0F, 0x00);
+            gfx_draw_text(20, 16, "Cerulia GUI", 0x0F, 0x00);
             gfx_draw_text(20, 32, "v0.3-gui", 0x0A, 0x00);
             gfx_draw_text(20, 56, "A tiny graphical UI", 0x07, 0x00);
-            gfx_draw_text(20, 72, "for EZOS kernel.", 0x07, 0x00);
+            gfx_draw_text(20, 72, "for Cerulia kernel.", 0x07, 0x00);
             gfx_draw_text(20, 96, "Apps: Calculator, Viewer", 0x07, 0x00);
             gfx_draw_text(20, GFX_H - 12, "[Esc] back", 0x08, 0x00);
         }

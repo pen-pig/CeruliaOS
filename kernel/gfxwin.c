@@ -1,5 +1,5 @@
 /*
- * gfxwin.c - EZOS 窗口框架（v0.7 Win10 桌面版）
+ * gfxwin.c - Cerulia 窗口框架（v0.7 Win10 桌面版）
  * 移植自 RetrOS-32 (joexbayer/RetrOS-32, MIT) + sinwindows v2 功能结构参考
  * 底层：gfx.h（VBE 16bpp LFB / VGA mode 0x13 320x200x256）
  *
@@ -68,7 +68,7 @@ static gw_window_t *gw_spawn_app(int idx);
 #define GW_APP_COUNT    9
 
 static const char *gw_app_names[GW_APP_COUNT] = {
-    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About EZOS", "Terminal", "Paint",
+    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About Cerulia", "Terminal", "Paint",
     "Browser"
 };
 static void gw_game_yield(void);
@@ -1049,7 +1049,7 @@ void gw_draw_desktop(void)
         gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x0C7BD5u, 0x063B66u);
     }
     /* 右下角水印 */
-    gfx_draw_text(GFX_W - gw_scale_x(60), gw_desktop_bottom() - 12, "EZOS", 0x0F, 0x0B);
+    gfx_draw_text(GFX_W - gw_scale_x(60), gw_desktop_bottom() - 12, "Cerulia", 0x0F, 0x0B);
     /* Ubuntu Dock（GNOME 主题） */
     gw_draw_dock();
     /* 桌面图标 */
@@ -1189,7 +1189,7 @@ void gw_draw_start_menu(void)
         gw_fill_vgrad(mx0, my0, mw, gw_scale_y(50), 0x0C7BD5u, 0x063B66u);
     gw_fill(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x3C3C3Cu);
     gw_frame(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x555555u);
-    gfx_draw_text(mx0 + 40, my0 + gw_scale_y(15), "EZOS User", 0x0F, 0x0B);
+    gfx_draw_text(mx0 + 40, my0 + gw_scale_y(15), "Cerulia User", 0x0F, 0x0B);
 
     /* 应用列表 */
     int row_h = gw_menu_row_h();   /* 与点击命中共用，小屏自动压缩 */
@@ -1974,7 +1974,7 @@ static void sysinfo_draw(gw_window_t *w)
     uint16_t vyr = *(volatile uint16_t*)0x5006;
 
     static const char *lines[10] = {
-        "EZOS System Information",
+        "Cerulia System Information",
         "CPU: i686 (protected mode)",
         "Resolution: AUTO (VBE LFB)",
         "Color depth: 16bpp RGB565",
@@ -2572,7 +2572,7 @@ static void settings_click(gw_window_t *w, int lx, int ly)
 static void about_draw(gw_window_t *w)
 {
     int ox = gw_ox(w), oy = gw_oy(w);
-    gfx_draw_text(ox + 4, oy + 6, "EZOS - Windows 10 style UI", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 6, "Cerulia - Windows 10 style UI", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 20, "Version 0.3-gui (v0.7 gfxwin)", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 34, "Base: RetrOS-32 (MIT)", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 48, "UI ref: sinwindows v2", 0x00, 0x0F);
@@ -2633,7 +2633,7 @@ static gw_window_t *gw_spawn_app(int idx)
         w->draw = term_draw;
         w->key = term_key;
         if (term_nrows == 0) {
-            term_print("EZOS Terminal - type 'help' for commands");
+            term_print("Cerulia Terminal - type 'help' for commands");
             term_newline();
         }
         term_prompt();   /* 打印 "> " 提示符，输入从提示符后开始 */
@@ -3123,14 +3123,14 @@ static void gw_boot_anim(void)
         gw_fill(lx + sz / 2, ly, sz / 2, sz / 2, 0x9BD3F0u);
         gw_fill(lx, ly + sz / 2, sz / 2, sz / 2, 0x9BD3F0u);
         gw_fill(lx + sz / 2, ly + sz / 2, sz / 2, sz / 2, 0x0078D7u);
-        /* 标题 */
-        gfx_draw_text(cx - 16, cy + sz / 2 + gw_scale_y(10), "EZOS", 0x0F, 0x0B);
+        /* 标题（居中：7 字符 × 8px / 2 = 28；改品牌名时这里要跟着改） */
+        gfx_draw_text(cx - 28, cy + sz / 2 + gw_scale_y(10), "Cerulia", 0x0F, 0x0B);
         /* 进度条 */
         gw_fill(bx, by, bw, gw_scale_y(10), 0x1B3D5Cu);
         gw_fill(bx, by, bw * s / steps, gw_scale_y(10), 0xFFFFFFu);
         /* 步骤文字 */
         static const char *msgs[7] = {
-            "Booting EZOS...",
+            "Booting Cerulia...",
             "Loading kernel modules...",
             "Probing VBE graphics...",
             "Initializing window system...",
@@ -3657,7 +3657,7 @@ static void gw_game_draw_menu(gw_window_t *w, int sel)
     int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
     int iw = w->inner_w - 8, ih = w->inner_h - 8;
     gw_fill(x0, y0, iw, ih, 0xF0F0F0);
-    gw_game_draw_text_center(x0, y0 + 8, iw, 20, "EZOS Games", 0x06, 2);
+    gw_game_draw_text_center(x0, y0 + 8, iw, 20, "Cerulia Games", 0x06, 2);
     static const char *names[7] = {
         "1  Guess the Number", "2  Tic-Tac-Toe", "3  Snake",
         "4  2048", "5  Minesweeper", "6  Rock-Paper-Scissors", "7  Memory"

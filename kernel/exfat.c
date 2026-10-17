@@ -1089,7 +1089,7 @@ int exfat_format(uint32_t part_start) {
     //                    bit1 = NoFatChain（位图要跨簇，必须走 FAT 链 = 0）；
     //     FirstCluster @0xC0+0x14，DataLength @0xC0+0x18。
     //
-    // 早先 EZOS 把 FirstCluster/DataLength 直接写在 0x81 主条目里、且不写
+    // 早先 Cerulia 把 FirstCluster/DataLength 直接写在 0x81 主条目里、且不写
     // 0xC0。后果不是"Windows 挑刺"——**内核读不了别人建的卷**：exfat_init
     // 按主条目 +0x14 取位图簇号，而规范卷的那个位置是保留字段（全 0），
     // 于是 bmp_cluster=0，位图同步全落到簇 0，Windows 一挂就报卷损坏。
@@ -1232,7 +1232,7 @@ int exfat_init(void) {
             if (e[0] == 0x81) {
                 /* FirstCluster / DataLength 的位置：优先取紧跟的 0xC0 Stream
                  * Extension（规范，也是 exfat_format 现在写的形态）。取不到
-                 * 才退回主条目 —— 那是历史盘（EZOS 早先把这两个字段直接写
+                 * 才退回主条目 —— 那是历史盘（Cerulia 早先把这两个字段直接写
                  * 在 0x81 主条目里、且不写 0xC0）的遗留格式，仓库里还有这
                  * 种盘，必须继续能读。
                  *
@@ -1842,7 +1842,7 @@ int exfat_fsck(fsck_report_t *r) {
                     nofat = (ec0[1] & 0x02) ? 1 : 0;
                     adv_slots = 2;
                 } else {
-                    /* **历史盘遗留**：EZOS 早先写的 0x81（位图）/ 0x82（大写表）
+                    /* **历史盘遗留**：Cerulia 早先写的 0x81（位图）/ 0x82（大写表）
                      * 后面没有 0xC0，FirstCluster/DataLength 直接放在主条目
                      * 里。format 已经改成写标准形态了（见 exfat_format 的
                      * 注释），但仓库里还有那种盘，读的时候必须认。

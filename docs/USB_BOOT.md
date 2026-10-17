@@ -1,6 +1,6 @@
-# 真机点亮：把 EZOS 做成可启动 U 盘（Legacy + UEFI 双通道）
+# 真机点亮：把 Cerulia 做成可启动 U 盘（Legacy + UEFI 双通道）
 
-> 适用对象：一个要在**真实 PC** 上点亮 EZOS 内核的人。
+> 适用对象：一个要在**真实 PC** 上点亮 Cerulia 内核的人。
 > 场景：**没有屏幕、只有一根 USB-TTL/串口线**也能判断卡在哪一步。
 >
 > **2026-10-06 更新**：UEFI 路径已经打通。现在的产物是
@@ -72,7 +72,7 @@ os-image.bin = boot/boot.bin   (512 字节，引导扇区)
 
 ### UEFI 现在也能启动了
 
-`usb-image.bin` 的 LBA2048 起是一个合规的 FAT32 ESP（卷标 `EZOS ESP`），
+`usb-image.bin` 的 LBA2048 起是一个合规的 FAT32 ESP（卷标 `Cerulia ESP`），
 里面有 `EFI/BOOT/BOOTIA32.EFI`（PE32 UEFI 应用，源码 `uefi/main.c`）与
 `EFI/KERNEL.BIN`。固件按标准流程走：分区表 -> 认到 EFI 系统分区 ->
 `\EFI\BOOT\BOOTIA32.EFI` -> 读 `KERNEL.BIN` 进内存 -> 跳转。
@@ -113,7 +113,7 @@ pad 的镜像做 E2E。
 ### 引导之后：内核自己就是 U 盘的主人（H1c 已完成）
 
 BIOS 的 INT 13h 仿真只活在实模式——内核一进保护模式那条通路就没了。
-EZOS 内核现在自带 **USB Mass Storage 驱动（BOT + SCSI 子集）**：
+Cerulia 内核现在自带 **USB Mass Storage 驱动（BOT + SCSI 子集）**：
 - 启动时自动认领 U 盘：`USB-MSC: unit0 ... sectors=... blksize=512 ready`
 - U 盘注册成块设备 **drive 12 起**（IDE 0-3、AHCI 4-11 之后），
   shell 里 `setdrive 12` 即可挂 U 盘上的文件系统、`ls`/`cat`/`write` 全通。
@@ -322,7 +322,7 @@ SELFTEST: string   str/fmt helpers     ... OK
 AHCI: port 0 online (model: ...)                ; 若 SATA 在 AHCI 模式且有盘
 AHCI: port 1 absent (SSTS.DET != 3)             ; 空端口
 ...
-EZOS>                                            ; 进 shell，可以敲命令了
+Cerulia>                                            ; 进 shell，可以敲命令了
 ```
 
 > 自检共 **21 项**：8 个核心子系统（kmalloc/paging/pmm/elf/fpu/calc/exec/fd）
@@ -347,7 +347,7 @@ EZOS>                                            ; 进 shell，可以敲命令�
 | 6 | **串口一条都没有**（连 `SERIAL:` 都没有） | ① 串口线接法错（TX/RX 交叉、GND 没接）；② 波特率/参数不对（必须是 115200 8N1）；③ 主板 COM1 被禁用或地址不是 0x3F8；④ 用的不是 COM1 | **接线**：USB-TTL 模块的 **TX→主板 COM1 RX（接主板 9 针座的 2 脚）、RX→主板 COM1 TX（3 脚）、GND→GND（5 脚）**；注意是交叉（模块的 TX 接对方的 RX）。**参数**：终端软件 115200 8N1 无流控（无 XON/XOFF、无 RTS/CTS）。**BIOS**：进 BIOS 确认 `Serial Port / COM1` 是 Enabled，模式 Standard（不是 SOL/Disabled），地址 0x3F8/IRQ4。内核只接 COM1（0x3F8），别接 COM2。 |
 | 7 | **串口有输出，但屏幕全黑** | 只是没接显示器或显示器输入源选错；内核本身正常 | 这是**最理想**的排障状态——所有信息都在串口。确认显示器信号源（VGA/HDMI 切对）；若坚持要屏，按第 5 节看 K 项。 |
 | 8 | **只有 `SERIAL: COM1 115200 8N1 loopback OK` 一行，之后就没了** | 串口自检通过了，但内核早期（VBE/A20/保护模式切换）在某处静默挂死 | 对照第 4 节预期输出，缺的就是卡住的那一步：没 `VBE:` 行 → 卡 VBE（见第 5 行）；连 SELFTEST 都没有 → 卡在 A20/保护模式（见第 4 行）。若串口在 SERIAL 后彻底停，多半是显示/保护模式切换时的硬件异常。 |
-| 9 | **进得了 shell（EZOS> 出来了），但 AHCI/SATA 盘没识别** | ① SATA 模式是 IDE，却用 `setdrive 4-11`；② 没盘 / 端口空；③ 控制器不是 class 0x0106 | 在 shell 里：先 `pci` 看有没有 `0106` 类设备；`AHCI: port N online` 有没有打出来；按 BIOS 里 SATA 模式选盘：`AHCI` 模式用 `setdrive 4`（或 5/6…），`IDE` 模式用 `setdrive 0-3`；换端口号再 `ls` 试。空端口会打 `absent (SSTS.DET != 3)`，那是物理没接盘。 |
+| 9 | **进得了 shell（Cerulia> 出来了），但 AHCI/SATA 盘没识别** | ① SATA 模式是 IDE，却用 `setdrive 4-11`；② 没盘 / 端口空；③ 控制器不是 class 0x0106 | 在 shell 里：先 `pci` 看有没有 `0106` 类设备；`AHCI: port N online` 有没有打出来；按 BIOS 里 SATA 模式选盘：`AHCI` 模式用 `setdrive 4`（或 5/6…），`IDE` 模式用 `setdrive 0-3`；换端口号再 `ls` 试。空端口会打 `absent (SSTS.DET != 3)`，那是物理没接盘。 |
 | 10 | **键盘/鼠标无响应** | 真机上 **USB HID 键盘鼠标要到 H2 才支持**；当前内核只认 **PS/2** 键鼠（走 8042 控制器） | **用 PS/2 接口的有线键鼠**（圆口，不是 USB）。USB 键盘在 H1c 阶段不会被识别，表现为"完全没反应"——这不是镜像写错，是功能未到。若主板只有 USB 口，开 BIOS 的 **"USB Legacy / PS/2 Emulation"** 选项，让固件把 USB 键盘模拟成 PS/2（部分主板有效，老主板可能不稳定）。 |
 | 11 | **进 shell 但 `ls` 看不到数据盘/文件系统** | 没 `setdrive` 选盘，或所选盘没有内核支持的 FS | shell 里 `setdrive <n>` 切换盘号（AHCI 用 4-11，IDE 用 0-3），再 `ls`；内核支持 exFAT/FAT/ext4/NTFS/F2FS/EROFS/ReFS，盘得是这些格式之一。引导盘（0 号）不会自动挂载，防误格。 |
 | 12 | **串口只到 `SERIAL:` 就 `SERIAL: COM1 not present - debug output disabled`** | 内核没找到 COM1（自检判定串口不存在），后续所有 klog 都不会镜像到串口 | 这是串口自检**失败**的标志（和"一行 OK"相反）。说明 COM1 没枚举到/地址不对。进 BIOS 确认 COM1 Enabled 且地址 0x3F8；或主板根本没 COM1（需用 PCI 串口卡——当前内核只认板载 0x3F8）。 |

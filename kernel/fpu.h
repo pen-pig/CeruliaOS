@@ -1,7 +1,7 @@
 /*
  * fpu.h - x87 FPU 初始化与自检（步骤 5e）
  *
- * EZOS 是 i686 内核。i686 起 CR0.EM 必须为 0（EM=1 在 i686 上对 SIMD
+ * Cerulia 是 i686 内核。i686 起 CR0.EM 必须为 0（EM=1 在 i686 上对 SIMD
  * 指令有未定义行为），所以"FPU 不可用"不能靠 EM 模拟，只能：
  *   - CR0.ES/MP 保持复位值
  *   - 探测：fninit 后 fnstenv 读状态字，若 FPU 存在状态字为 0

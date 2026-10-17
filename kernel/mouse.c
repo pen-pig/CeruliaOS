@@ -1,5 +1,5 @@
 /*
- * mouse.c - EZOS PS/2 鼠标驱动（v0.6 重构）
+ * mouse.c - Cerulia PS/2 鼠标驱动（v0.6 重构）
  * 职责：PS/2 位移累积、分辨率自适应坐标裁剪（320x200 / 640x480）
  *       mouse_get_x/y/buttons/wheel 查询接口；无鼠标时优雅降级
  */
