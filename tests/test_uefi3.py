@@ -30,7 +30,12 @@ VER = kernel_version() or "0.0.0"   # 版本号取自 kernel/version.h
 
 # ESP 里的内核体积预算（字节，含 512 对齐余量）。ESP 实际有 34MB，
 # 这里卡的是"内核别悄悄变大"，所以加实质功能时要显式上调这个数。
-KERNEL_BUDGET = 640 * 1024
+# 调整记录：
+#   496KB -> 640KB（c8d42c5）：浏览器解析+排版 +36KB
+#   640KB -> 1MB  （本提交）：GB2312 16x16 点阵字库进 .rodata
+#                     （7445 字形 x 32B + 7445 映射 x 6B ≈ +282KB，
+#                       实测 547KB -> 817KB），见 kernel/cjk_font.c
+KERNEL_BUDGET = 1024 * 1024
 
 import json
 import os
@@ -206,8 +211,9 @@ def main():
     #
     # **KERNEL_BUDGET 是人为预算，不是物理限制**：ESP 有 34MB（FAT32 要
     # >= 65525 簇才名副其实），装得下几十兆的内核。这个数字的作用是"内核
-    # 不该悄悄膨胀"，所以内核加了实质功能（浏览器解析+排版 +36KB）就该
-    # 显式上调，而不是把测试改成永远通过 —— 后者等于把闸门拆了。
+    # 不该悄悄膨胀"，所以内核加了实质功能（浏览器解析+排版 +36KB、GB2312
+    # 点阵字库 +282KB）就该显式上调，而不是把测试改成永远通过 —— 后者
+    # 等于把闸门拆了。调整记录见文件头 KERNEL_BUDGET 注释。
     ksz = os.path.getsize(KERNEL_BIN)
     if ksz == 0 or ksz % 512 != 0 or ksz > KERNEL_BUDGET:
         print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= %d)"

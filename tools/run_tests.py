@@ -61,7 +61,7 @@ LAYERS = {
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns", "fetch"],
-    "gui":  ["vi", "vi_big", "vi_color", "uefi3", "exitmode", "html"],
+    "gui":  ["vi", "vi_big", "vi_color", "cjk", "uefi3", "exitmode", "html"],
     # corrupt：故意把盘改坏后断言内核不卡死（6 FS，黄金盘 + 随机翻位 +
     # 定向损坏，约 45 分钟）
     "deep": ["step7_sock", "step7_tcp", "corrupt"],
@@ -139,6 +139,8 @@ WATCH = [
 TIMEOUT = {
     "step7_sock": 900, "step7_tcp": 900, "uefi3": 600,
     "vi_color": 420, "vi": 420, "dhcp": 420, "dns": 420,
+    # cjk：起 1 台 QEMU + screendump 逐像素比对，实测 ~20 秒
+    "cjk": 180,
     "fs_matrix": 600, "hostfs": 900, "netapp": 600, "edge": 700,
     "power": 420, "ahci": 420, "nvme": 600, "regress": 600,
     # edge 每用例独立起一个 QEMU，实测 416s；420 会刚好卡线超时

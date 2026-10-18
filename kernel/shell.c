@@ -494,6 +494,7 @@ static const command_t commands[] = {
     {"fetch",     cmd_fetch},
     {"wget",      cmd_fetch},
     {"htmltest",  cmd_htmltest},
+    {"cjk",       cmd_cjk},
     {0, 0}
 };
 
@@ -1148,6 +1149,7 @@ static void cmd_help(const char *args) {
     help_line("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
     help_line("  fetch <url> [file] - HTTP GET (wget is an alias)\n");
     help_line("  htmltest [url] - parse a page and print the layout to serial\n");
+    help_line("  cjk - GB2312 Chinese glyph demo in graphics mode (any key exits)\n");
     help_line("  help <cmd> - detailed help for a command\n");
 }
 

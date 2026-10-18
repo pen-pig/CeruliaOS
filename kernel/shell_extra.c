@@ -12,6 +12,7 @@
  */
 
 #include "shell_extra.h"
+#include "gfx.h"
 #include "version.h"
 #include "tty.h"
 #include "keyboard.h"
@@ -2417,6 +2418,14 @@ const char *shell_extra_help(const char *cmd) {
                "  Runs the same parser and layout as the browser window, so\n"
                "  E2E can assert on layout instead of squinting at pixels.";
     }
+    if (x_strcasecmp(cmd, "cjk") == 0) {
+        return "cjk - GB2312 Chinese glyph demo in graphics mode\n"
+               "  usage: cjk\n"
+               "  Enters the framebuffer and draws Chinese text at fixed\n"
+               "  positions (64,64 / 64,96 / 64,128), then waits for any key\n"
+               "  and returns to text mode. The font is a 16x16 GB2312\n"
+               "  bitmap compiled into the kernel - no disk needed.";
+    }
     if (x_strcasecmp(cmd, "help") == 0) {
         return "help [cmd] - show this help or detailed help for a command\n  usage: help\n         help df";
     }
@@ -3215,4 +3224,27 @@ void cmd_htmltest(const char *args) {
         return;
     }
     wv_dump(path);
+}
+
+/* cjk: 图形模式中文渲染演示 + 字库自检。
+ *
+ * 为什么常驻一个命令而不是只活在测试里：中文渲染是日用刚需（浏览器正文、
+ * 窗口标题、菜单全是中文），这个命令既是演示也是最小可断言面——E2E 按
+ * 固定坐标的 16x16 区域直接比点阵，不需要 OCR 认汉字。
+ * 进入 framebuffer 画三行字，等一个键后回文本模式。
+ */
+void cmd_cjk(const char *args) {
+    (void)args;
+    gfx_init();
+    gfx_clear(0x00);
+    /* 固定坐标：tests/test_cjk.py 直接按点阵比对这些区域 */
+    gfx_draw_text_utf8(64, 64,  "中文渲染", 8, 0x0A, 0x00);
+    gfx_draw_text_utf8(64, 96,  "蔚蓝系统", 8, 0x0F, 0x00);
+    gfx_draw_text_utf8(64, 128, "GB2312 16x16", 12, 0x0B, 0x00);
+    /* 等任意键退出 */
+    while (keyboard_getchar() == 0) {
+    }
+    gfx_restore_text();
+    terminal_initialize();
+    terminal_writestring("cjk: demo done\n");
 }

@@ -1,4 +1,5 @@
 #include "gfx.h"
+#include "cjk.h"
 #include "port.h"
 #include "types.h"
 #include "tty.h"
@@ -697,8 +698,16 @@ int gfx_text_width_utf8(const char *sp, uint32_t n) {
     uint32_t i = 0;
     int w = 0;
     while (i < n) {
-        w += 8;
-        i += gfx_seq_len(s, i, n);
+        uint32_t l = gfx_seq_len(s, i, n);
+        if (l == 1) {
+            w += 8;
+        } else {
+            /* 与 gfx_draw_text_utf8 的步进一致：有字形 16px，否则 tofu 8px */
+            uint32_t adv = 0;
+            uint32_t cp = cjk_utf8_decode(sp + i, n - i, &adv);
+            w += (cp && cjk_lookup(cp)) ? cjk_glyph_width() : 8;
+        }
+        i += l;
     }
     return w;
 }
@@ -712,10 +721,19 @@ int gfx_draw_text_utf8(int x, int y, const char *sp, uint32_t n,
         if (l == 1) {
             if (s[i] >= 0x20 && s[i] < 0x7F) gfx_draw_char(x, y, (char)s[i], fg, bg);
             else gfx_draw_tofu(x, y, fg, bg);   /* 控制字符也不该画出字形 */
+            x += 8;
         } else {
-            gfx_draw_tofu(x, y, fg, bg);
+            /* 多字节序列：有字形画汉字（16px 宽），没有才退回豆腐块。
+             * 2026-10-18 前这里一律 tofu——中文网页整页空白。 */
+            uint32_t adv = 0;
+            uint32_t cp = cjk_utf8_decode((const char *)(s + i), n - i, &adv);
+            if (cp && cjk_draw_glyph(x, y, cp, fg, bg)) {
+                x += cjk_glyph_width();
+            } else {
+                gfx_draw_tofu(x, y, fg, bg);
+                x += 8;
+            }
         }
-        x += 8;
         i += l;
     }
     return x;
