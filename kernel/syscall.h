@@ -34,6 +34,16 @@
 #define SYS_WAITPID 44u
 /* getpid(2)：返回当前进程的 pid（用户态 libc 用，后台任务打印 [n] pid）。 */
 #define SYS_GETPID  45u
+/* readdir(2)：列一个目录的全部条目（ebx=路径，ecx=用户 user_dirent_t[]，
+ * edx=容量）。一次性填完返回条目数（0=空目录，-1=失败），没有"目录句柄"
+ * 概念——目录内条目由 fs_read_dir_path 直接写进校验过的用户缓冲。
+ * 用户结构与内核 fs_dir_entry_t 逐字段同布局（user/libc.h 有断言）。
+ * edx 上限 MAX_READDIR_ENTRIES：先查上界再乘法，防 count*sizeof 回绕。 */
+#define SYS_READDIR 46u
+/* stat(2)：取路径的属性（ebx=路径，ecx=用户 user_stat_t*）。
+ * 写回 size 与 is_dir；路径不存在返回 -1。 */
+#define SYS_STAT    47u
+#define MAX_READDIR_ENTRIES 128u
 /* waitpid 的 options 标志位（内核侧与 libc 共用，必须一致） */
 #define WNOHANG     1               /* 非阻塞：子进程还在跑则立即返回（不收割） */
 /* socketcall 复用器（沿用 Linux i386 的 102 号）：

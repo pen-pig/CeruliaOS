@@ -111,3 +111,28 @@ sockcall:
     int     0x80
     pop     ebx
     ret
+
+; ---- int readdir(const char *path, user_dirent_t *ents, unsigned max)
+;      : SYS_READDIR (46)。一次性列完：返回条目数（0=空目录），失败 -1。----
+global readdir
+readdir:
+    push    ebx
+    mov     eax, 46             ; SYS_READDIR
+    mov     ebx, [esp + 8]      ; path
+    mov     ecx, [esp + 12]     ; ents
+    mov     edx, [esp + 16]     ; max
+    int     0x80
+    pop     ebx
+    ret
+
+; ---- int stat(const char *path, user_stat_t *st) : SYS_STAT (47)。
+;      存在写回 {size,is_dir} 返回 0；不存在 -1。----
+global stat
+stat:
+    push    ebx
+    mov     eax, 47             ; SYS_STAT
+    mov     ebx, [esp + 8]      ; path
+    mov     ecx, [esp + 12]     ; st
+    int     0x80
+    pop     ebx
+    ret

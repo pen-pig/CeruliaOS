@@ -660,6 +660,29 @@ uint32_t fs_get_file_size(const char *name) {
     return 0;
 }
 
+/* stat：存在经 size/is_dir 写回属性返回 0，不存在/未挂载 -1。
+ * 与 fs_get_file_size 同一套路由，只是多带回一个 is_dir。 */
+int fs_stat(const char *name, uint32_t *size, uint8_t *is_dir) {
+    if (name == 0 || size == 0 || is_dir == 0) return -1;
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return sysvol_stat(full, size, is_dir);
+    if (fs_type_cur == FS_EXFAT) return exfat_stat(full, size, is_dir);
+    if (fs_is_fat()) return fat_stat(full, size, is_dir);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        /* ro_is_dir 契约：1=目录 / 0=文件 / -1=不存在（各只读后端统一）。
+         * 不拿 size==0 当"不存在"——空文件也是合法存在的文件。 */
+        int d = ro_is_dir(abs);
+        if (d < 0) return -1;
+        *size = ro_get_file_size(abs);
+        *is_dir = (d == 1) ? 1u : 0u;
+        return 0;
+    }
+    return -1;
+}
+
 int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
     /* 系统卷只读：写 /bin、/system 一律拒绝（哪怕是磁盘卷已挂载）。
      * 这是"格式化数据分区不影响系统"的另一半——系统目录不可写。
@@ -727,7 +750,16 @@ int fs_read_dir(fs_dir_entry_t *entries, int max_entries) {
 int fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries) {
     char full[256];
     if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
-    if (sysvol_is_path(full)) return sysvol_list(full, entries, max_entries);
+    if (sysvol_is_path(full)) {
+        /* 非目录路径必须 -1，与磁盘后端对齐：sysvol_list 对"表内文件"和
+         * "不存在的路径"都返回 0（没有条目匹配），而 0 在调用方眼里等于
+         * "空目录"——用户态 readdir 一个文件时分不出 ENOTDIR 和"这目录
+         * 是空的"，ls 一个不存在的目录也会安静地打印空。 */
+        uint32_t sz;
+        uint8_t d;
+        if (sysvol_stat(full, &sz, &d) != 0 || d == 0) return -1;
+        return sysvol_list(full, entries, max_entries);
+    }
     /* 每个后端都真的按路径列那个目录。以前只有 exFAT/FAT 接了，其余后端
      * 退化成"忽略参数列 cwd"——`ls SD` 答非所问，是纯简化，不是能力不够：
      * ext4/ntfs/f2fs/refs/erofs 的 read_dir 本身就吃 path 参数。 */

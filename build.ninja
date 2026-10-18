@@ -186,7 +186,7 @@ build kernel/shell_extra.o: cc kernel/shell_extra.c
 build kernel/exfat.o: cc kernel/exfat.c
 build kernel/fat.o: cc kernel/fat.c
 build kernel/fs.o: cc kernel/fs.c
-build kernel/sysvol_data.c: make_sysvol user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
+build kernel/sysvol_data.c: make_sysvol user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf user/dirwalk.elf
 build kernel/sysvol.o: cc kernel/sysvol.c
 build kernel/sysvol_data.o: cc kernel/sysvol_data.c
 build kernel/ext4.o: cc kernel/ext4.c
@@ -228,6 +228,8 @@ build user/segprobe.o: cc_user user/segprobe.c
 build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
 build user/netcli.o: cc_user user/netcli.c
 build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
+build user/dirwalk.o: cc_user user/dirwalk.c
+build user/dirwalk.elf: link_user user/crt0.o user/dirwalk.o user/libc.o | user/user.ld
 
 build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/http.o kernel/webview.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/cjk.o kernel/cjk_font.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 
@@ -286,7 +288,7 @@ rule make_vmware
 
 build vmware: make_vmware usb-image.bin tools/make_vmware.py
 
-default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.vhd usb-image.bin
+default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf user/dirwalk.elf disk.vhd usb-image.bin
 
 build clean: phony
     command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

@@ -81,6 +81,8 @@ int      fs_list_root(void);
 int      fs_read_dir(fs_dir_entry_t *entries, int max_entries);
 /* 带路径的列目录：/bin 与 /system 走内核内置只读系统卷，其余走当前磁盘卷 */
 int      fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries);
+/* stat：存在经 size/is_dir 写回属性返回 0；不存在/未挂载返回 -1 */
+int      fs_stat(const char *name, uint32_t *size, uint8_t *is_dir);
 int      fs_change_dir(const char *name);
 int      fs_mkdir(const char *name);
 int      fs_rmdir(const char *name);   /* 删空目录；非目录/非空/不存在均 -1 */

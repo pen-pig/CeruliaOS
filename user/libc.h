@@ -41,6 +41,34 @@ int lseek(int fd, int off, int whence);
 void _exit(int code) __attribute__((noreturn));
 int sockcall(int subcmd, void *args);
 
+/* ---- 目录项 / 属性结构：布局必须与内核逐字节一致 ----
+ * readdir 的输出缓冲由内核校验后**直写**（syscall.c SYS_READDIR 注释），
+ * 所以这里差一个字节，内核写的就是别的字段。用 _Static_assert 钉住，
+ * 布局漂移在编译期炸，而不是在 E2E 里变成乱码名字。 */
+typedef struct {
+    char          name[256];    /* NUL 结尾；内核侧 fs_dir_entry_t.name */
+    unsigned int  size;         /* 字节数；目录项为 0 */
+    unsigned char is_dir;       /* 1=目录 */
+} user_dirent_t;
+
+typedef struct {
+    unsigned int  size;         /* +0：内核按小端四字节写回 */
+    unsigned char is_dir;       /* +4 */
+} user_stat_t;                  /* sizeof=8（含对齐填充），内核写 5 字节 */
+
+_Static_assert(sizeof(user_dirent_t) == 264,
+               "user_dirent_t must match kernel fs_dir_entry_t");
+_Static_assert(__builtin_offsetof(user_dirent_t, size) == 256, "size offset drift");
+_Static_assert(__builtin_offsetof(user_dirent_t, is_dir) == 260, "is_dir offset drift");
+_Static_assert(sizeof(user_stat_t) == 8, "user_stat_t must match kernel writeback");
+
+/* readdir：一次性列完一个目录（SYS_READDIR=46）。返回条目数
+ * （0=空目录），失败 -1。ents 见上面的 user_dirent_t。 */
+int readdir(const char *path, user_dirent_t *ents, unsigned int max);
+/* stat：取路径属性（SYS_STAT=47）。存在写回 {size,is_dir} 返回 0，
+ * 不存在/未挂载 -1。 */
+int stat(const char *path, user_stat_t *st);
+
 /* ---- libc 提供的系统调用薄封装（int 0x80 直接陷入） ---- */
 int  syscall(int num, int a, int b, int c);
 void exit(int code) __attribute__((noreturn));
@@ -59,6 +87,13 @@ void         itoa(unsigned int v, char *out);   /* 十进制，NUL 结尾 */
 void         puts(const char *s);               /* 原样写出，不加换行 */
 void         putdec(int v);                     /* 十进制打印（支持负数） */
 
+/* ---- 格式化输出（%d %i %u %x %X %c %s %%，无宽度/精度）---- */
+void         printf(const char *fmt, ...);
+
+/* ---- 堆：静态池 + free-list（见 libc.c 顶部的设计注释）---- */
+void        *malloc(unsigned int n);
+void         free(void *p);
+
 /* ---- 系统调用号（与内核 syscall.h 对齐；只封装内核已实现的） ---- */
 #define SYS_READ    0u
 #define SYS_WRITE   1u
@@ -70,6 +105,8 @@ void         putdec(int v);                     /* 十进制打印（支持负�
 #define SYS_FORK    43u
 #define SYS_WAITPID 44u
 #define SYS_GETPID  45u
+#define SYS_READDIR 46u
+#define SYS_STAT    47u
 #define WNOHANG     1        /* 非阻塞 waitpid：子进程仍在跑则返回 0（不收割） */
 
 #endif

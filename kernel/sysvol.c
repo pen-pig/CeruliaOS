@@ -111,6 +111,22 @@ uint32_t sysvol_size(const char *path) {
     return sysvol_table[i].size;
 }
 
+int sysvol_stat(const char *path, uint32_t *size, uint8_t *is_dir) {
+    if (path == 0 || size == 0 || is_dir == 0) return -1;
+    /* 两个挂载点本身是目录。用 sv_ci_eq 而不是 sv_seg_is：后者对
+     * "/bin/x" 也为真，会把文件误判成目录。 */
+    if (sv_ci_eq(path, "bin") || sv_ci_eq(path, "system")) {
+        *size = 0;
+        *is_dir = 1;
+        return 0;
+    }
+    int i = sysvol_lookup(path);
+    if (i < 0) return -1;
+    *size = sysvol_table[i].size;
+    *is_dir = 0;
+    return 0;
+}
+
 int sysvol_read(const char *path, uint8_t *buffer, uint32_t max_size) {
     int i = sysvol_lookup(path);
     if (i < 0 || buffer == 0) return -1;

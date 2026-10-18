@@ -9,6 +9,7 @@
 #include "panic.h"
 #include "task.h"
 #include "fd.h"
+#include "fs.h"
 #include "net.h"
 
 /* kernel_entry.asm */
@@ -167,6 +168,60 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
     case SYS_GETPID:
         /* libc getpid()：返回当前进程的 pid（用户态后台任务打印 [n] pid 用）。 */
         return (cur != 0) ? (int)cur->pid : 0;
+    case SYS_READDIR: {
+        /* ebx=路径（用户指针，逐字节校验拷进核内缓冲，同 SYS_OPEN），
+         * ecx=用户 user_dirent_t[]（与内核 fs_dir_entry_t 同布局），
+         * edx=容量。一次性填完：成功返回条目数（0=空目录），失败 -1。
+         *
+         * 输出缓冲**校验后直写**（fs_read_dir_path 直接写用户内存），与
+         * SYS_READ 让 fd_read 直写用户缓冲同一风格——内核侧不留 static
+         * 暂存，多任务并发各自写各自的页，没有共享状态可踩。
+         * 乘法前先查 edx 上界：count*sizeof 回绕会把校验长度变成 0，
+         * 之后的大段写入全部落在未校验内存上（本项目经典事故形态）。 */
+        uint32_t max = a3;
+        if (max == 0 || max > MAX_READDIR_ENTRIES) return -1;
+        if (!user_range_ok(a2, max * (uint32_t)sizeof(fs_dir_entry_t), 1))
+            return -1;
+        char kpath[256];
+        uint32_t i = 0;
+        while (i < sizeof(kpath) - 1) {
+            if (!user_range_ok(a1 + i, 1, 0)) return -1;
+            char c = ((const char *)a1)[i];
+            if (c == '\0') break;
+            kpath[i] = c;
+            i++;
+        }
+        if (i >= sizeof(kpath) - 1) return -1;       /* 未遇 NUL：过长 */
+        kpath[i] = '\0';
+        return fs_read_dir_path(kpath, (fs_dir_entry_t *)a2, (int)max);
+    }
+    case SYS_STAT: {
+        /* ebx=路径（逐字节拷核内），ecx=用户 user_stat_t*（8 字节：
+         * +0 uint32 size, +4 uint8 is_dir，其余为对齐填充）。
+         * 存在写回属性返回 0；不存在/未挂载 -1。 */
+        char kpath[256];
+        uint32_t i = 0;
+        while (i < sizeof(kpath) - 1) {
+            if (!user_range_ok(a1 + i, 1, 0)) return -1;
+            char c = ((const char *)a1)[i];
+            if (c == '\0') break;
+            kpath[i] = c;
+            i++;
+        }
+        if (i >= sizeof(kpath) - 1) return -1;
+        kpath[i] = '\0';
+        if (!user_range_ok(a2, 8, 1)) return -1;
+        uint32_t size = 0;
+        uint8_t is_dir = 0;
+        if (fs_stat(kpath, &size, &is_dir) != 0) return -1;
+        uint8_t *out = (uint8_t *)a2;
+        out[0] = (uint8_t)(size & 0xFF);
+        out[1] = (uint8_t)((size >> 8) & 0xFF);
+        out[2] = (uint8_t)((size >> 16) & 0xFF);
+        out[3] = (uint8_t)((size >> 24) & 0xFF);
+        out[4] = is_dir;
+        return 0;
+    }
     case SYS_EXIT:
         if (cur != 0 && cur->is_user) {
             /* 用户进程退出（步骤 6c）：拆地址空间、关 fd、记退出码并让出 CPU。

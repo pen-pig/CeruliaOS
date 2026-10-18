@@ -1393,6 +1393,20 @@ uint32_t exfat_get_file_size(const char *name) {
     return *((uint32_t*)(entry + EXFAT_MERGED_SIZE_OFF));
 }
 
+int exfat_stat(const char *name, uint32_t *size, uint8_t *is_dir) {
+    if (!exfat_ready || name == 0 || size == 0 || is_dir == 0) return -1;
+
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+
+    uint8_t entry[1024];
+    if (exfat_find_entry(dir, leaf, entry) < 0) return -1;
+    *size = *((uint32_t*)(entry + EXFAT_MERGED_SIZE_OFF));
+    *is_dir = (entry[1] & EXFAT_ATTR_DIRECTORY) ? 1u : 0u;
+    return 0;
+}
+
 // 统计 FAT 表中已分配的簇数（供 df 使用）：扫描全部 FAT 表项，非 0 即已用
 uint32_t exfat_count_used_clusters(void) {
     if (!exfat_ready) return 0;

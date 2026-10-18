@@ -43,6 +43,7 @@ BIN_FILES = [
     "netecho.elf",
     "nettcp.elf",
     "netcli.elf",
+    "dirwalk.elf",
 ]
 
 MAX_PATH = 32          # 必须与 kernel/sysvol.h 的 SYSVOL_MAX_PATH 一致

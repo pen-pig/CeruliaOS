@@ -1159,6 +1159,18 @@ uint32_t fat_get_file_size(const char *name) {
     return de.size;
 }
 
+int fat_stat(const char *name, uint32_t *size, uint8_t *is_dir) {
+    if (!fat_type || name == 0 || size == 0 || is_dir == 0) return -1;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+    fat_dirent_t de;
+    if (fat_find_entry(dir, leaf, &de) != 0) return -1;
+    *size = de.size;
+    *is_dir = de.is_dir ? 1u : 0u;
+    return 0;
+}
+
 uint32_t fat_get_file_clusters(const char *name) {
     if (!fat_type) return 0;
     uint32_t dir = 0;

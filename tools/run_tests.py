@@ -54,7 +54,7 @@ PY = sys.executable
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
-             "termwrap", "stackchk", "systest", "oomtest"],
+             "termwrap", "stackchk", "systest", "oomtest", "userfs"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
              "fsck"],
@@ -143,6 +143,8 @@ TIMEOUT = {
     "cjk": 180,
     "fs_matrix": 600, "hostfs": 900, "netapp": 600, "edge": 700,
     "power": 420, "ahci": 420, "nvme": 600, "regress": 600,
+    # userfs：起 1 台 QEMU，exec dirwalk 两轮（系统卷 + 数据盘），实测 ~2 分钟
+    "userfs": 300,
     # edge 每用例独立起一个 QEMU，实测 416s；420 会刚好卡线超时
     # rmdir 用 screendump+OCR 逐个断言，6 个 FS x ~20 条命令，实测 ~7 分钟
     "rmdir": 900,

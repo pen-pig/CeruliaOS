@@ -187,8 +187,14 @@ def main():
         except Exception:
             kill_all_qemu()
         wait_port_free(QMP_PORT, 15)
+        # 删私有盘副本必须带保护：沙箱/删除钩子环境下 os.remove 会被拦，
+        # 无保护的删除会在**全部断言通过之后**炸掉 finally，现象是
+        # "最后一条 PASS 却退出码 1"——极具误导性（2026-10-18 长跑实测）。
         if os.path.isfile(WORK):
-            os.remove(WORK)
+            try:
+                os.remove(WORK)
+            except OSError:
+                pass
 
     bad = [n for n, ok in results if not ok]
     print("---- %d/%d passed ----" % (len(results) - len(bad), len(results)))

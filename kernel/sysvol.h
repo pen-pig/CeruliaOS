@@ -61,6 +61,10 @@ int sysvol_read(const char *path, uint8_t *buffer, uint32_t max_size);
  * 成功返回条目数，失败 -1。 */
 int sysvol_list(const char *dir, fs_dir_entry_t *out, int max_entries);
 
+/* stat：/bin 与 /system 精确匹配（容忍尾 '/' 与大小写）是目录（size=0）；
+ * 表内文件 size=表项值、is_dir=0；都不命中返回 -1。 */
+int sysvol_stat(const char *path, uint32_t *size, uint8_t *is_dir);
+
 /* exec 用：把裸程序名（"hello" / "HELLO.ELF"）解析成系统卷里的绝对路径，
  * 写进 out 并返回 0；系统卷里没有则返回 -1（调用方回落到数据盘）。 */
 int sysvol_resolve_bin(const char *name, char *out, uint32_t outsz);

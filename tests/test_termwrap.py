@@ -122,7 +122,12 @@ class Qmp(object):
 def grab_vga(qmp):
     """把 0xB8000 的文本缓冲抓成 25 行字符串（只取字符字节，丢属性）。"""
     if os.path.exists(VGABIN):
-        os.remove(VGABIN)
+        # 删除带保护：沙箱/删除钩子环境下 os.remove 会被拦，无保护删除
+        # 会炸掉 finally，现象是"断言全过却退出码 1"（2026-10-18 实测）。
+        try:
+            os.remove(VGABIN)
+        except OSError:
+            pass
     qmp.hmc("memsave 0x%x %d %s" % (0xB8000, COLS * ROWS * 2, VGABIN))
     if not os.path.exists(VGABIN):
         return None
@@ -154,7 +159,12 @@ def wait_shell(timeout=BOOT_WAIT):
 def main():
     results = []
     if os.path.exists(LOG):
-        os.remove(LOG)
+        # 删除带保护：沙箱/删除钩子环境下 os.remove 会被拦，本测试开头
+        # 这一步就崩过一次（0.6s 无输出退出），极易误判成 QEMU 起不来。
+        try:
+            os.remove(LOG)
+        except OSError:
+            pass
     proc = subprocess.Popen(
         [QEMU, "-machine", "pc", "-vga", "std", "-m", "128",
          "-drive", "format=raw,file=" + IMG,

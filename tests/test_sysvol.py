@@ -64,7 +64,7 @@ WORK_B = os.path.join(HERE, "sysvol_b.vhd").replace("\\", "/")
 
 BIN_PROGRAMS = ["hello.elf", "forktest.elf", "fdtest.elf", "fdleak.elf",
                 "spin.elf", "segprobe.elf", "netecho.elf", "nettcp.elf",
-                "netcli.elf"]
+                "netcli.elf", "dirwalk.elf"]
 
 
 def boot(work, ports):
@@ -174,7 +174,7 @@ def case_sysvol():
         # 2) ls /bin 列出全部内置程序
         ok, out = run_cmd(qmp, serial, "ls /bin", "hello.elf")
         missing = [p for p in BIN_PROGRAMS if p not in out]
-        results.append(("ls /bin lists all 9 built-in programs", ok and not missing))
+        results.append(("ls /bin lists all 10 built-in programs", ok and not missing))
         if missing:
             print("  ls /bin missing: " + ",".join(missing))
 

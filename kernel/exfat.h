@@ -58,5 +58,8 @@ typedef struct {
 int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries);
 /* 列指定路径的目录（支持 "SD"、"SD/sub"、"/SD"）；不存在或不是目录 -> -1 */
 int exfat_read_dir_path(const char *path, exfat_dir_entry_t *entries, int max_entries);
+/* stat：路径存在则经 size/is_dir 写回属性并返回 0；不存在返回 -1。
+ * 复用 exfat_resolve_leaf + exfat_find_entry，不复制第二套查找逻辑。 */
+int exfat_stat(const char *name, uint32_t *size, uint8_t *is_dir);
 
 #endif
