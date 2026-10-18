@@ -283,6 +283,7 @@ diskutil eject /dev/disk4
 **关于 SATA 模式（AHCI vs IDE）——与后面 `setdrive` 的关系：**
 - **AHCI 模式**：SATA 控制器走 AHCI，内核扫描 PCI class `0x0106` 控制器，
   端口号 0~N，`setdrive 4-11` 选 AHCI 盘。这是 H1b 验证过的路径。
+  **真机 bring-up 检查单（串口诊断速查 + 症状表）见 `docs/AHCI_BRINGUP.md`**。
 - **IDE / 兼容模式（有时叫 RAID 或 ATA）**：控制器退化为 IDE（ATA PIO），
   内核走 `setdrive 0-3` 选 IDE 盘（主/从，主盘控制器 0/1，从盘 2/3）。
 - 没把握就**先用 AHCI 模式**写盘试；进 shell 后用 `setdrive` + `ls` 看哪个盘能挂上。

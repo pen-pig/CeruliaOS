@@ -86,7 +86,11 @@ LAYERS = {
     # 在带删除钩子的环境里还会被拦成 FAIL），而 check_html.py 从来没被执行过。
     # 所以对拍闸门形同虚设，static 层每次都在跑 E2E。
     "static": ["check_stack", "stack", "encoding", "help", "check_cpu",
-               "check_vmx", "check_html", "usbmsc_rules", "check_alloc"],
+               "check_vmx", "check_html", "usbmsc_rules", "check_alloc",
+               # lint：BANNED 家族 + 文件级 ERROR 规则（ahci.c 的 W 位/BOHC
+               # 闸门住这儿）。以前 lint 只靠人手动跑——闸门不被调用等于
+               # 没有，2026-10-18 接进回归。几秒跑完，不进 QEMU。
+               "lint"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。

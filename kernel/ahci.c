@@ -9,6 +9,16 @@
  *
  * 缓冲全部静态落在 .bss（19MB 区，identity 映射 == 物理地址），AHCI 直接拿
  * 内核地址当物理地址用，无需 bounce。轮询 CI 位 + 超时 fail closed，不接 IRQ。
+ *
+ * 2026-10-18 真机 bring-up 审查（QEMU test_ahci 10/10 绿的前提下修了三处
+ * QEMU 看不见的问题，详见各点注释）：
+ *   1. 命令头 W 位曾用 bit 7（P 位）——QEMU 按命令字定向 DMA，不读该位；
+ *      真机 HBA 按 W 位编程总线主控方向，写命令会坏。已修 + 命名宏钉死。
+ *   2. BOHC 握手曾重写 BOS 却等 OOS——真机 BIOS 持控制器时必等满 1 秒且
+ *      拿不到所有权。已按规范 10.6 修（置 OOS，等 OOS=1 && BOS=0）。
+ *   3. ABAR 页映射 uint32 回绕（0xFFFFF000 一带）+ pa=0 不设防。已修。
+ * 另显式关 PxIE。HBA reset（GHC.HR）仍保持关闭：端口级 stop/COMRESET 已
+ * 够用，reset 在部分控制器上会挂——真机端口起不来时再作为诊断手段开。
  */
 #include "ahci.h"
 #include "pci.h"
@@ -50,6 +60,37 @@
 #define PXCMD_FRE  (1u << 4)  /* FIS Receive Enable */
 #define PXCMD_FR   (1u << 14) /* FIS Receive Running */
 #define PXCMD_CR   (1u << 15) /* Command List Running */
+
+/* 命令头 DW0 位定义（AHCI 1.3.1 规范表 30 / Intel AHCI 1.0 规范 Figure 8）：
+ *   CFL[4:0] 命令 FIS 长度（dword）；A(ATAPI)=5；W(写)=6；P(预取)=7；
+ *   R=8；B=9；C=10；PMP[15:12]；PRDTL[31:16]。
+ * 曾经写命令标志用 (1u << 7)——那是 P 位，W 位（bit 6）根本没置。QEMU 对
+ * DMA 命令按 FIS 里的命令字定向（hw/ide/core.c 的 IDE_DMA_WRITE 分派），
+ * 读都不读这个位，所以 E2E 全程绿；真机 HBA 按 W 位编程总线主控 DMA 方向，
+ * 写命令 W=0 会被当成"设备→内存"，数据永远到不了盘（或协议错误超时）。
+ * 双处佐证：Intel AHCI 1.0 规范 Figure 8（W 在 06 行）+ QEMU
+ * hw/ide/ahci-internal.h 的 AHCI_CMD_WRITE = (1 << 6)。 */
+#define CH_CFL(fis_dwords) ((uint32_t)(fis_dwords))     /* bits 4:0 */
+#define CH_ATAPI  (1u << 5)
+#define CH_WRITE  (1u << 6)   /* 1 = 系统内存→设备（写） */
+#define CH_PREFETCH (1u << 7)
+#define CH_RESET  (1u << 8)
+#define CH_BIST   (1u << 9)
+#define CH_CLR_BUSY (1u << 10)
+#define CH_PMP(p) ((uint32_t)(p) << 12)
+#define CH_PRDTL(n) ((uint32_t)(n) << 16)
+
+/* BIOS/OS 所有权交接（BOHC @ ABAR+0x28，AHCI 1.3.1 规范 3.1.11 / 10.6）：
+ *   bit0 BOS = BIOS 持有；bit1 OOS = OS 请求（拿到所有权的条件是
+ *   OOS 读回 1 且 BOS 读回 0）；bit2 SOOE；bit3 OOC(RWC)；bit4 BB = BIOS
+ *   正在为交接做清理。
+ * 曾经这里写 boqc|1（又写了一遍 BOS）却等 bit1——OOS 从未被置起来，每次
+ * 必等满 1 秒且所有权根本拿不到。真机 BIOS 从 SATA 启动时 BOS 恒为 1，
+ * 这条路径必踩（QEMU 未实现 BOHC，读回 0，所以 E2E 看不见）。
+ * 注意：BOHC 不受 HBA reset 影响。 */
+#define BOHC_BOS (1u << 0)
+#define BOHC_OOS (1u << 1)
+#define BOHC_BB  (1u << 4)
 
 #define SSTS_DET(p) ((p) & 0x0Fu)
 #define TFD_ERR     (1u << 0)
@@ -192,8 +233,9 @@ static int ahci_submit(uint8_t port, uint8_t ata_cmd, int is_write,
 
     /* 命令头：清 8 个 dword */
     for (int i = 0; i < 8; i++) ((uint32_t *)cl)[i] = 0;
-    /* CFL=5（CFIS 5 dword），W=写标志，PRDTL=1 */
-    ((uint32_t *)cl)[0] = 5u | (is_write ? (1u << 7) : 0u) | (1u << 16);
+    /* CFL=5（CFIS 5 dword），W=写标志（bit 6，见 CH_WRITE 注释里的真机事故），
+     * PRDTL=1。曾误用 bit 7（P 位）当 W——QEMU 不读该位所以测试照绿。 */
+    ((uint32_t *)cl)[0] = CH_CFL(5u) | (is_write ? CH_WRITE : 0u) | CH_PRDTL(1u);
     ((uint32_t *)cl)[2] = (uint32_t)(size_t)ct;   /* CTBA */
     ((uint32_t *)cl)[3] = 0;                       /* CTBAU */
 
@@ -265,6 +307,10 @@ static int ahci_probe_port(uint8_t port) {
     aw(pr + PX_FB,   (uint32_t)(size_t)g_fb[port]);
     aw(pr + PX_FBU,  0);
     aw(pr + PX_SERR, ~0u);
+    /* 轮询模式：显式关端口中断。GHC.IE=0 时 HBA 本就不该拉中断线，但真机
+     * BIOS 可能给 PxIE 留着位，个别控制器照拉不误——撞进没有处理函数的
+     * IRQ 向量就是一次莫名重启。写 0 是一行钱的保险。 */
+    aw(pr + PX_IE, 0);
 
     /* HBA reset 之后链路默认不会起来，发 COMRESET 让设备重新协商 */
     ahci_comreset(pr);
@@ -473,11 +519,24 @@ int ahci_init(void) {
         return -1;
     }
     uint32_t pa = bar & 0xFFFFFFF0u;
-    uint32_t page_pa = pa & 0xFFFFF000u;
-    for (int i = 0; i < 4; i++) {        /* 最多 4 页，覆盖 <=32 端口的寄存器区 */
-        uint32_t pg = page_pa + (uint32_t)i * 4096u;
-        if (paging_map(pg, pg, PAGING_MMIO_FLAGS) != 0) {
-            aklog("AHCI: ABAR map failed, abort");
+    /* pa=0 说明 BAR5 没被固件编程（或拿到的不是真 AHCI 设备）。曾经直接
+     * 拿 0 当 ABAR：映射掉 0 页（IVT/BDA 区）后读出来的"CAP/SIG"全是垃圾，
+     * 现象是控制器假上线、端口全 absent——极具误导性。fail closed。 */
+    if (pa == 0) {
+        aklog("AHCI: BAR5 not programmed (pa=0), abort");
+        return -1;
+    }
+    /* 端口寄存器区 = [pa, pa + 0x100 + 31*0x80 + 0x43] ≈ 4.3KB。按页向下
+     * 对齐后最多跨 3 页，映射 4 页富余。页号用 64 位算：ABAR 落在
+     * 0xFFFFF000 附近时，uint32 的 page_pa + 3*4096 会回绕成 0x2EF0，
+     * 把低地址页映射掉、顶端寄存器区反而没映射——真机上 ABAR 就经常在
+     * 0xFExxF000 这一带。 */
+    uint64_t page_pa = (uint64_t)pa & ~(uint64_t)0xFFFu;
+    for (int i = 0; i < 4; i++) {
+        uint64_t pg = page_pa + (uint64_t)i * 4096u;
+        if (pg > 0xFFFFFFFFu) break;     /* BAR5 是 32 位区，4GB 外不映射 */
+        if (paging_map((uint32_t)pg, (uint32_t)pg, PAGING_MMIO_FLAGS) != 0) {
+            aklog_hex("AHCI: ABAR page map failed at 0x", (uint32_t)pg, "");
             return -1;
         }
     }
@@ -496,18 +555,31 @@ int ahci_init(void) {
         aklog_hex("AHCI: SSTS@0x128=0x", ar(0x128), "");
     }
 
-    /* 4) BIOS/OS 接管握手（若 BIOS 仍持有控制器） */
-    uint32_t boqc = ar(GHC_BOQC);
-    if ((boqc & 1u) && !(boqc & 2u)) {
-        aw(GHC_BOQC, boqc | 1u);
+    /* 4) BIOS/OS 所有权交接（BIOS 从 SATA 启动时 BOS 恒为 1，真机必踩）。
+     *    正确序列（规范 10.6）：置 OOS 请求 → 等 OOS 读回 1 且 BOS 读回 0
+     *    （BB 清 0 表示 BIOS 清理完毕）。拿不到就带日志继续——让后面的
+     *    端口探测去暴露状态，比死在握手上好。 */
+    uint32_t bohc = ar(GHC_BOQC);
+    if (bohc & BOHC_BOS) {
+        aklog_hex("AHCI: BIOS holds controller (BOHC=0x", bohc, "), requesting");
+        aw(GHC_BOQC, bohc | BOHC_OOS);
         /* 用 g_pit_ticks 计时，不用迭代次数。固定 20万次空转的墙钟时间
          * 取决于 CPU 频率、cache 状态、是否被中断打断 —— 同一个数在
          * 一台机器上可能是 2ms 也可能是 200ms，不能当超时用。
          * 这也是本文件头的自订原则：等硬件一律用真实时间基准。 */
         uint32_t bt0 = g_pit_ticks;
         for (;;) {
-            if (ar(GHC_BOQC) & 2u) break;
-            if ((uint32_t)(g_pit_ticks - bt0) >= AHCI_BOQC_HANDSHAKE_MS) break;
+            uint32_t b = ar(GHC_BOQC);
+            if ((b & BOHC_OOS) && !(b & BOHC_BOS)) {
+                aklog("AHCI: OS ownership acquired");
+                break;
+            }
+            if ((uint32_t)(g_pit_ticks - bt0) >= AHCI_BOQC_HANDSHAKE_MS) {
+                /* 有些 BIOS 不响应 OOS。带值打日志：真机 bring-up 时这行
+                 * 直接说明"所有权没拿到"，比沉默继续有价值。 */
+                aklog_hex("AHCI: BOQC handoff timeout, BOHC=0x", b, "");
+                break;
+            }
         }
     }
 

@@ -35,6 +35,28 @@ WARN_PATTERNS = [
     (r"\bkmalloc\s*\(", None),   # 单独处理（配合返回值检查）
 ]
 
+# 文件级 ERROR 规则：曾经的坑只可能在特定文件复发，全局模式会误伤别处。
+# 匹配在剥注释后的代码行上做（和 BANNED 同一管道）。
+FILE_RULES = {
+    "kernel/ahci.c": [
+        # 命令头 DW0 拼装必须走 CH_* 宏。W（写）位是 bit 6，P（预取）是 bit 7
+        # （AHCI 1.3.1 规范表 30 / Intel AHCI 1.0 Figure 8 / QEMU
+        # ahci-internal.h 的 AHCI_CMD_WRITE）。曾经手写 (1u << 7) 当 W：
+        # QEMU 对 DMA 命令按命令字定向、根本不读该位，E2E 全绿；真机 HBA
+        # 按 W 位编程总线主控方向，写命令会被当成"设备→内存"，数据永远
+        # 到不了盘。裸位写法就是给这个 bug 留门。
+        (r"\(\s*uint32_t\s*\*\s*\)\s*cl\s*\)\s*\[\s*0\s*\]\s*=(?![^;]*CH_CFL)",
+         "命令头 DW0 必须用 CH_CFL/CH_WRITE/CH_PRDTL 宏拼装"
+         "（W=bit6/P=bit7，曾误用 bit 7：QEMU 绿、真机写命令全坏）"),
+        # BOHC 所有权交接：必须写 OOS（bit 1）请求所有权，等 OOS=1 且
+        # BOS=0。曾经写 boqc|1（又写了一遍 BOS）却等 bit 1——OOS 从没被
+        # 置起来，真机 BIOS 从 SATA 启动持控制器时必等满 1 秒且拿不到
+        # 所有权（QEMU 未实现 BOHC、读回 0，E2E 看不见）。
+        (r"aw\s*\(\s*GHC_BOQC\s*,(?![^;]*BOHC_OOS)",
+         "写 GHC_BOQC 必须带 BOHC_OOS（bit 1）请求所有权；只写 BOS 是无效重写"),
+    ],
+}
+
 # 分配点：变量名 = kmalloc(...)，要求后面若干行内出现空检查
 ALLOC_RE = re.compile(
     r"(?<![\w.>])([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*=\s*(?:\([^)]*\)\s*)?"
@@ -104,8 +126,14 @@ def scan_file(path):
         stripped, in_block = strip_comments(ln, in_block)
         code_lines.append(stripped)
 
+    rel = os.path.relpath(path, ROOT).replace("\\", "/")
+    file_rules = FILE_RULES.get(rel, [])
+
     for idx, code in enumerate(code_lines, 1):
         for pat, msg in BANNED:
+            if re.search(pat, code):
+                errors.append((idx, msg, lines[idx - 1].strip()[:90]))
+        for pat, msg in file_rules:
             if re.search(pat, code):
                 errors.append((idx, msg, lines[idx - 1].strip()[:90]))
         if MEMCPY_SIZEOF_PTR_RE.search(code):
