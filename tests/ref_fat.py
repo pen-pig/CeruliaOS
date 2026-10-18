@@ -16,7 +16,7 @@
   - audit()：FAT 链越界/成环、目录项首簇越界、文件大小超链长、
     8.3 名非法字符、LFN checksum 不符
 
-只读：不写盘。造盘请用 temp/gen_diskimg.py 或 tests 里的写入器。
+只读：不写盘。造盘请用 tools/gen_diskimg.py 或 tests 里的写入器。
 """
 import struct
 

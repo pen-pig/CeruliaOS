@@ -1004,7 +1004,7 @@ int exfat_format(uint32_t part_start) {
     // 扇区 0 参与计算时 VolumeFlags(106,107) 与 PercentInUse(112) 按 0 处理
     //（这两个字段会被宿主/格式化工具改写，所以排除）。
     // 早期只写 VolumeChecksum@0 + 一个整体校验@508，Windows 会判为卷损坏
-    //（双击挂载报"需要格式化"）—— 与 temp/gen_diskimg.py 保持同一算法。
+    //（双击挂载报"需要格式化"）—— 与 tools/gen_diskimg.py 保持同一算法。
     uint8_t boot_region[11 * 512];
     for (int s = 0; s < 11; s++) {
         // BootChecksum 覆盖卷相对 0-10（=绝对 exfat_partition_start..+10）

@@ -7,7 +7,7 @@
      也不认；而我们的 exFAT Boot Checksum 扇区一直是"VolumeChecksum@0 +
      整体校验@508"的非规范写法，Windows 会判卷损坏、提示格式化。
 
-现在镜像**本身就是固定 VHD**：temp/gen_diskimg.py 把镜像字节写在文件头
+现在镜像**本身就是固定 VHD**：tools/gen_diskimg.py 把镜像字节写在文件头
 （偏移 0）再追加 512 字节 footer，所以 QEMU 用 format=raw 直接加载 disk.vhd，
 不再有第二份 .img。本脚本守住：
   A. footer 字段合法、校验和对、CHS 容量与 Current Size 一致；
@@ -36,7 +36,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 VHD = disk_path()
-GEN = os.path.join(ROOT, "temp", "gen_diskimg.py")
+GEN = os.path.join(ROOT, "tools", "gen_diskimg.py")
 MAKE_VHD = os.path.join(ROOT, "tools", "make_vhd.py")
 TMP_BAD = os.path.join(HERE, "_vhd_bad.vhd")
 TMP_REGEN_DIR = os.path.join(HERE, "_vhd_regen")
@@ -127,7 +127,7 @@ def bad_case(name, mutate, blob):
 
 def main():
     if not os.path.isfile(MAKE_VHD) or not os.path.isfile(GEN):
-        print("MISSING tools/make_vhd.py / temp/gen_diskimg.py")
+        print("MISSING tools/make_vhd.py / tools/gen_diskimg.py")
         return 2
 
     src = fresh_vhd()
