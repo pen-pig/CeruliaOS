@@ -28,6 +28,14 @@ extern void ezos_console_print_dec(uint32_t num);
 #define CMD_BUFFER_SIZE 1024
 #define HISTORY_SIZE 8
 
+/* 文件读写共享缓冲。历史：cat/grep/wc/head/tail/cp/mv/vi 各自持有一份
+ * 4KB static，共 44KB BSS，且任何超过 4KB 的文档都被静默截断——vi 打开
+ * 大文件只读前 4KB、存盘也只存前 4KB，日用编辑直接撞墙。统一成一份 64KB
+ * 共享缓冲（这些命令互斥运行，不存在并发），单一上限 FILE_BUF_SIZE。
+ * 按纪律 ≥4KB 的缓冲必须 static —— 它在文件作用域，天然 .bss。 */
+#define FILE_BUF_SIZE 65536u
+static uint8_t g_file_buf[FILE_BUF_SIZE];
+
 static char cmd_buffer[CMD_BUFFER_SIZE];
 static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
@@ -626,18 +634,19 @@ static void shell_execute(char *cmd) {
         while (*fname == ' ') fname++;
         if (append) {
             /* >> 追加：先读回原文件再合并 */
-            static uint8_t old[4096];
-            static uint8_t merged[8192];
+            /* 追加上限从 8KB 提到 128KB：原 old[4096]+merged[8192] 使
+             * "cmd >> file" 对超过 8KB 的文档静默截断，与 cat/vi 同病。 */
+            static uint8_t merged[131072];
             int mn = 0;
             if (fs_init() == 0) {
-                int on = fs_read_file(fname, old, 4096);
-                if (on > 0) for (int i = 0; i < on && mn < 8191; i++) merged[mn++] = old[i];
+                int on = fs_read_file(fname, g_file_buf, FILE_BUF_SIZE);
+                if (on > 0) for (int i = 0; i < on && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = g_file_buf[i];
             }
             static char cap[PIPE_BUF_SIZE];
             terminal_begin_capture(cap, PIPE_BUF_SIZE);
             shell_execute_raw(cmd, 0);
             int n = terminal_end_capture();
-            for (int i = 0; i < n && mn < 8191; i++) merged[mn++] = (uint8_t)cap[i];
+            for (int i = 0; i < n && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = (uint8_t)cap[i];
             if (mn > 0 && fs_init() == 0) {
                 fs_create_file(fname, merged, mn);
             }
@@ -1635,13 +1644,12 @@ static void cmd_cat(const char *args) {
         terminal_writestring("FS init failed.\n");
         return;
     }
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("File not found or read error.\n", CLR_ERROR);
     } else {
         for (int j = 0; j < bytes; j++) {
-            char c = (char)file_buffer[j];
+            char c = (char)g_file_buf[j];
             if (c == '\n' || c == '\t' || c == '\r' || (c >= 32 && c <= 126)) {
                 terminal_putchar(c);
             } else {
@@ -1798,8 +1806,7 @@ static void cmd_grep(const char *args) {
         }
         return;
     }
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("File not found or read error.\n", CLR_ERROR);
         return;
@@ -1807,15 +1814,15 @@ static void cmd_grep(const char *args) {
     int plen = my_strlen(pattern);
     int line_start = 0, line_end = 0;
     while (line_end < bytes) {
-        while (line_end < bytes && file_buffer[line_end] != '\n') line_end++;
+        while (line_end < bytes && g_file_buf[line_end] != '\n') line_end++;
         int found = 0;
         for (int s = line_start; s + plen <= line_end; s++) {
             int k = 0;
-            while (k < plen && file_buffer[s + k] == pattern[k]) k++;
+            while (k < plen && g_file_buf[s + k] == pattern[k]) k++;
             if (k == plen) { found = 1; break; }
         }
         if (found) {
-            print_highlighted((const char *)file_buffer, line_start, line_end, pattern, plen);
+            print_highlighted((const char *)g_file_buf, line_start, line_end, pattern, plen);
             terminal_putchar('\n');
         }
         line_end++;
@@ -1825,6 +1832,20 @@ static void cmd_grep(const char *args) {
 
 static void cmd_wc(const char *args) {
     char filename[128];
+    /* 支持 -l/-w/-c（可组合，如 -lw）：此前无选项解析，`wc -l file` 会把
+     * "-l" 当成文件名报 file not found——日用习惯性输入第一课。
+     * 无选项时保持原行为（三列全打印）。 */
+    int want_l = 0, want_w = 0, want_c = 0;
+    while (*args == ' ') args++;
+    while (args[0] == '-' && args[1] != '\0' && args[1] != ' ') {
+        for (const char *o = args + 1; *o && *o != ' '; o++) {
+            if (*o == 'l') want_l = 1;
+            else if (*o == 'w') want_w = 1;
+            else if (*o == 'c') want_c = 1;
+        }
+        while (*args && *args != ' ') args++;
+        while (*args == ' ') args++;
+    }
     parse_token(args, filename, 128);
     if (filename[0] == '\0') {
         if (pipe_len > 0) {
@@ -1846,8 +1867,7 @@ static void cmd_wc(const char *args) {
         terminal_writestring("Usage: wc <file>\n");
         return;
     }
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("File not found or read error.\n", CLR_ERROR);
         return;
@@ -1855,18 +1875,16 @@ static void cmd_wc(const char *args) {
     int lines = 0, words = 0, chars = 0;
     int in_word = 0;
     for (int i = 0; i < bytes; i++) {
-        char c = (char)file_buffer[i];
+        char c = (char)g_file_buf[i];
         chars++;
         if (c == '\n') { lines++; in_word = 0; }
         else if (c == ' ' || c == '\t' || c == '\r') { in_word = 0; }
         else if (!in_word) { words++; in_word = 1; }
     }
-    print_dec(lines);
-    terminal_putchar(' ');
-    print_dec(words);
-    terminal_putchar(' ');
-    print_dec(chars);
-    terminal_putchar(' ');
+    int any = want_l || want_w || want_c;
+    if (!any || want_l) { print_dec(lines); terminal_putchar(' '); }
+    if (!any || want_w) { print_dec(words); terminal_putchar(' '); }
+    if (!any || want_c) { print_dec(chars); terminal_putchar(' '); }
     terminal_writestring(filename);
     terminal_putchar('\n');
 }
@@ -1881,16 +1899,15 @@ static void cmd_head(const char *args) {
         return;
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int shown = 0, line_start = 0, line_end = 0;
     while (line_end < bytes && shown < n) {
-        while (line_end < bytes && file_buffer[line_end] != '\n') line_end++;
-        for (int j = line_start; j < line_end; j++) terminal_putchar((char)file_buffer[j]);
+        while (line_end < bytes && g_file_buf[line_end] != '\n') line_end++;
+        for (int j = line_start; j < line_end; j++) terminal_putchar((char)g_file_buf[j]);
         terminal_putchar('\n');
         shown++;
         line_end++;
@@ -1908,20 +1925,19 @@ static void cmd_tail(const char *args) {
         return;
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int total_lines = 0;
-    for (int i = 0; i < bytes; i++) if (file_buffer[i] == '\n') total_lines++;
+    for (int i = 0; i < bytes; i++) if (g_file_buf[i] == '\n') total_lines++;
     int start_line = total_lines > n ? total_lines - n : 0;
     int cur_line = 0, line_start = 0;
     for (int pos = 0; pos <= bytes; pos++) {
-        if (pos == bytes || file_buffer[pos] == '\n') {
+        if (pos == bytes || g_file_buf[pos] == '\n') {
             if (cur_line >= start_line) {
-                for (int j = line_start; j < pos; j++) terminal_putchar((char)file_buffer[j]);
+                for (int j = line_start; j < pos; j++) terminal_putchar((char)g_file_buf[j]);
                 terminal_putchar('\n');
             }
             cur_line++;
@@ -1952,13 +1968,12 @@ static void cmd_cp(const char *args) {
         terminal_writestring("Usage: cp <src> <dst>\n");
         return;
     }
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("Source file not found.\n", CLR_ERROR);
         return;
     }
-    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, g_file_buf, (uint32_t)bytes) != 0) {
         terminal_writestring("Copy failed.\n");
     } else {
         terminal_writestring("Copied.\n");
@@ -1973,13 +1988,12 @@ static void cmd_mv(const char *args) {
         puts_c("Usage: mv <src> <dst>\n", CLR_ERROR);
         return;
     }
-    static uint8_t file_buffer[4096];
-    int bytes = fs_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, g_file_buf, FILE_BUF_SIZE);
     if (bytes < 0) {
         puts_c("Source file not found.\n", CLR_ERROR);
         return;
     }
-    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, g_file_buf, (uint32_t)bytes) != 0) {
         puts_c("Move failed.\n", CLR_ERROR);
         return;
     }
@@ -2090,8 +2104,8 @@ static void cmd_theme(const char *args) {
 }
 
 
-#define VI_MAX_LINES 100
-#define VI_MAX_LINE 96
+#define VI_MAX_LINES 512
+#define VI_MAX_LINE 128
 #define VI_SCREEN_ROWS 24
 #define VI_SCREEN_COLS 80
 
@@ -2592,6 +2606,27 @@ static void vi_insert_newline(void) {
     vi_modified = 1;
 }
 
+// 在当前行下方插入一个空行并把光标移过去（vi 的 o / O 命令）。
+// 历史缺陷：vi 一直没有 o/O 绑定——按 o 无任何反应，而后续误触的
+// 'a'/'i' 会把字符插进当前行，表现为"o 开新行失败、内容串行"。
+// 日用的编辑器不能开新行是不可接受的，这里补齐。语义与真 vi 一致：
+// o = 下方开行进插入；O = 上方开行进插入。
+static void vi_open_line(int below) {
+    if (vi_count >= VI_MAX_LINES) return;
+    int at = below ? vi_row + 1 : vi_row;
+    for (int r = vi_count; r > at; r--) {
+        vi_len[r] = vi_len[r - 1];
+        for (int m = 0; m < VI_MAX_LINE; m++) vi_lines[r][m] = vi_lines[r - 1][m];
+    }
+    vi_count++;
+    vi_lines[at][0] = '\0';
+    vi_len[at] = 0;
+    vi_row = at;
+    vi_col = 0;
+    vi_modified = 1;
+    vi_mode = 1;
+}
+
 // 删除当前行
 static void vi_delete_line(void) {
     if (vi_count == 0) return;
@@ -2614,12 +2649,12 @@ static void vi_delete_line(void) {
 
 // 保存到文件
 static void vi_save(void) {
-    static uint8_t out_buf[4096];
+    static uint8_t out_buf[FILE_BUF_SIZE];
     int o = 0;
-    for (int k = 0; k < vi_count && o < 4095; k++) {
+    for (int k = 0; k < vi_count && o < (int)sizeof(out_buf) - 1; k++) {
         int L = vi_len[k];
-        for (int m = 0; m < L && o < 4095; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
-        if (o < 4095) out_buf[o++] = '\n';
+        for (int m = 0; m < L && o < (int)sizeof(out_buf) - 1; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
+        if (o < (int)sizeof(out_buf) - 1) out_buf[o++] = '\n';
     }
     if (fs_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
         vi_msg = "saved";
@@ -2767,20 +2802,19 @@ static void cmd_vi(const char *args) {
     }
     for (int i = 0; i < 128; i++) { vi_filename[i] = filename[i]; if (filename[i] == '\0') break; }
 
-    static uint8_t file_buffer[4096];
     vi_count = 0;
-    int bytes = fs_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
     if (bytes > 0) {
         int i = 0;
         while (i < bytes && vi_count < VI_MAX_LINES) {
             int j = 0;
-            while (i < bytes && file_buffer[i] != '\n' && j < VI_MAX_LINE - 1) {
-                vi_lines[vi_count][j++] = (char)file_buffer[i++];
+            while (i < bytes && g_file_buf[i] != '\n' && j < VI_MAX_LINE - 1) {
+                vi_lines[vi_count][j++] = (char)g_file_buf[i++];
             }
             vi_lines[vi_count][j] = '\0';
             vi_len[vi_count] = j;
             vi_count++;
-            if (i < bytes && file_buffer[i] == '\n') i++;
+            if (i < bytes && g_file_buf[i] == '\n') i++;
         }
     }
     if (vi_count == 0) {
@@ -2866,6 +2900,10 @@ static void cmd_vi(const char *args) {
                 if (c2 == 'g') vi_row = 0;
             } else if (c == 'G') {
                 if (vi_count > 0) vi_row = vi_count - 1;
+            } else if (c == 'o') {
+                vi_open_line(1);
+            } else if (c == 'O') {
+                vi_open_line(0);
             } else if (c == ':') {
                 char cmd[16];
                 if (vi_read_command(cmd, 16)) {
