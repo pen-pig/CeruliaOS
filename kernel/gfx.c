@@ -1,6 +1,7 @@
 #include "gfx.h"
 #include "cjk.h"
 #include "port.h"
+#include "dmesg.h"
 #include "types.h"
 #include "tty.h"
 #include "keyboard.h"
@@ -157,26 +158,45 @@ void gfx_init(void) {
         && lfb >= 0x00100000u && lfb < 0xFFF00000u
         && vxr >= 320 && vyr >= 200 && (vbpp == 16 || vbpp == 32)) {
         uint32_t gstride = *(volatile uint32_t*)0x500C;
-        gfx_fmt = (*(volatile uint8_t*)0x5009 == 0) ? 0 : 1;
-        GFX_W = vxr;
-        GFX_H = vyr;
-        gfx_fb = (uint8_t*)(uint32_t)lfb;
-        gfx_bpp = (vbpp == 32) ? 4 : 2;
-        gfx_stride = (gstride >= (uint32_t)vxr) ? (int)gstride : (int)vxr;
+        int dispi_ok = 0;
         outw(0x1CE, 0x00);
         {
             uint16_t _vbepid = inw(0x1CF);
             if ((_vbepid & 0xFFF0u) == 0xB0C0u) {
-                /* bochs-vbe: reprogram same res/bpp (hardware stride becomes
-                 * XRES; GOP PixelsPerScanLine no longer applies) */
+                /* bochs-vbe: reprogram same res/bpp, then READ BACK and
+                 * compare. QEMU's cirrus also answers the DISPI ID but
+                 * silently ignores the mode set - without this check the
+                 * kernel would paint a 1280x1024 desktop into an LFB the
+                 * display never scans at that geometry (vertical-stripe
+                 * garbage + every mouse hit-test off, 2026-10-18 measured). */
                 outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
                 outw(0x1CE, 0x01); outw(0x1CF, vxr);   /* XRES */
                 outw(0x1CE, 0x02); outw(0x1CF, vyr);   /* YRES */
                 outw(0x1CE, 0x03); outw(0x1CF, vbpp);  /* BPP = 16 or 32 */
                 outw(0x1CE, 0x04); outw(0x1CF, 0x01);  /* VBE_DISPI_ENABLE = 1 */
-                gfx_stride = vxr;
+                {
+                    uint16_t rx = 0, ry = 0, rb = 0, re = 0;
+                    outw(0x1CE, 0x01); rx = inw(0x1CF);
+                    outw(0x1CE, 0x02); ry = inw(0x1CF);
+                    outw(0x1CE, 0x03); rb = inw(0x1CF);
+                    outw(0x1CE, 0x04); re = inw(0x1CF);
+                    if (rx == vxr && ry == vyr && rb == vbpp && (re & 1u))
+                        dispi_ok = 1;
+                    else
+                        dmesg_write("VBE: DISPI set failed readback, keeping GOP mode\n");
+                }
             }
         }
+        gfx_fmt = (*(volatile uint8_t*)0x5009 == 0) ? 0 : 1;
+        GFX_W = vxr;
+        GFX_H = vyr;
+        gfx_fb = (uint8_t*)(uint32_t)lfb;
+        gfx_bpp = (vbpp == 32) ? 4 : 2;
+        /* bochs-vbe reprogrammed: hardware stride becomes XRES and the GOP
+         * PixelsPerScanLine no longer applies. Real firmware: keep the
+         * loader-reported PixelsPerScanLine (may exceed width). */
+        gfx_stride = dispi_ok ? (int)vxr
+                              : ((gstride >= (uint32_t)vxr) ? (int)gstride : (int)vxr);
         gfx_set_palette();                     /* build gfx_palette32 / gfx_palette16 */
         gfx_load_font();
         return;
@@ -185,9 +205,10 @@ void gfx_init(void) {
     /* Probe VBE_DISPI ID (bochs-vbe only). If absent (e.g. real HW without
      * Bochs VBE), force VGA 0x13 fallback - writing to the LFB would be
      * invisible. */
+    uint16_t _vbepid;
     outw(0x1CE, 0x00);                  /* VBE_DISPI_INDEX_ID */
     {
-        uint16_t _vbepid = inw(0x1CF);
+        _vbepid = inw(0x1CF);
         if ((_vbepid & 0xFFF0u) == 0xB0C0u
             && lfb >= 0x00100000u && lfb < 0xFFF00000u
             && vxr >= 320 && vyr >= 200 && vbpp == 16) {
@@ -208,53 +229,85 @@ void gfx_init(void) {
             outw(0x1CE, 0x02); outw(0x1CF, vyr);   /* YRES */
             outw(0x1CE, 0x03); outw(0x1CF, 16);    /* BPP = 16 (RGB565) */
             outw(0x1CE, 0x04); outw(0x1CF, 0x01);  /* VBE_DISPI_ENABLE = 1 */
-            gfx_set_palette();                     /* build RGB565 lookup table */
-            gfx_load_font();
-            return;
+            /* 读回验证（fail closed）：写进去的不算数，读回来比对过才算。
+             * QEMU cirrus 应答 DISPI ID 但模式切换静默失败——不验的话内核
+             * 按 1280x1024 往 LFB 画，显示停在别的几何，竖条花屏 + 鼠标
+             * 命中全错位（2026-10-18 实测）。验不过就不认这块 LFB，落到
+             * 下面的 VGA 0x13 回退，绝不画没人看的内容。 */
+            {
+                uint16_t rx = 0, ry = 0, rb = 0, re = 0;
+                outw(0x1CE, 0x01); rx = inw(0x1CF);
+                outw(0x1CE, 0x02); ry = inw(0x1CF);
+                outw(0x1CE, 0x03); rb = inw(0x1CF);
+                outw(0x1CE, 0x04); re = inw(0x1CF);
+                if (rx == vxr && ry == vyr && rb == 16 && (re & 1u)) {
+                    gfx_set_palette();             /* build RGB565 lookup table */
+                    gfx_load_font();
+                    return;
+                }
+                dmesg_write("VBE: DISPI set failed readback, using VGA 0x13 fallback\n");
+            }
+        } else if (lfb >= 0x00100000u && lfb < 0xFFF00000u
+                   && vxr >= 320 && vyr >= 200 && vbpp == 16) {
+            /* 探测到了可用的 VBE LFB，但没有 Bochs DISPI（真机/VMware 的
+             * VESA BIOS 就是这样）——没有 I/O 端口能在保护模式下切 VESA
+             * 模式，只能回退。这条日志是真机 bring-up 的关键信号。 */
+            dmesg_write("VBE: LFB probed but no VBE_DISPI (real HW?), VGA 0x13 fallback\n");
         }
     }
-    /* Fallback: VGA mode 0x13 320x200x256 */
+    /* Fallback: VGA mode 0x13 320x200x256（标准寄存器组）。
+     * 只有真机/VMware 这类没有 Bochs VBE_DISPI 的环境会走到这里——
+     * 寄存器值全部按 OSDev "Sample Register Settings" 的 mode 13h 标准表，
+     * 一个都不能错：
+     *   SR4 必须 0x06（odd/even 关）——0x0E 会把打包像素拆进 4 个平面 → 花屏
+     *   AC 恒等调色板 0x00-0x0F + AR12=0x0F 必须写——AR12=0 关掉所有颜色平面 → 黑屏
+     *   CR11 末位必须 0x0E 且 bit7=0——结尾写 0xAC 会把 CRTC 锁死，时序不生效
+     *   CR06/07/10/12/15/16/17 一整套垂直时序错 → 画面撕裂/闪烁/错位
+     * 另外：若 Bochs DISPI 仍 enabled（boot.asm 激活过 1280x1024），必须先
+     * DISPI disable 再写标准寄存器——cirrus/bochs 显示引擎在 DISPI enabled
+     * 时按 DISPI 几何扫描，标准 VGA 模式寄存器写了也不显示（2026-10-18
+     * QEMU 实测：SR/CRTC/GR/AR 全部回读正确，屏幕停在文本画面不动，
+     * 内核却按 320x200 往 0xA0000 画 → 桌面全不可见 + 鼠标命中全错位）。
+     * 真机无 DISPI（ID 不是 0xB0C0）时这段跳过，不碰未定义端口。 */
+    if ((_vbepid & 0xFFF0u) == 0xB0C0u) {
+        outw(0x1CE, 0x04); outw(0x1CF, 0x00);   /* VBE_DISPI_ENABLE = 0 */
+    }
+    dmesg_write("GFX: no VBE, VGA mode 0x13 320x200x256 fallback\n");
     GFX_W = 320;
     GFX_H = 200;
     gfx_fb = (uint8_t*)0xA0000;
     gfx_bpp = 1;
     gfx_stride = 320;
+
+    /* 1) Miscellaneous Output: color mode, 25.175MHz, 400-line */
     outb(0x3C2, 0x63);
 
-    // Sequencer
-    outb(0x3C4, 0x00); outb(0x3C5, 0x01);
-    outb(0x3C4, 0x01); outb(0x3C5, 0x00);
-    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);
-    outb(0x3C4, 0x03); outb(0x3C5, 0x00);
-    outb(0x3C4, 0x04); outb(0x3C5, 0x0E);
+    /* 2) Sequencer: 先进 sync reset，写完放行 */
+    outb(0x3C4, 0x00); outb(0x3C5, 0x01);   /* SR0: sync reset */
+    outb(0x3C4, 0x01); outb(0x3C5, 0x01);   /* SR1: 8-dot chars */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);   /* SR2: all planes */
+    outb(0x3C4, 0x03); outb(0x3C5, 0x00);   /* SR3: char map A */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);   /* SR4: odd/even OFF + extended mem */
+    outb(0x3C4, 0x00); outb(0x3C5, 0x03);   /* SR0: resume */
     io_wait();
 
-    // CRTC
-    outb(0x3D4, 0x11); outb(0x3D5, 0x0C);
-    outb(0x3D4, 0x00); outb(0x3D5, 0x5F);
-    outb(0x3D4, 0x01); outb(0x3D5, 0x4F);
-    outb(0x3D4, 0x02); outb(0x3D5, 0x50);
-    outb(0x3D4, 0x03); outb(0x3D5, 0x82);
-    outb(0x3D4, 0x04); outb(0x3D5, 0x54);
-    outb(0x3D4, 0x05); outb(0x3D5, 0x80);
-    outb(0x3D4, 0x06); outb(0x3D5, 0x0B);
-    outb(0x3D4, 0x07); outb(0x3D5, 0x3E);
-    outb(0x3D4, 0x08); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x09); outb(0x3D5, 0x40);
-    outb(0x3D4, 0x0A); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x0B); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x0E); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x0F); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x10); outb(0x3D5, 0xEA);
-    outb(0x3D4, 0x12); outb(0x3D5, 0xDF);
-    outb(0x3D4, 0x13); outb(0x3D5, 0x28);
-    outb(0x3D4, 0x14); outb(0x3D5, 0x00);
-    outb(0x3D4, 0x15); outb(0x3D5, 0xE7);
-    outb(0x3D4, 0x16); outb(0x3D5, 0x04);
-    outb(0x3D4, 0x17); outb(0x3D5, 0xE3);
-    outb(0x3D4, 0x11); outb(0x3D5, 0xAC);
+    /* 3) CRTC: 先解保护（CR11 bit7=0），写完保持解锁 */
+    outb(0x3D4, 0x11); outb(0x3D5, 0x00);
+    {
+        static const uint8_t crtc13[25] = {
+            0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, /* CR00-CR05 */
+            0xBF, 0x1F, 0x00, 0x41, 0x00, 0x00, /* CR06-CR0B */
+            0x00, 0x00, 0x00, 0x00,             /* CR0C-CR0F */
+            0x9C, 0x0E, 0x8F, 0x28,             /* CR10-CR13 */
+            0x00, 0x96, 0xB9, 0xA3              /* CR14-CR17 */
+        };
+        for (int i = 0; i < 25; i++) {
+            outb(0x3D4, (uint8_t)i);
+            outb(0x3D5, crtc13[i]);
+        }
+        /* CR11 单独收尾：0x0E = 垂直回扫结束，bit7=0 保持 CRTC 解锁 */
+        outb(0x3D4, 0x11); outb(0x3D5, 0x0E);
+    }
     io_wait();
 
     // Graphics Controller
@@ -268,38 +321,22 @@ void gfx_init(void) {
     outb(0x3CE, 0x07); outb(0x3CF, 0x0F);
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
-    // Attribute Controller
-    inb(0x3DA);
-    outb(0x3C0, 0x30); outb(0x3C0, 0x41);
-    outb(0x3C0, 0x31); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x32); outb(0x3C0, 0x0F);
-    outb(0x3C0, 0x33); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x34); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x35); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x36); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x37); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x38); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x39); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3A); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3B); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3C); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3D); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3E); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x3F); outb(0x3C0, 0x00);
-    outb(0x3C0, 0x20);
-    outb(0x3C4, 0x00); outb(0x3C5, 0x03);  // resume sequencer (clear sync reset)
-    /* 把 VGA 调色板重置为文本模式默认的 16 色，免得图形模式的调色板污染文本显示 */
-    outb(0x3C8, 0x00);
-    for (int _i = 0; _i < 16; _i++) {
-        static const uint8_t _pr[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
-        static const uint8_t _pg[16] = {0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255};
-        static const uint8_t _pb[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
-        outb(0x3C9, _pr[_i]); outb(0x3C9, _pg[_i]); outb(0x3C9, _pb[_i]);
+    /* 5) Attribute Controller: 先读 0x3DA 复位 flip-flop，再写 0x00-0x14，最后 0x20 使能 */
+    (void)inb(0x3DA);
+    for (int i = 0; i < 16; i++) {
+        outb(0x3C0, (uint8_t)i);
+        outb(0x3C0, (uint8_t)i);               /* identity palette */
     }
-    /* 光标形状恢复成文本模式 */
-    outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);
-    outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
+    outb(0x3C0, 0x10); outb(0x3C0, 0x41);      /* mode control: 8-bit color */
+    outb(0x3C0, 0x11); outb(0x3C0, 0x00);      /* overscan */
+    outb(0x3C0, 0x12); outb(0x3C0, 0x0F);      /* color plane enable */
+    outb(0x3C0, 0x13); outb(0x3C0, 0x00);      /* horizontal pixel pan */
+    outb(0x3C0, 0x14); outb(0x3C0, 0x00);      /* color select */
+    outb(0x3C0, 0x20);                          /* enable video output */
 
+    /* 6) DAC 调色板 + 字体（与 VBE 路径一致，GUI 才能拿到 Win10 配色） */
+    gfx_set_palette();
+    gfx_load_font();
 }
 
 
