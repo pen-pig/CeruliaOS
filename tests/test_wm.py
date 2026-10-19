@@ -13,7 +13,15 @@ fallback；而 QEMU cirrus 在 DISPI 仍 enabled 时忽略标准 VGA 模式切�
      回退（320x200）或文本模式（640x480）都直接红
   2. 无输入连拍两帧，帧间差异 < 1%——闪屏红
   3. 标题栏拖动 120px，窗口 bbox 必须真的移动——拖不动红
+     （含竖向快拖：8px 步进超过标题栏高度时续命判据必须容错，否则
+      竖向拖动必死——2026-10-18 真 bug，用户"有时拖得动有时拖不动"）
   4. 任务栏暗色 + 标题栏 accent 蓝——主题错红
+  5. 左边缘钳制：把窗口一路拖出左屏，必须钳到 x=0 并 1:1 跟随回拖——
+     2026-10-18 二次 bug：桌面图标拦截在拖动中吞事件，窗口死在图标列
+     右缘 x=124（光标在图标列里→事件被图标吞→窗口收不到位移→永远
+     盖不住图标→永远被吞），且释按落在容差外会残留拖动态
+  6. 任务栏上释按不残留拖动态：换偏移重新按下微拖，窗口必须精确跟随
+     （陈旧 move_dx 复用会跳 +45px）
 
 用法：
     python tests/test_wm.py            # BIOS 路径
@@ -123,6 +131,15 @@ class Qmp(object):
             time.sleep(0.05)
         time.sleep(0.15)
 
+    def drag_move(self, dx, dy, steps=1, pause=0.04):
+        """按住状态下的相对位移。与裸 hmc("mouse_move") 的区别是同步
+        坐标簿——否则后续 move_to 会按失步的簿子发相对位移，点错地方"""
+        for _ in range(steps):
+            self.hmc("mouse_move %d %d" % (dx, dy))
+            self.cx += dx
+            self.cy += dy
+            time.sleep(pause)
+
     def shot(self, path):
         rm(path)
         self.hmc("screendump " + path)
@@ -171,6 +188,14 @@ def win_bbox(buf, w, h):
         else:
             break
     return (x0, y0, x1, y1)
+
+
+def title_grab(bb, win_h, dx=3):
+    """标题栏抓取点（x=窗口左缘+dx, y=标题栏中心）。
+    bbox 是内容区：内容顶 = 底边-窗高，窗框外顶 = 内容顶-13，
+    标题栏中心 = 内容顶-7。用底边反推是因为顶边锚点会被终端内容里的
+    文字打断（2026-10-18 实测 y0 假性 +54），底边永远干净"""
+    return (bb[0] + dx, bb[3] - win_h - 7)
 
 
 def frame_diff(a, b, w, h, step=3):
@@ -245,7 +270,7 @@ def main():
             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     qmp = None
     S = [os.path.join(ROOT, "temp", "wm_s%d.ppm" % i).replace("\\", "/")
-         for i in range(6)]
+         for i in range(14)]
     try:
         # ---- boot ----
         end = time.time() + BOOT_WAIT
@@ -303,14 +328,13 @@ def main():
             "| diff %d/%d = %.2f%%" % (d, n, d * 100.0 / n))
 
         # ---- drag: title bar, +120px right ----
-        # bbox 是内容区；窗框外顶 = y0-13，标题栏中心 = y0-7（GW_TITLE_H=12）
-        tx, ty = (x0 + x1) // 2, y0 - 7
+        # 标题栏中心 = 内容顶-7（GW_TITLE_H=12）；抓取点用底边反推保稳
+        win_h = y1 - y0
+        tx, ty = title_grab(bb1, win_h, dx=(x1 - x0) // 2)
         qmp.move_to(tx, ty)
         qmp.hmc("mouse_button 1")
         time.sleep(0.3)
-        for i in range(10):
-            qmp.hmc("mouse_move 12 0")
-            time.sleep(0.06)
+        qmp.drag_move(12, 0, steps=10, pause=0.06)
         time.sleep(0.5)
         qmp.hmc("screendump " + S[4])
         time.sleep(0.4)
@@ -333,6 +357,37 @@ def main():
         rec(results, "window moved right ~120px", 80 <= dx <= 160,
             "| dx=%d (expect ~120)" % dx)
 
+        # ---- vertical drag with fast steps (regression) ----
+        # 真 bug（2026-10-18）：拖动续命判据 my < hit->y+GW_TITLE_H 没有容差，
+        # 而优先命中判据有 ±8——鼠标单帧步进超过标题栏高度（竖向快拖 8px）
+        # 时光标落到标题栏下方，事件掉进内容区分支，拖动当场中断且再也回不来。
+        # 用户侧现象"有时拖得动有时拖不动"，竖向快拖必现；横向不受影响
+        # （分支判据从不限制 x）。修法：moving 时续命判据含容差。
+        # dy 用底边差量算：y1 不受终端文字污染，y0 会（实测假性 +54）
+        qmp.move_to(w - 180, h - 200)
+        qmp.shot(S[6])
+        _, _, d6 = ppm_load(S[6])
+        bb_v0 = win_bbox(d6, w, h)
+        if bb_v0 is None:
+            rec(results, "clean bbox before vertical drag", False, "| bbox=None")
+            return 1
+        gx, gy = title_grab(bb_v0, win_h, dx=(bb_v0[2] - bb_v0[0]) // 2)
+        qmp.move_to(gx, gy)
+        qmp.hmc("mouse_button 1")
+        time.sleep(0.3)
+        qmp.drag_move(0, 8, steps=15)        # 竖向快拖 120px（8px 步进）
+        time.sleep(0.3)
+        qmp.hmc("mouse_button 0")
+        time.sleep(1.0)
+        qmp.move_to(w - 180, h - 200)
+        qmp.shot(S[7])
+        _, _, d7 = ppm_load(S[7])
+        bb_v1 = win_bbox(d7, w, h)
+        vdy = (bb_v1[3] - bb_v0[3]) if bb_v1 else -999
+        rec(results, "vertical drag follows fast steps",
+            bb_v1 is not None and 80 <= vdy <= 160,
+            "| dy=%d (expect ~120; stall bug = 0)" % vdy)
+
         # ---- theme: taskbar dark + titlebar accent blue ----
         tb = zone_avg(d1, w, 0, h - 26, w, h - 2)
         dark_ok = max(tb) < TB_MAX_CHANNEL
@@ -342,6 +397,99 @@ def main():
         blue = accent_blue_count(d1, w, h, x1 - 80, y0 - 13, x1 - 20, y0 - 1)
         rec(results, "titlebar accent blue", blue > TITLE_BLUE_MIN,
             "| %d px (expect > %d)" % (blue, TITLE_BLUE_MIN))
+
+        # ---- clamp: drag left past the icon column (deadlock regression) ----
+        # 真 bug（2026-10-18）：桌面图标双击拦截在拖动中吞事件。Win10 主题
+        # 无 dock，图标列在 x=16..122；光标进图标列→事件被图标吞→窗口收不到
+        # 位移→永远盖不住图标→永远被吞。实测窗口死在 x=124（图标列右缘），
+        # 应一路钳到 gw_desktop_left()=0。修法：拖动中桌面层拦截全让位。
+        # 先把光标移到窗口外再量 bbox：光标精灵压在窗顶会污染顶边锚点
+        qmp.move_to(w - 180, h - 200)
+        qmp.shot(S[8])
+        _, _, d6 = ppm_load(S[8])
+        bb_clean = win_bbox(d6, w, h)
+        if bb_clean is None:
+            rec(results, "clean bbox before clamp drag", False, "| bbox=None")
+            return 1
+        cx, cy = title_grab(bb_clean, win_h)
+        qmp.move_to(cx, cy)
+        qmp.hmc("mouse_button 1")
+        time.sleep(0.3)
+        qmp.drag_move(-8, 0, steps=40)      # 一路向左出屏（QEMU 把指针钳在 0）
+        time.sleep(0.5)
+        qmp.hmc("screendump " + S[9])
+        time.sleep(0.4)
+        _, _, d7 = ppm_load(S[9])
+        bb4 = win_bbox(d7, w, h)
+        rec(results, "drag clamps at desktop left edge",
+            bb4 is not None and bb4[0] <= 2,
+            "| bbox=%r (expect x0<=2; deadlock bug stuck at x=124)" % (bb4,))
+        # 同一笔拖动继续向右。回拖一半时光标还在图标列里（x≈80）：
+        # 修复后窗口必须已跟上光标；死锁态窗口仍冻在 124 → 红
+        qmp.drag_move(8, 0, steps=10)
+        time.sleep(0.4)
+        qmp.hmc("screendump " + S[10])
+        time.sleep(0.4)
+        _, _, d8 = ppm_load(S[10])
+        bbM = win_bbox(d8, w, h)
+        rec(results, "window tracks mouse over icon column",
+            bbM is not None and bbM[0] <= 90,
+            "| bbox=%r (expect x0<=90 mid-return)" % (bbM,))
+        qmp.drag_move(8, 0, steps=10)       # 回拖满 160px
+        time.sleep(0.3)
+        qmp.hmc("mouse_button 0")
+        time.sleep(1.0)
+        qmp.shot(S[11])
+        _, _, d9 = ppm_load(S[11])
+        bb5 = win_bbox(d9, w, h)
+        # 钳制期间 move_dx 已按新位置重校准，回拖应 1:1：0 -> 160
+        rec(results, "window follows mouse 1:1 after clamp",
+            bb5 is not None and 120 <= bb5[0] <= 200,
+            "| bbox=%r (expect x0 in 120..200)" % (bb5,))
+
+        # ---- stuck-drag regression: 拖到底后在任务栏上释按 ----
+        # 真 bug：释按落在 gw_handle_desktop_mouse 的拦截区（任务栏/开始菜单/
+        # GNOME Dock）时 gw_handle_mouse 根本不会被调用，旧代码只在标题栏分支
+        # 里清 moving → 拖动态残留：主循环每帧按 dragging 合并重绘 + 下次按下
+        # 复用陈旧 move_dx → 窗口跳位。修法：释按即终 drag（gw_end_drags）。
+        gx, gy = title_grab(bb5, win_h)
+        qmp.move_to(gx, gy)
+        qmp.hmc("mouse_button 1")
+        time.sleep(0.3)
+        qmp.drag_move(12, 0, steps=5)             # 先右拖 60px
+        qmp.move_to(qmp.cx, h - 10)               # 光标下移压到任务栏（窗口钳底边）
+        time.sleep(0.3)
+        qmp.hmc("mouse_button 0")                 # 在任务栏上释按
+        time.sleep(1.0)
+        qmp.shot(S[12])
+        _, _, d10 = ppm_load(S[12])
+        bb6 = win_bbox(d10, w, h)
+        rec(results, "window survives taskbar release", bb6 is not None,
+            "| bbox=%r" % (bb6,))
+        if bb6 is None:
+            return 1
+        # 换一个抓取偏移（x+40）重新按下并微拖 8px：修复后窗口精确跟随（+8）；
+        # 拖动态残留则复用陈旧 move_dx（=3）→ 窗口跳到 +45 → 红
+        gx, gy = title_grab(bb6, win_h, dx=40)
+        qmp.move_to(gx, gy)
+        qmp.hmc("mouse_button 1")
+        time.sleep(0.3)
+        qmp.drag_move(8, 0, steps=1)
+        time.sleep(0.4)
+        qmp.hmc("screendump " + S[13])
+        time.sleep(0.4)
+        _, _, d11 = ppm_load(S[13])
+        bb7 = win_bbox(d11, w, h)
+        rec(results, "no phantom-drag jump after taskbar release",
+            bb7 is not None and 4 <= bb7[0] - bb6[0] <= 16,
+            "| dx=%d (expect ~8; stale move_dx bug jumps +45)"
+            % (bb7[0] - bb6[0] if bb7 else -999))
+        qmp.hmc("mouse_button 0")
+        time.sleep(0.5)
+        # 坐标簿重同步：前面出屏/任务栏段 QEMU 钳过指针，簿子已失真；
+        # 大幅右推把实际指针顶到右缘，按钳制后的确定值重记账
+        qmp.drag_move(200, 0, steps=6, pause=0.02)
+        qmp.cx, qmp.cy = w - 1, qmp.cy
 
         failed = [n for n, ok in results if not ok]
         print("\n%d/%d passed" % (len(results) - len(failed), len(results)))

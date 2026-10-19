@@ -2791,70 +2791,97 @@ int gw_handle_desktop_mouse(int mx, int my, int buttons)
 /* ==================================================================
  * 窗口层鼠标 / 键盘
  * ================================================================== */
+/* 是否有窗口正处于标题栏拖动态（按住标题栏移动中） */
+static int gw_any_moving(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].moving) return 1;
+    return 0;
+}
+
+/* 释按即终 drag：无论光标落在哪（命中容差外/任务栏/图标/开始菜单上）
+ * 都必须清除 moving。漏清的后果是拖动态残留：主循环每帧按 dragging
+ * 合并重绘窗口区（闪），且下次按下复用陈旧 move_dx → 窗口跳位 */
+static void gw_end_drags(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].moving) {
+            gw_windows[i].moving = 0;
+            gw_dirty = 1;
+        }
+}
+
 void gw_handle_mouse(int mx, int my, int buttons)
 {
     static int last_btn = 0;
     int pressed = (buttons & 1) && !(last_btn & 1);
     int released = !(buttons & 1) && (last_btn & 1);
 
-    /* 开始菜单打开时：菜单区域点击优先交给菜单处理（应用项 / 返回终端 / 设置 / 电源） */
-    if (gw_start_menu_active && !gw_in_taskbar(my)) {
-        if (gw_start_menu_mouse(mx, my, buttons)) { last_btn = buttons; return; }
-        if (pressed) gw_start_menu_active = 0;   /* 点击菜单外桌面（按下沿）：关闭菜单 */
-    }
+    /* 拖动中：桌面层拦截（开始菜单/任务栏/图标双击）一律让位给拖动态。
+     * 否则窗口拖到图标列即死锁：光标在图标上→事件被图标吞→窗口收不到
+     * 位移→永远盖不住图标→永远被吞。实测窗口停在图标列右缘（x=124，
+     * 841px 宽的窗口盖不住 106px 宽的图标列），回拖时光标掠过图标列
+     * 的部分也全部丢事件 */
+    if (!gw_any_moving()) {
+        /* 开始菜单打开时：菜单区域点击优先交给菜单处理（应用项 / 返回终端 / 设置 / 电源） */
+        if (gw_start_menu_active && !gw_in_taskbar(my)) {
+            if (gw_start_menu_mouse(mx, my, buttons)) { last_btn = buttons; return; }
+            if (pressed) gw_start_menu_active = 0;   /* 点击菜单外桌面（按下沿）：关闭菜单 */
+        }
 
-    /* 任务栏区域：开始按钮开关菜单 + 窗口按钮切换（聚焦窗口点击=最小化，
-     * 非聚焦/最小化窗口点击=恢复置顶） */
-    if (gw_in_taskbar(my)) {
-        if (pressed) {
-            if (mx >= 4 && mx < gw_tb_btn_x0()) {
-                gw_start_menu_active = !gw_start_menu_active;
-            } else {
-                for (int btn = 0; ; btn++) {
-                    gw_window_t *w; int bx, tw;
-                    if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
-                    if (mx >= bx && mx < bx + tw) {
-                        if (w->focused && !w->hidden) gw_minimize(w);
-                        else { gw_restore(w); gw_bring_front(w); }
-                        break;
+        /* 任务栏区域：开始按钮开关菜单 + 窗口按钮切换（聚焦窗口点击=最小化，
+         * 非聚焦/最小化窗口点击=恢复置顶） */
+        if (gw_in_taskbar(my)) {
+            if (pressed) {
+                if (mx >= 4 && mx < gw_tb_btn_x0()) {
+                    gw_start_menu_active = !gw_start_menu_active;
+                } else {
+                    for (int btn = 0; ; btn++) {
+                        gw_window_t *w; int bx, tw;
+                        if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+                        if (mx >= bx && mx < bx + tw) {
+                            if (w->focused && !w->hidden) gw_minimize(w);
+                            else { gw_restore(w); gw_bring_front(w); }
+                            break;
+                        }
                     }
                 }
+                gw_dirty = 1;
             }
-            gw_dirty = 1;
+            last_btn = buttons;
+            return;
         }
-        last_btn = buttons;
-        return;
-    }
 
-    /* 桌面图标双击启动（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
-    if (!gw_in_taskbar(my)) {
-        int hit_icon = 0;
-        for (int i = 0; i < GW_DESK_ICONS; i++) {
-            int ix, iy, iw, ih;
-            if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
-            if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
-                if (gw_icon_covered(ix, iy, iw, ih)) continue;   /* 被窗口覆盖：跳过图标，交给窗口命中 */
-                hit_icon = 1;
-                if (pressed) {
-                    /* 双击判定：400ms 内两次按下同一图标才启动 */
-                    static uint32_t last_ico_tick = 0;
-                    static int last_ico_idx = -1;
-                    uint32_t now = g_pit_ticks;
-                    if (i == last_ico_idx && now - last_ico_tick < 400) {
-                        last_ico_idx = -1;
-                        if (gw_desktop_icon_app[i] >= 0)
-                            gw_launch_app(gw_desktop_icon_app[i]);
-                        else
-                            gw_launch_game(gw_desktop_icon_game[i]);
-                    } else {
-                        last_ico_idx = i;
-                        last_ico_tick = now;
+        /* 桌面图标双击启动（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
+        if (!gw_in_taskbar(my)) {
+            int hit_icon = 0;
+            for (int i = 0; i < GW_DESK_ICONS; i++) {
+                int ix, iy, iw, ih;
+                if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
+                if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
+                    if (gw_icon_covered(ix, iy, iw, ih)) continue;   /* 被窗口覆盖：跳过图标，交给窗口命中 */
+                    hit_icon = 1;
+                    if (pressed) {
+                        /* 双击判定：400ms 内两次按下同一图标才启动 */
+                        static uint32_t last_ico_tick = 0;
+                        static int last_ico_idx = -1;
+                        uint32_t now = g_pit_ticks;
+                        if (i == last_ico_idx && now - last_ico_tick < 400) {
+                            last_ico_idx = -1;
+                            if (gw_desktop_icon_app[i] >= 0)
+                                gw_launch_app(gw_desktop_icon_app[i]);
+                            else
+                                gw_launch_game(gw_desktop_icon_game[i]);
+                        } else {
+                            last_ico_idx = i;
+                            last_ico_tick = now;
+                        }
                     }
+                    break;
                 }
-                break;
             }
+            if (hit_icon) { last_btn = buttons; return; }
         }
-        if (hit_icon) { last_btn = buttons; return; }
     }
 
     /* 拖动中的窗口优先命中（带容差，解决边界钳制后鼠标滑出标题栏导致拖不动） */
@@ -2901,7 +2928,12 @@ void gw_handle_mouse(int mx, int my, int buttons)
         return;
     }
 
-    if (my < hit->y + GW_TITLE_H) {
+    /* 拖动态续命判据必须含容差（与优先命中判据的 ±8 一致）：鼠标单帧
+     * 步进超过标题栏高度时（快速竖向拖动 / 低帧率 / QEMU 大步注入），
+     * 光标会落到标题栏下方一点——严格判据会让事件掉进内容区分支，
+     * 拖动当场中断且再也回不来（用户侧现象"有时拖得动有时拖不动"，
+     * 竖向快拖必现；横向不受影响，因为分支判据从不限制 x）。 */
+    if (hit->moving || my < hit->y + GW_TITLE_H) {
         /* 标题栏双击：最大化/还原（400ms 内两次按下同一窗口标题栏） */
         static uint32_t last_title_tick = 0;
         static gw_window_t *last_title_wnd = NULL;
@@ -2940,10 +2972,9 @@ void gw_handle_mouse(int mx, int my, int buttons)
                 hit->move_dx = mx - hit->x;
                 hit->move_dy = my - hit->y;
             }
-        } else if (released && hit->moving) {
-            hit->moving = 0;
-            gw_dirty = 1;   /* 释放后全屏重绘一次，完成收尾 */
         }
+        /* 释按终 drag 已在入口统一处理（gw_end_drags）：容差外/任务栏/图标上
+         * 释按同样清得干净，拖动态不残留、下次拖动不会跳位 */
         last_btn = buttons;
         return;
     }
@@ -2958,6 +2989,10 @@ void gw_handle_mouse(int mx, int my, int buttons)
     /* 内容区鼠标移动回调（Paint 拖画：每帧调用，回调内自行读按键状态） */
     if (hit->mousemove)
         hit->mousemove(hit, mx - gw_ox(hit), my - gw_oy(hit));
+    /* 释按即终 drag：无论释按落在内容区/容差外/任务栏/图标上，都要清干净。
+     * gw_handle_desktop_mouse 先返回 1 时本函数不会被调用，故主循环里还有
+     * 一道兜底（见 gw_run 的 btn_released 分支）——两处合一保证 moving 不残留 */
+    if (released) gw_end_drags();
     last_btn = buttons;
 }
 
@@ -3975,6 +4010,11 @@ void gw_demo(void)
         }
         /* 鼠标按下/释放：全屏重绘一次，保证窗口/菜单/图标交互结果立即可见 */
         if (btn_pressed || btn_released) gw_dirty = 1;
+
+        /* 释按即终 drag：光标压在任务栏/开始菜单/GNOME Dock 上时
+         * gw_handle_desktop_mouse 直接返回 1，gw_handle_mouse 根本不会被
+         * 调用——漏清 moving 的后果见 gw_end_drags 注释 */
+        if (btn_released) gw_end_drags();
 
         if (!gw_handle_desktop_mouse(mx, my, bt))
             gw_handle_mouse(mx, my, bt);
