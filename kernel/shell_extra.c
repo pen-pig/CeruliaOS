@@ -2326,6 +2326,12 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "desktop") == 0) {
         return "desktop - enter the graphical desktop (the only way in)\n  usage: desktop";
     }
+    if (x_strcasecmp(cmd, "vbetest") == 0) {
+        return "vbetest [force] - set the boot-probed VBE mode via real-mode INT 10h\n"
+               "  thunk (VMware/real-HW path), read back and verify, then restore text\n"
+               "  usage: vbetest        (probe only)\n"
+               "         vbetest force  (also pin gfx_skip_dispi=1 for the next desktop)";
+    }
     if (x_strcasecmp(cmd, "exit") == 0) {
         return "exit - this shell is the system console and cannot be left\n"
                "  usage: exit        (prints a hint; use 'desktop' or 'shutdown')";

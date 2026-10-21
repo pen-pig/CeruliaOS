@@ -9,6 +9,7 @@
 #include "gfxwin.h"
 #include "shell.h"
 #include "vga_font.h"
+#include "bios_thunk.h"
 
 /* U3 additions for 32bpp UEFI GOP (see gfx.h): scanline stride, direct-color
  * LUT and channel order. Defaults keep the legacy 16bpp/8bpp behavior. */
@@ -22,6 +23,9 @@ int GFX_H = 200;
 uint8_t *gfx_fb = (uint8_t*)0xA0000;
 int gfx_bpp = 1;                      /* 1=VGA 0x13, 2=VBE 16bpp */
 uint16_t gfx_palette16[256];          /* 调色板索引 -> RGB565（VBE 16bpp 用） */
+
+/* 见 gfx.h：置 1 强制走 bios_thunk 实模式回切（VMware/真机路径的 QEMU 测试入口） */
+int gfx_skip_dispi = 0;
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
@@ -209,7 +213,8 @@ void gfx_init(void) {
     outw(0x1CE, 0x00);                  /* VBE_DISPI_INDEX_ID */
     {
         _vbepid = inw(0x1CF);
-        if ((_vbepid & 0xFFF0u) == 0xB0C0u
+        if (!gfx_skip_dispi
+            && (_vbepid & 0xFFF0u) == 0xB0C0u
             && lfb >= 0x00100000u && lfb < 0xFFF00000u
             && vxr >= 320 && vyr >= 200 && vbpp == 16) {
             /* VBE LFB: use boot-probed resolution, 16bpp RGB565 (gfx_bpp=2).
@@ -249,10 +254,43 @@ void gfx_init(void) {
             }
         } else if (lfb >= 0x00100000u && lfb < 0xFFF00000u
                    && vxr >= 320 && vyr >= 200 && vbpp == 16) {
-            /* 探测到了可用的 VBE LFB，但没有 Bochs DISPI（真机/VMware 的
-             * VESA BIOS 就是这样）——没有 I/O 端口能在保护模式下切 VESA
-             * 模式，只能回退。这条日志是真机 bring-up 的关键信号。 */
-            dmesg_write("VBE: LFB probed but no VBE_DISPI (real HW?), VGA 0x13 fallback\n");
+            /* 探测到了可用的 VBE LFB，但没有 Bochs DISPI——VMware SVGA /
+             * 真机 VESA BIOS 就是这样。没有 I/O 端口能在保护模式下切 VESA
+             * 模式，但可以实模式回切调 INT 10h 0x4F02（bios_thunk）：
+             * boot.asm 探测时把选中的模式号留在了 0x500A。
+             * fail closed：BIOS 不应答 0x004F、或读回的 mode info 与 boot
+             * 探测结果（几何/BPP/LFB 地址）有任何不一致，都落 VGA 0x13，
+             * 绝不画没人看的内容。 */
+            uint16_t vbe_mode = *(volatile uint16_t*)0x500A;
+            int set_ax = vbe_mode
+                ? bios_int10(0x4F02, (uint16_t)(vbe_mode | 0x4000u), 0, 0)
+                : -1;
+            if (set_ax == 0x004F) {
+                /* 读回 mode info（ES:DI = 0:BT_SCRATCH），逐字段比对 */
+                (void)bios_int10(0x4F01, 0, vbe_mode,
+                                 (uint16_t)(BT_SCRATCH & 0xFFFFu));
+                uint16_t xr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_XRES);
+                uint16_t yr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_YRES);
+                uint8_t  bpp = *(volatile uint8_t *)(BT_SCRATCH + VBE_MI_BPP);
+                uint32_t pb  = *(volatile uint32_t*)(BT_SCRATCH + VBE_MI_PHYS);
+                uint16_t bps = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_BPS);
+                if (xr == vxr && yr == vyr && bpp == vbpp && pb == lfb) {
+                    GFX_W = vxr;
+                    GFX_H = vyr;
+                    gfx_fb = (uint8_t*)(uint32_t)lfb;
+                    gfx_bpp = 2;
+                    /* BytesPerScanLine 是字节数；stride 以像素计。
+                     * 探测没给（0）时按宽度兜底——两种 VBE 模式都成立 */
+                    gfx_stride = bps ? (int)(bps / 2) : (int)vxr;
+                    gfx_set_palette();
+                    gfx_load_font();
+                    dmesg_write("VBE: mode set via INT 10h thunk, readback verified\n");
+                    return;
+                }
+                dmesg_write("VBE: thunk set mode but readback mismatch, VGA 0x13 fallback\n");
+            } else {
+                dmesg_write("VBE: no DISPI and INT 10h thunk failed, VGA 0x13 fallback\n");
+            }
         }
     }
     /* Fallback: VGA mode 0x13 320x200x256（标准寄存器组）。
@@ -390,12 +428,20 @@ void gfx_text_font_init(void) {
 void gfx_restore_text(void) {
     /* U3: UEFI boots on firmware without bochs-vbe (real GOP hardware) have
      * no VGA text mode to restore - keep GOP and rely on serial output. */
-    {
-        uint32_t magic = *(volatile uint32_t*)0x5010;
-        outw(0x1CE, 0x00);
-        if ((inw(0x1CF) & 0xFFF0u) != 0xB0C0u && magic == 0x55454649u) return;
-        gfx_save_font();   /* U3: stage builtin font if gfx_init never ran (idempotent) */
+    uint32_t magic = *(volatile uint32_t*)0x5010;
+    outw(0x1CE, 0x00);
+    uint16_t vbepid = inw(0x1CF);
+    if (gfx_skip_dispi || (vbepid & 0xFFF0u) != 0xB0C0u) {
+        if (magic == 0x55454649u) return;   /* UEFI 真机 GOP：无文本模式可回 */
+        /* BIOS + 无 DISPI（VMware/真机），或强制旁路（QEMU 测同一条路）：
+         * VBE 模式是 INT 10h 设的，标准 VGA 寄存器序列切不回去（SVGA 停在
+         * VESA 几何，屏幕不动）——与 gfx_init 同路回切实模式调 mode 3。
+         * 调用方随后都会 terminal_initialize()，清屏无副作用。 */
+        bios_int10(0x0003, 0, 0, 0);
+        gfx_save_font();   /* idempotent：为下次进图形备好字体 */
+        return;
     }
+    gfx_save_font();   /* U3: stage builtin font if gfx_init never ran (idempotent) */
     /* disable VBE (bochs-vbe) first so VGA register sequence restores text mode */
     outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
     // Misc Output: enable color, 25.175MHz, 400-line

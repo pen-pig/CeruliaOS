@@ -139,6 +139,7 @@ build boot/boot.bin: asm_bin boot/boot.asm | boot/layout.inc
 build boot/stage2.bin: asm_bin boot/stage2.asm | boot/layout.inc
 build boot/kernel_entry.o: asm_elf boot/kernel_entry.asm
 build boot/task_switch.o: asm_elf boot/task_switch.asm
+build kernel/bios_thunk_asm.o: asm_elf kernel/bios_thunk.asm
 
 build kernel/kernel.o: cc kernel/kernel.c
 build kernel/tty.o: cc kernel/tty.c
@@ -199,6 +200,7 @@ build kernel/oomtest.o: cc kernel/oomtest.c
 build kernel/stackchk.o: cc kernel/stackchk.c
 build kernel/sysinfo.o: cc kernel/sysinfo.c
 build kernel/gfx.o: cc kernel/gfx.c
+build kernel/bios_thunk.o: cc kernel/bios_thunk.c
 build kernel/gui.o: cc kernel/gui.c
 build kernel/mouse.o: cc kernel/mouse.c
 build kernel/gfxwin.o: cc kernel/gfxwin.c
@@ -231,7 +233,7 @@ build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
 build user/dirwalk.o: cc_user user/dirwalk.c
 build user/dirwalk.elf: link_user user/crt0.o user/dirwalk.o user/libc.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/http.o kernel/webview.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/cjk.o kernel/cjk_font.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/http.o kernel/webview.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/bios_thunk.o kernel/bios_thunk_asm.o kernel/cjk.o kernel/cjk_font.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 
 build kernel.bin os-image.bin: make_image boot/boot.bin boot/stage2.bin kernel_raw.bin tools/make_image.py boot/layout.inc
 

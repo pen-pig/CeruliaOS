@@ -10,6 +10,7 @@
  * 所以探测只能靠哨兵值，不能靠陷阱。
  */
 #include "fpu.h"
+#include "dmesg.h"
 
 /* fnstenv 的 28 字节布局：控制字 +0，状态字 +4（16 位字段各占 4 字节槽） */
 typedef struct {
@@ -32,6 +33,46 @@ static double f_mul(double a, double b) { return a * b; }
 static double f_div(double a, double b) { return a / b; }
 static double f_neg(double a)        { return -a; }
 
+/* CPUID.1:EDX bit0 = FPU on chip（Intel SDM Vol.2A CPUID 指令说明）。
+ * 这是架构规定的权威判定；哨兵探测（fninit+fnstenv）是行为佐证。
+ * 2026-10-20 VMware 实测：哨兵失败但 CPUID 未见数据——两者都打，
+ * 哪个说谎一看便知。 */
+static int cpuid_has_fpu(void) {
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile(
+        "xor %%eax, %%eax\n"
+        "cpuid\n"                       /* leaf 0：最大叶号在 eax */
+        "cmp $1, %%eax\n"
+        "jb 1f\n"
+        "mov $1, %%eax\n"
+        "xor %%ecx, %%ecx\n"
+        "cpuid\n"                       /* leaf 1：特性位在 edx */
+        "mov %%edx, %[edx]\n"
+        "jmp 2f\n"
+        "1:\n"
+        "mov $-1, %[edx]\n"             /* 老 CPU：无 leaf 1 */
+        "2:\n"
+        : [edx] "=r"(edx), "=a"(eax), "=b"(ebx), "=c"(ecx)
+        :
+        : "cc");
+    return (edx & 1u) != 0;
+}
+
+static void fpu_diag_line(const char *tag, uint32_t v) {
+    static const char *h = "0123456789ABCDEF";
+    char line[48];
+    int i = 0;
+    const char *p = "FPU: ";
+    while (*p) line[i++] = *p++;
+    while (*tag) line[i++] = *tag++;
+    line[i++] = '=';
+    line[i++] = '0'; line[i++] = 'x';
+    for (int b = 28; b >= 0; b -= 4) line[i++] = h[(v >> b) & 0xF];
+    line[i++] = '\n';
+    line[i] = '\0';
+    dmesg_write(line);
+}
+
 int fpu_init(void) {
     fpu_env_t env;
     env.ctrl   = 0x5A5A5A5Au;                 /* 哨兵：无 FPU 时保持不变 */
@@ -45,7 +86,16 @@ int fpu_init(void) {
     );
     /* fninit 把控制字写成 0x037F、状态字清零。两个都验：
      * 无 FPU 时两条都是 NOP，哨兵原样保留。 */
-    g_fpu_ok = (env.ctrl == 0x037Fu) && (env.status == 0u);
+    int sentinel_ok = (env.ctrl == 0x037Fu) && (env.status == 0u);
+    int cpuid_ok = cpuid_has_fpu();
+    /* 双证据都进 dmesg：QEMU/VMware/真机行为分歧时不用重跑就能定位 */
+    fpu_diag_line("cpuid.edx0", (uint32_t)cpuid_ok);
+    fpu_diag_line("sentinel.ok", (uint32_t)sentinel_ok);
+    fpu_diag_line("sentinel.ctrl", env.ctrl);
+    fpu_diag_line("sentinel.status", env.status);
+    /* CPUID 是架构权威：它说有就有（哨兵失败 = fninit/fnstenv 被某种
+     * 方式干扰，如实记录但不停机）；它说没有才真没有。 */
+    g_fpu_ok = cpuid_ok;
     return g_fpu_ok ? 0 : -1;
 }
 

@@ -9,6 +9,7 @@
 #include "types.h"
 #include "gfx.h"
 #include "irqflags.h"
+#include "dmesg.h"
 
 #define MOUSE_WHEEL_BUF_SIZE 64
 
@@ -327,6 +328,23 @@ void mouse_init(void) {
     if (tries >= 5) {
         mouse_available = 0;
         mouse_fail_stage = 1;   // A9 测试全失败
+        /* 2026-10-20 VMware 实测：鼠标检测时有时无（run1 认到、run2 没有），
+         * 无证据行就无法区分"真没有"和"8042 握手时序没对上"。把 A9 实测值
+         * 与重试次数打进 dmesg，VMware/真机轮一看便知。 */
+        {
+            static const char *h = "0123456789ABCDEF";
+            char line[64];
+            int i = 0;
+            const char *p = "Mouse: no PS/2 (A9 test failed, last=";
+            while (*p) line[i++] = *p++;
+            line[i++] = '0'; line[i++] = 'x';
+            line[i++] = h[(mouse_a9val >> 4) & 0xF];
+            line[i++] = h[mouse_a9val & 0xF];
+            p = ", tries=5)\n";
+            while (*p) line[i++] = *p++;
+            line[i] = '\0';
+            dmesg_write(line);
+        }
         return;   // 无鼠标 / 无触摸板，优雅降级
     }
 
@@ -359,6 +377,7 @@ void mouse_init(void) {
         if (!bat_ok) {
             mouse_available = 0;
             mouse_fail_stage = 2;   // BAT 未收到 0xAA
+            dmesg_write("Mouse: no PS/2 (BAT failed, no 0xAA)\n");
             return;
         }
     }
@@ -376,6 +395,7 @@ void mouse_init(void) {
 
     mouse_available = 1;
     mouse_fail_stage = 0x55;   // [DEBUG] init 成功（0=未执行 1=A9失败 2=BAT失败 0xAA=未到末尾）
+    dmesg_write("Mouse: PS/2 detected (A9 ok, BAT ok)\n");
 
     // 分辨率自适应：指针初始位置 = 屏幕中心（320x200 -> 160,100；640x480 -> 320,240）
     if (GFX_W > 0 && GFX_H > 0) {

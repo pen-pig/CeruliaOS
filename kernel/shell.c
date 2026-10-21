@@ -16,6 +16,7 @@
 #include "gfx.h"
 #include "gfxwin.h"
 #include "games.h"
+#include "bios_thunk.h"
 #include "isr.h"
 #include "panic.h"
 #include "task.h"
@@ -206,6 +207,7 @@ static void cmd_mkdir(const char *args);
 static void cmd_pwd(const char *args);
 static void cmd_gui(const char *args);
 static void cmd_desktop(const char *args);
+static void cmd_vbetest(const char *args);
 static void cmd_theme(const char *args);
 static void cmd_uname(const char *args);
 static void cmd_vi(const char *args);
@@ -439,6 +441,7 @@ static const command_t commands[] = {
     {"pwd",      cmd_pwd},
     {"gui",      cmd_gui},
     {"desktop",  cmd_desktop},
+    {"vbetest",  cmd_vbetest},
     {"theme",    cmd_theme},
     {"uname",    cmd_uname},
     {"vi",       cmd_vi},
@@ -2070,6 +2073,62 @@ static void cmd_desktop(const char *args) {
     terminal_initialize();
     terminal_scroll_reset();
     shell_banner();
+}
+
+/* vbetest [force] - 实模式回切 INT 10h 设置 VBE 模式（bios_thunk 探针）。
+ * 无参：设模式 -> 读回 mode info 逐字段比对 -> 恢复文本模式，全程打印。
+ *   VMware / 真机（无 Bochs DISPI）靠这条路进 VBE 图形；QEMU 有 DISPI，
+ *   平时走寄存器路径，此命令用于验证同一条 thunk 通路本身是好的。
+ * force：通过后把 gfx_skip_dispi 置 1，之后 desktop 强制走 thunk 路径
+ *   （QEMU E2E 覆盖 VMware/真机桌面路径的唯一入口）。
+ * 输出同时进串口，E2E 按行抓。 */
+static void cmd_vbetest(const char *args) {
+    uint16_t mode = *(volatile uint16_t*)0x500A;
+    if (!mode) {
+        terminal_writestring("vbetest: no VBE mode probed at boot\n");
+        return;
+    }
+    terminal_writestring("vbetest: set VBE mode ");
+    print_hex32((uint32_t)mode | 0x4000u);
+    int ax = bios_int10(0x4F02, (uint16_t)(mode | 0x4000u), 0, 0);
+    terminal_writestring(" -> AX=");
+    print_hex32((uint32_t)(uint16_t)ax);
+    if (ax != 0x004F) {
+        terminal_writestring(" FAIL (BIOS rejected)\n");
+        bios_int10(0x0003, 0, 0, 0);   /* 屏幕可能已变，拉回文本 */
+        return;
+    }
+    /* 读回 mode info（ES:DI = 0:BT_SCRATCH） */
+    (void)bios_int10(0x4F01, 0, mode, (uint16_t)(BT_SCRATCH & 0xFFFFu));
+    uint16_t xr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_XRES);
+    uint16_t yr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_YRES);
+    uint8_t  bpp = *(volatile uint8_t *)(BT_SCRATCH + VBE_MI_BPP);
+    uint32_t pb  = *(volatile uint32_t*)(BT_SCRATCH + VBE_MI_PHYS);
+    uint16_t bps = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_BPS);
+    terminal_writestring(" OK, readback ");
+    print_dec((uint32_t)xr);
+    terminal_writestring("x");
+    print_dec((uint32_t)yr);
+    terminal_writestring("x");
+    print_dec((uint32_t)bpp);
+    terminal_writestring(" LFB=");
+    print_hex32(pb);
+    terminal_writestring(" stride=");
+    print_dec((uint32_t)bps);
+    int ax3 = bios_int10(0x4F03, 0, 0, 0);
+    uint16_t cur = bios_int10_bx();
+    terminal_writestring(" cur=");
+    print_hex32((uint32_t)cur);
+    if (ax3 == 0x004F && (cur & 0x0FFFu) == (mode & 0x0FFFu)) {
+        terminal_writestring(" VERIFIED\n");
+        if (args && args[0] == 'f') {
+            gfx_skip_dispi = 1;
+            terminal_writestring("vbetest: gfx_skip_dispi=1, next desktop uses thunk\n");
+        }
+    } else {
+        terminal_writestring(" MISMATCH\n");
+    }
+    bios_int10(0x0003, 0, 0, 0);   /* 拉回文本模式，shell 才看得见 */
 }
 
 /* theme [n]: list or switch GUI theme (also selectable in Settings) */

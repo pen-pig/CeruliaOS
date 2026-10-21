@@ -25,6 +25,7 @@
 #include "ata.h"
 #include "ahci.h"
 #include "sysvol.h"
+#include "dmesg.h"
 
 /* 布局一致性编译期检查：三种目录项结构被互相强转（cmd_ls 直接拿
  * fat_dir_entry_t* / exfat_dir_entry_t* 当 fs_dir_entry_t* 用，省一份拷贝），
@@ -246,6 +247,27 @@ int fs_is_readonly(void) {
 
 int fs_init(void) {
     if (fs_type_cur != FS_NONE) return 0;    /* 已挂载：幂等返回，保留 cwd */
+
+    /* 单盘环境（VMware / U 盘启动 H1c）：引导与数据同在 drive 0。
+     * 双盘布局（QEMU E2E：drive 0=引导镜像，drive 1=数据盘）首选 1 不变；
+     * 首选缺席且 drive 0 带 MBR 分区表时把首选切到 0——
+     * exfat/fat 后端只挂 MBR 里的数据分区，不碰 LBA0 引导代码；
+     * 无分区表的裸镜像（QEMU 引导盘形态）不切，保持原有失败路径。 */
+    if (fs_preferred_drive != 0
+        && !ata_drive_present(fs_preferred_drive)
+        && ata_drive_present(0)) {
+        static uint8_t mbr0[512];
+        if (ata_read_sector(0, 0, mbr0) == 0
+            && mbr0[510] == 0x55 && mbr0[511] == 0xAA) {
+            for (int i = 0; i < 4; i++) {
+                if (mbr0[446 + i * 16 + 4] != 0) {
+                    fs_preferred_drive = 0;
+                    dmesg_write("FS: single-disk layout, data volume on drive 0\n");
+                    break;
+                }
+            }
+        }
+    }
 
     /* 1) 首选数据盘 */
     if (fs_try_drive(fs_preferred_drive)) return 0;

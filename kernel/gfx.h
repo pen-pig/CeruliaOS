@@ -23,7 +23,13 @@ extern uint16_t gfx_palette16[256];
  *   0x5000: dword LFB 物理地址（0 = 无可用模式，内核回退 VGA 0x13）
  *   0x5004: word  XRES
  *   0x5006: word  YRES
- *   0x5008: byte  BPP（16 = 16bpp RGB565） */
+ *   0x5008: byte  BPP（16 = 16bpp RGB565）
+ *   0x500A: word  选中的 VBE 模式号（bios_thunk 实模式回切设模式用） */
+
+/* 调试/E2E 旁路：置 1 后 gfx_init / gfx_restore_text 跳过 Bochs DISPI
+ * 寄存器路径，强制走 bios_thunk 实模式回切 INT 10h——VMware/真机路径
+ * 在 QEMU 上的唯一可测入口（shell 命令 "vbetest force" 设置）。 */
+extern int gfx_skip_dispi;
 
 void gfx_init(void);            // 初始化图形模式（优先 VBE 多分辨率 LFB，失败回退 VGA 0x13 320x200）
 void gfx_restore_text(void);    // 恢复 80x25 文本模式

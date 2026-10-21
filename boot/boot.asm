@@ -96,7 +96,9 @@ disk_error:
 ;   成功：0x5000 写入 { dword LFB; word XRES; word YRES; byte BPP }
 ;   失败：0x5000 写 0，内核回退到 VGA 0x13 320x200。
 ;   注意：这里**不**调 0x4F02 切模式——文本模式还要留给内核 shell，
-;        真正的切模式在用户态 gfx_init 里通过 VBE_DISPI 寄存器完成。
+;        真正的切模式在用户态 gfx_init 里完成：有 Bochs VBE_DISPI 时走
+;        DISPI 寄存器（QEMU），没有时走 bios_thunk 实模式回切 INT 10h
+;        （VMware / 真机）。
 ;   缓冲：VBEInfoBlock 与 mode info 都放在实模式 0x6000
 ;        （读 mode info 会覆盖 VBEInfoBlock，那时它已经用完了）。
 ; ------------------------------------------------------------------
@@ -146,13 +148,19 @@ set_vbe:
     mov eax, dword [es:0x6028]
     test eax, eax
     jz .next
-    ; success: store { LFB, XRES, YRES, BPP } at 0x5000
+    ; success: store { LFB, XRES, YRES, BPP, MODE } at 0x5000
     mov dword [0x5000], eax
     mov ax, word [es:0x6012]
     mov word [0x5004], ax
     mov ax, word [es:0x6014]
     mov word [0x5006], ax
     mov byte [0x5008], 16
+    ; 选中的 VBE 模式号：内核实模式回切设模式用。
+    ; 必须从 si 取——bx 已被上面的属性字检查覆盖成 0x00BB，
+    ; 直接存 bx 会把属性当模式号（2026-10-20 实测 vbetest 拿到
+    ; 0x40BB，BIOS 拒绝，桌面落 0x13）。
+    mov ax, [si]                  ; si 自 122 行装载后未被改写（int 前后 push/pop）
+    mov word [0x500A], ax
     pop es
     popa
     ret
@@ -164,6 +172,7 @@ set_vbe:
     mov word [0x5004], 0
     mov word [0x5006], 0
     mov byte [0x5008], 0
+    mov word [0x500A], 0
     pop es
     popa
     ret
