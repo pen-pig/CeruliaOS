@@ -73,7 +73,10 @@ static uint64_t rd64(uint32_t v) { return ((uint64_t)rd32(v + 4) << 32) | rd32(v
  * ------------------------------------------------------------------ */
 #define ACPI_WIN_VADDR   PAGING_IDENTITY_END          /* 0x02000000 */
 #define ACPI_WIN_SLOTS   4u
-#define ACPI_WIN_PAGES   16u                          /* 每槽 16 页 = 64KB */
+/* 每槽 64 页 = 256KB。VMware/真机的 DSDT 经常超过 64KB（ASL 大、多 SSDT
+ * 融进一张表），老上限 16 页会把超长 DSDT 直接判 invalid → 关机走不通。
+ * 256KB 覆盖绝大多数固件；4 槽共 1MB，仍在 identity 32MB 之上，无冲突。 */
+#define ACPI_WIN_PAGES   64u
 #define ACPI_SLOT_BYTES  (ACPI_WIN_PAGES * 4096u)
 
 static uint32_t g_slot_phys[ACPI_WIN_SLOTS];          /* 槽当前映射的物理页基址 */
@@ -135,8 +138,9 @@ static void collect_tables(uint32_t rsdp) {
         uint32_t xsdt = acpi_map_table((uint32_t)ver_u64(rsdp + 24), "XSDT", 0);
         if (xsdt) {
             uint32_t len = rd32(xsdt + 4);
+            if (len > ACPI_SLOT_BYTES) len = ACPI_SLOT_BYTES;
             for (uint32_t off = 36;
-                 off + 8 <= len && off + 8 <= ACPI_SLOT_BYTES && g_tbl_n < ACPI_MAX_TABLE;
+                 off + 8 <= len && g_tbl_n < ACPI_MAX_TABLE;
                  off += 8) {
                 g_tbl[g_tbl_n++] = (uint32_t)rd64(xsdt + off);
             }
@@ -146,8 +150,9 @@ static void collect_tables(uint32_t rsdp) {
     uint32_t rsdt = acpi_map_table(ver_u32(rsdp + 16), "RSDT", 0);
     if (!rsdt) return;
     uint32_t len = rd32(rsdt + 4);
+    if (len > ACPI_SLOT_BYTES) len = ACPI_SLOT_BYTES;
     for (uint32_t off = 36;
-         off + 4 <= len && off + 4 <= ACPI_SLOT_BYTES && g_tbl_n < ACPI_MAX_TABLE;
+         off + 4 <= len && g_tbl_n < ACPI_MAX_TABLE;
          off += 4) {
         g_tbl[g_tbl_n++] = rd32(rsdt + off);
     }
