@@ -1075,10 +1075,7 @@ void uhci_init(void) {
         uhci_setup_one(d);
     }
 
-    if (found == 0) {
-        dmesg_write("UHCI: no UHCI controller found");
-        return;
-    }
+    if (found == 0) return;    /* usb_scan_log 已报 "no USB controller"，不重复 */
 
     {
         char line[128];

@@ -13,17 +13,20 @@
  * CMOS 读不到（无 RTC / 校验失败）时 rtc_valid() 返回 0，调用方必须
  * 自己决定退路（本项目的退路是沿用那个基准日期，而不是假装成功）。
  *
- * 时区：BIOS RTC 存的是 UTC（QEMU 与多数服务器如此），显示与 FAT/exFAT
- * 时间戳都按 RTC_TZ_HOURS 折算成本地时间。改这一处即可，不要在各调用点
- * 各加一次偏移（gfxwin 以前是自己在读的时候 +8）。
+ * 时区：CMOS RTC 的时区语义**因平台而异**（没有可靠的自动检测手段）：
+ *   - VMware / UEFI 固件 / 多数消费级 BIOS → 存本地时间（UEFI Spec 2.10 §8.3）
+ *   - QEMU SeaBIOS / 服务器 BIOS           → 存 UTC
+ * 本项目的主目标是 VMware + 真机 = 本地时间，所以默认不转换（RTC_TZ_HOURS=0）。
+ * QEMU E2E 的时钟会偏 8 小时（不影响测试，测试不钉绝对时间）。
+ * 改这一处即可，不要在各调用点各加一次偏移。
  */
 #ifndef RTC_H
 #define RTC_H
 
 #include "types.h"
 
-/* CMOS 存 UTC，本地时间 = UTC + RTC_TZ_HOURS（+8 = 中国标准时间） */
-#define RTC_TZ_HOURS   8
+/* CMOS 时区偏移：0 = 直接用 CMOS 值（本地时间），8 = 当 UTC 加 +8 */
+#define RTC_TZ_HOURS   0
 
 typedef struct {
     uint16_t year;      /* 完整年份，如 2026 */

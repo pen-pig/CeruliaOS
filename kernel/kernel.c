@@ -528,30 +528,32 @@ void kernel_main(void) {
      * U 盘）提供统一的 usbhc_t 句柄。 */
     usbhc_scan();
 
-    /* H2-2c: enumerate devices on connected ports (port reset -> device
-     * descriptor -> SET_ADDRESS -> configuration descriptor -> interface/
-     * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
-     * no device attached means a clean skip with zero success lines.
-     * 走的是 usbhc 统一端口表：同一个枚举流程既能跑 UHCI 也能跑 EHCI。 */
-    usbenum_init();
+    if (usbhc_port_count() > 0) {
+        /* H2-2c: enumerate devices on connected ports (port reset -> device
+         * descriptor -> SET_ADDRESS -> configuration descriptor -> interface/
+         * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
+         * no device attached means a clean skip with zero success lines.
+         * 走的是 usbhc 统一端口表：同一个枚举流程既能跑 UHCI 也能跑 EHCI。 */
+        usbenum_init();
 
-    /* H2-2d: claim a HID boot keyboard among the enumerated devices and
-     * switch it to the boot protocol. Input arrives by polling the interrupt
-     * IN endpoint (hooked into keyboard_getchar, see usbkbd.c). */
-    usbkbd_init();
+        /* H2-2d: claim a HID boot keyboard among the enumerated devices and
+         * switch it to the boot protocol. Input arrives by polling the interrupt
+         * IN endpoint (hooked into keyboard_getchar, see usbkbd.c). */
+        usbkbd_init();
 
-    /* H1c: claim USB mass storage devices (BOT + SCSI subset) among the
-     * enumerated ones and register them as block drives 12..15 so setdrive
-     * and the FS layer can use the boot USB stick after legacy BIOS
-     * INT 13h emulation is gone (protected mode). */
-    usbmsc_init();
+        /* H1c: claim USB mass storage devices (BOT + SCSI subset) among the
+         * enumerated ones and register them as block drives 12..15 so setdrive
+         * and the FS layer can use the boot USB stick after legacy BIOS
+         * INT 13h emulation is gone (protected mode). */
+        usbmsc_init();
 
-    /* H2-2e: claim a HID boot mouse (subclass=1 / protocol=2) among the
-     * enumerated devices and switch it to the boot protocol. Movement
-     * arrives by polling the interrupt IN endpoint and is injected into the
-     * shared pointer state (mouse.c), so the GUI sees one cursor no matter
-     * which bus it came from. */
-    usbmouse_init();
+        /* H2-2e: claim a HID boot mouse (subclass=1 / protocol=2) among the
+         * enumerated devices and switch it to the boot protocol. Movement
+         * arrives by polling the interrupt IN endpoint and is injected into the
+         * shared pointer state (mouse.c), so the GUI sees one cursor no matter
+         * which bus it came from. */
+        usbmouse_init();
+    }
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has

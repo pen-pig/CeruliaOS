@@ -94,9 +94,6 @@ void usbhc_scan(void) {
         int lim = (int)sizeof(line) - 1;
         const char *s = "USB-HC: ";
         while (*s && n < lim) line[n++] = *s++;
-        /* 手写十进制（内核无 sprintf）。用同一个辅助函数，别再写
-         * `(char)('0' + (n > 9 ? 9 : n))` —— 那样 16 口会打成 "9"，
-         * 日志比不打印还误导。 */
         n = usbhc_put_dec(line, n, lim, (uint32_t)g_ports_n);
         s = " connected port(s) (UHCI ";
         while (*s && n < lim) line[n++] = *s++;
@@ -106,7 +103,8 @@ void usbhc_scan(void) {
         n = usbhc_put_dec(line, n, lim, (uint32_t)ne);
         if (n < lim) line[n++] = ')';
         if (n < lim) line[n] = 0; else line[lim] = 0;
-        dmesg_write(line);
+        if (g_ports_n > 0 || nu > 0 || ne > 0) dmesg_write(line);
+        /* 全零 = 无任何 USB 控制器，usb_scan_log 已报，不重复 */
     }
 }
 

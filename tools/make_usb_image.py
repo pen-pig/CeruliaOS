@@ -148,6 +148,7 @@ def build_esp(esp_sectors, kernel_data, efi_data):
 
         \\EFI\\BOOT\\BOOTIA32.EFI     UEFI 加载器
         \\KERNEL.BIN                  UEFI 加载器要读的内核（uefi/main.c）
+        \\README.TXT                  fd_selftest 契约文件（"Welcome " 开头）
 
     目录用 8.3 短名（BOOTIA32 EFI / KERNEL BIN），不写 LFN——固件不认长名时
     短名才是保底。"""
@@ -174,11 +175,17 @@ def build_esp(esp_sectors, kernel_data, efi_data):
         n = (len(data) + SECTOR - 1) // SECTOR
         return n
 
+    readme_data = (b"Welcome to Cerulia OS!\r\n"
+                   b"\r\n"
+                   b"This is a readme file on the data volume.\r\n"
+                   b"Type 'help' in the shell for commands.\r\n")
     n_kernel = chain(kernel_data)
     n_efi = chain(efi_data)
+    n_readme = chain(readme_data)
     c_kernel = 5
     c_efi = c_kernel + n_kernel
-    next_free = c_efi + n_efi
+    c_readme = c_efi + n_efi
+    next_free = c_readme + n_readme
 
     fat = bytearray(p['fat_size'] * SECTOR)
     # FAT32 的前两项是**保留的**（规范原文：The first two entries in the FAT
@@ -199,14 +206,17 @@ def build_esp(esp_sectors, kernel_data, efi_data):
         set_fat(c_kernel + k, c_kernel + k + 1 if k + 1 < n_kernel else 0x0FFFFFFF)
     for k in range(n_efi):
         set_fat(c_efi + k, c_efi + k + 1 if k + 1 < n_efi else 0x0FFFFFFF)
+    for k in range(n_readme):
+        set_fat(c_readme + k, c_readme + k + 1 if k + 1 < n_readme else 0x0FFFFFFF)
     for i in range(p['nfats']):
         wsec(p['reserved'] + i * p['fat_size'], bytes(fat))
     wsec(1, fat32_fsinfo(p, next_free))
 
-    # 根目录：EFI 目录 + KERNEL.BIN
+    # 根目录：EFI 目录 + KERNEL.BIN + README.TXT
     root = bytearray(SECTOR)
     root[0:32] = fat32_dirent(b'EFI', FAT32_DIR, 3, 0)
     root[32:64] = fat32_dirent(b'KERNEL  BIN', 0x20, c_kernel, len(kernel_data))
+    root[64:96] = fat32_dirent(b'README  TXT', 0x20, c_readme, len(readme_data))
     wclus(2, bytes(root))
 
     # 目录：. .. BOOT
@@ -237,6 +247,9 @@ def build_esp(esp_sectors, kernel_data, efi_data):
     for i in range(n_efi):
         chunk = efi_data[i * SECTOR:(i + 1) * SECTOR]
         wclus(c_efi + i, chunk + b'\x00' * (SECTOR - len(chunk)))
+    for i in range(n_readme):
+        chunk = readme_data[i * SECTOR:(i + 1) * SECTOR]
+        wclus(c_readme + i, chunk + b'\x00' * (SECTOR - len(chunk)))
 
     return bytes(img), p
 

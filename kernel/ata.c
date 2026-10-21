@@ -120,13 +120,27 @@ int ata_drive_present(uint8_t drive) {
         uint8_t status = inb(base + 7);
         if (status == 0xFF) return 0;           /* 浮动总线 */
         if (status == 0x00) return 0;           /* 空插槽：命令无应答 */
-        if (status & ATA_STAT_ERR) return 1;    /* ATAPI 等：存在（无数据阶段） */
-        if (status & ATA_STAT_DRQ) {            /* ATA 设备：读空 256 words
-                                                 * 必须清掉 IDENTIFY 数据，否则
-                                                 * DRQ 滞留 + 数据滞留 FIFO，下一
-                                                 * 条读命令会先取到这份残留数据 */
-            for (int i = 0; i < 256; i++) (void)inw(base);
-            return 1;
+        if (status & ATA_STAT_ERR) {
+            /* ATAPI 签名：LBA mid=0x14 / LBA high=0xEB（ATA/ATAPI-6 §9.10.2）。
+             * VMware 空 IDE 插槽也回 ERR，但签名不是 ATAPI——必须验，
+             * 否则空插槽被误判成"存在"（2026-10-21 实测 drive 2/3 误报）。 */
+            uint8_t sig_mid = inb(base + 4);
+            uint8_t sig_hi  = inb(base + 5);
+            return (sig_mid == 0x14 && sig_hi == 0xEB) ? 1 : 0;
+        }
+        if (status & ATA_STAT_DRQ) {            /* ATA 设备：读 IDENTIFY 256 words
+                                                 * 必须清掉数据，否则 DRQ 滞留 + FIFO
+                                                 * 残留，下一命令先取到脏数据。
+                                                 * 同时验 model 字段非全零——VMware
+                                                 * 空插槽 DRQ 后读出全零数据。 */
+            uint16_t id[256];
+            for (int i = 0; i < 256; i++) id[i] = inw(base);
+            /* model 在 words 27-46（偏移 54-92 字节），全零 = 假设备 */
+            int nonzero = 0;
+            for (int i = 27; i <= 46; i++) {
+                if (id[i] != 0) { nonzero = 1; break; }
+            }
+            return nonzero ? 1 : 0;
         }
         if (status & ATA_STAT_BSY) {            /* 忙：继续等结果 */
             if (t-- == 0) return 0;

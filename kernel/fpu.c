@@ -84,9 +84,11 @@ int fpu_init(void) {
         :
         : "memory"
     );
-    /* fninit 把控制字写成 0x037F、状态字清零。两个都验：
-     * 无 FPU 时两条都是 NOP，哨兵原样保留。 */
-    int sentinel_ok = (env.ctrl == 0x037Fu) && (env.status == 0u);
+    /* fninit 把控制字写成 0x037F、状态字清零。fnstenv 的 32 位槽高位
+     * 是保留位（Intel SDM Vol.1 8.1.8）：QEMU 写 0，VMware 写 0xFFFF。
+     * 必须 mask 0xFFFF 再比，否则 VMware 上哨兵永远假阴性。 */
+    int sentinel_ok = ((env.ctrl & 0xFFFFu) == 0x037Fu)
+                   && ((env.status & 0xFFFFu) == 0u);
     int cpuid_ok = cpuid_has_fpu();
     /* 双证据都进 dmesg：QEMU/VMware/真机行为分歧时不用重跑就能定位 */
     fpu_diag_line("cpuid.edx0", (uint32_t)cpuid_ok);

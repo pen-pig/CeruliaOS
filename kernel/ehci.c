@@ -893,10 +893,7 @@ void ehci_init(void) {
         if (ehci_setup_one(d, g_ctl_n) == 0) g_ctl_n++;
     }
 
-    if (found == 0) {
-        dmesg_write("EHCI: no EHCI controller found");
-        return;
-    }
+    if (found == 0) return;    /* usb_scan_log 已报 "no USB controller"，不重复 */
     {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         e_str(line, &li, lim, "EHCI: ");
