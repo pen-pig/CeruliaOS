@@ -609,6 +609,17 @@ static void gw_bring_front(gw_window_t *w)
     }
     w->focused = 1;
     gw_focused_wnd = w;
+    /* 焦点切换=任何输入框失焦（浏览器地址栏的 wv_bar_focus 是 webview 内部
+     * 状态，不清则切走再切回后打字仍进地址栏——点页面区/Alt+Tab/任务栏
+     * 恢复均应失焦）。browser_click 点地址栏发生在 released 的 click 回调，
+     * 晚于 pressed 的 bring_front，置 1 仍生效。 */
+    wv_bar_set_focus(0);
+    /* 防御性置脏：z 序切换（focused 后画）需要整屏重绘。当前所有调用方
+     * 都另有 dirty 触发——点击路径靠主循环按键沿（gw_run 的
+     * btn_pressed/btn_released 分支）、Alt+Tab/任务栏/gw_restore 显式置位
+     * ——故此句目前是冗余保险；新增调用方若忘记置脏，置顶将不重绘，
+     * 现象"点了下层窗口没反应"（变异测试证实：删掉它各断言仍全绿）。 */
+    gw_dirty = 1;
 }
 
 static int gw_taskbar_h(void)
@@ -717,6 +728,7 @@ void gw_close(gw_window_t *w)
     w->used = 0;
     w->hidden = 0;
     if (gw_focused_wnd == w) gw_focused_wnd = NULL;
+    gw_dirty = 1;   /* 关窗后原被盖区域（桌面/其他窗口）需整屏重绘 */
 }
 
 void gw_minimize(gw_window_t *w)
@@ -728,6 +740,7 @@ void gw_minimize(gw_window_t *w)
         gw_focused_wnd = NULL;
         w->focused = 0;
     }
+    gw_dirty = 1;   /* 最小化后窗口区域露出桌面，同上 */
 }
 
 void gw_restore(gw_window_t *w)
@@ -2938,6 +2951,9 @@ void gw_handle_mouse(int mx, int my, int buttons)
         static uint32_t last_title_tick = 0;
         static gw_window_t *last_title_wnd = NULL;
         if (pressed) {
+            /* 拖动非焦点窗口必须先置顶：否则窗口视觉仍被上层盖住，
+             * 拖动中它的移动与画面脱节（组合场景：B 盖着 A，拖 A 跳） */
+            gw_bring_front(hit);
             uint32_t now = g_pit_ticks;
             if (hit == last_title_wnd && now - last_title_tick < 400) {
                 gw_toggle_max(hit);
