@@ -17,20 +17,25 @@
 #define WV_PAGE_W   420
 #define WV_PAGE_H   240
 
-/* ---- 调色板索引（8bpp DAC；与 gfxwin 的 0xF0..0xF9 段错开） ---- */
-#define WV_C_BG        0x01   /* 页面底色（近白）    */
-#define WV_C_FG        0x00   /* 正文（近黑）        */
-#define WV_C_MUTED     0x08   /* 次要文字 / 分隔线   */
-#define WV_C_LINK      0x02   /* 链接（蓝）          */
-#define WV_C_TITLE     0x04   /* 标题（深蓝）        */
-#define WV_C_ERR       0x0C   /* 错误（红）          */
-#define WV_C_TOOLBAR   0x07   /* 工具栏底（浅灰）    */
-#define WV_C_BAR       0x0F   /* 地址栏底（白）      */
-#define WV_C_BAR_FOCUS 0x1F   /* 地址栏底（聚焦）    */
-#define WV_C_BORDER    0x08   /* 描边                */
-#define WV_C_TRACK     0x07   /* 滚动槽              */
-#define WV_C_THUMB     0x08   /* 滚动滑块            */
-#define WV_C_OFF       0x08   /* 不可用按钮          */
+/* ---- 调色板索引（gfx_set_palette 的 LUT；走 Win10 段 0xF0..0xF9 + VGA 0x00/0x0F） ----
+ * 2026-10-21 修：旧常量按"自定义 DAC（0x01=近白 / 0x1F=聚焦）"设计，但
+ * gfx_set_palette 实际把 0..15 映射成标准 VGA（0x01=蓝、0x04=红）、0x1F=垃圾
+ * 渐变。后果：页面整块蓝底、点地址栏变**黑**、打字黑字黑底**看不见**（用户
+ * 现象"点输入框就卡死"）。改成 Win10 段：0xF3 #F3F3F3 页面底 / 0xF2 #3C9BE8
+ * 聚焦高亮 / 0xF0 #0078D7 链接 / 0xF1 #005A9E 标题 / 0xF7 #E81123 错误。 */
+#define WV_C_BG        0xF3   /* 页面底色（#F3F3F3 近白）  */
+#define WV_C_FG        0x00   /* 正文（黑）                */
+#define WV_C_MUTED     0xF6   /* 次要文字 / 分隔线（#999999）*/
+#define WV_C_LINK      0xF0   /* 链接（#0078D7 蓝）        */
+#define WV_C_TITLE     0xF1   /* 标题（#005A9E 深蓝）      */
+#define WV_C_ERR       0xF7   /* 错误（#E81123 红）        */
+#define WV_C_TOOLBAR   0xF4   /* 工具栏底（#E1E1E1 浅灰）  */
+#define WV_C_BAR       0x0F   /* 地址栏底（白）            */
+#define WV_C_BAR_FOCUS 0xF2   /* 地址栏底（聚焦 #3C9BE8）  */
+#define WV_C_BORDER    0xF5   /* 描边（#CDCDCD）           */
+#define WV_C_TRACK     0xF4   /* 滚动槽                    */
+#define WV_C_THUMB     0xF6   /* 滚动滑块                  */
+#define WV_C_OFF       0xF6   /* 不可用按钮                */
 
 /* ---- 行样式：两个字节，位互不重叠 ----
  * `fs` 直接来自 Rust 的 S_*（解析器给的），`fx` 是渲染层自己加的。

@@ -816,8 +816,10 @@ void wv_draw_bar(int ox, int oy, int iw, int h,
     gfx_fill_rect(ax, ay, aw, ah, bar_bg);
     gfx_draw_rect(ax, ay, aw, ah, WV_C_BORDER);
 
-    if (bar_x) *bar_x = ax;
-    if (bar_y) *bar_y = ay;
+    /* 输出内容区相对坐标（与 click 回调的 lx/ly 同域），
+     * browser_click 做命中测试时才能直接比较 */
+    if (bar_x) *bar_x = ax - ox;
+    if (bar_y) *bar_y = ay - oy;
     if (bar_w) *bar_w = aw;
     if (bar_h) *bar_h = ah;
 

@@ -1,9 +1,9 @@
-.encoding = "UTF-8"
 # 【必填】virtualHW.version 决定硬件/固件兼容性。VMware 26 缺这一行会直接
 # 报 "Cannot read the virtual machine configuration file"，别删。参考值：
 # Workstation 17=20、17.5=21、25/26=22（可用宿主机的 vmx 对照）。
+.encoding = "UTF-8"
 virtualHW.version = "22"
-# 【必填】config.version = "8" 与上面 virtualHW 配套。缺这一行时VMware 26
+# 【必填】config.version = "8" 与上面 virtualHW 配套。缺这一行时 VMware 26
 # 报 "Cannot read the virtual machine configuration file"，加上就能正常启动。
 config.version = "8"
 displayName = "EZOS"
@@ -35,3 +35,19 @@ usb.present = "FALSE"
 
 bios.bootDelay = "3000"
 logging = "FALSE"
+virtualHW.productCompatibility = "hosted"
+vmxstats.filename = "ezos.scoreboard"
+svga.vramSize = "268435456"
+numa.autosize.cookie = "10012"
+numa.autosize.vcpu.maxPerVirtualNode = "1"
+cpuid.coresPerSocket.cookie = "1"
+uuid.location = "56 4d 9f a8 2c 57 74 90-5e 7d 1f 2d 84 e9 48 01"
+ide0:0.redo = ""
+vmotion.checkpointFBSize = "134217728"
+vmotion.checkpointSVGAPrimarySize = "268435456"
+vmotion.svga.mobMaxSize = "268435456"
+vmotion.svga.graphicsMemoryKB = "262144"
+monitor.phys_bits_used = "45"
+vm.lastPowerRequestTimestamp = "1792584968279000"
+cleanShutdown = "TRUE"
+softPowerOff = "FALSE"
