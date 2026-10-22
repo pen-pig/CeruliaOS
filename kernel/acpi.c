@@ -296,8 +296,18 @@ static uint32_t aml_read_byte(uint32_t base, uint32_t off, uint32_t end, uint8_t
  *           PkgLength NumElements ByteConst(SLP_TYPa) ByteConst(SLP_TYPb)
  *
  * 老实现跳过长名字后**直接把 PkgLength 和 NumElements 当成 SLP_TYPa/b**
- * 读走——对 QEMU 的 `12 06 02 0A 05 0A 00` 会读出 0x06/0x02，而真正的
- * SLP_TYPa 是 0x05。写进 PM1a_CNT 的 SLP_TYP 字段是错的。现在按 AML 解。
+ * 读走——对 QEMU 的 `12 0A 04 00 00 00 00`（Package(4) 全零）会读出
+ * 0x0A/0x04，而真正的 SLP_TYPa 是 0x00。写进 PM1a_CNT 的 SLP_TYP 字段
+ * 是错的。现在按 AML 解。
+ *
+ * 已验证的真实字节（2026-10-23，别凭记忆改这两行）：
+ *  - QEMU（hw/i386/acpi-build.c）：aml_package(4) 全 aml_int(0) → SLP_TYPa=0；
+ *    QEMU 的 acpi_pm_cnt_write 对 SLP_TYP=0 就是 soft power off。
+ *  - VMware（从 vmware/ezos-*.vmem 快照直接挖出 DSDT@0xfeeed00）：
+ *    `08 5F 53 35 5F 12 06 02 0A 00 0A 00` = Name(\_S5_, Package(2)
+ *    {ByteConst(0), ByteConst(0)}) → SLP_TYPa=0。
+ * 两家都是 0，"S5_TYP=0x0"不是解析 bug——VMware 关机失效的真因是
+ * PM1a_CNT 盲写清掉 SCI_EN，见 acpi_shutdown 的读-改-写。
  * 全程越界检查，畸形一律 fail closed。 */
 static int find_s5(uint32_t dsdt, uint8_t *typa, uint8_t *typb) {
     uint32_t len = ver_u32(dsdt + 4);
@@ -463,10 +473,49 @@ const char *acpi_status_line(void) {
 
 void acpi_shutdown(void) {
     if (A.ready) {
-        /* 可选：SMI 使能 ACPI 模式（真 BIOS 需要；QEMU 的 SMI_CMD=0 跳过） */
+        /* 可选：SMI 使能 ACPI 模式（真 BIOS 需要；QEMU 的 SMI_CMD=0 跳过）。
+         * VMware 的 FADT：SMI_CMD=0xB2 / ACPI_ENABLE=0xF0 —— 这步之后
+         * PM1a_CNT.SCI_EN(bit0) 会变 1（芯片进入 ACPI 模式）。 */
         if (A.smi_needed) outb(A.smi_cmd, A.acpi_enable);
 
-        uint16_t val = (uint16_t)((A.slp_typa << 10) | (1u << 13));  /* S5|SLP_EN */
+        /* 读-改-写：只清 SLP_TYPx(bit10-12) 和 SLP_EN(bit13)，保留其余位
+         * ——尤其是 SCI_EN(bit0)。老实现盲写 (typa<<10)|0x2000 会把
+         * SCI_EN 清 0：芯片被踢出 ACPI 模式后 SLP_EN 不再被理会，VMware
+         * 上表现"关机失效"（SMI 刚使能 ACPI 就被这一笔关掉）。ACPICA 与
+         * 各经典实现（osdev/Intel ICH 示例）均为读-改-写。 */
+        uint16_t val = inw(A.pm1a_cnt);
+        uint16_t old = val;
+        val &= (uint16_t)~((7u << 10) | (1u << 13));
+        val |= (uint16_t)((A.slp_typa << 10) | (1u << 13));  /* S5 | SLP_EN */
+        /* 关机路径诊断：真机/VMware 上"关机失效"唯一可观测的通道（GUI 下
+         * 终端输出被 g_gfx_hook 重定向进窗口缓冲，必须直写 COM1） */
+        {
+            extern void serial_write(const char *s);
+            static const char h[] = "0123456789ABCDEF";
+            char b[80];
+            int n = 0;
+            const char *p = "[PWROFF] smi=";
+            for (; *p; p++) b[n++] = *p;
+            b[n++] = A.smi_needed ? '1' : '0';
+            p = " pm1a=0x";
+            for (; *p; p++) b[n++] = *p;
+            for (int sh = 12; sh >= 0; sh -= 4)
+                b[n++] = h[(A.pm1a_cnt >> sh) & 0xF];
+            p = " old=0x";
+            for (; *p; p++) b[n++] = *p;
+            b[n++] = h[(old >> 12) & 0xF];
+            b[n++] = h[(old >> 8) & 0xF];
+            b[n++] = h[(old >> 4) & 0xF];
+            b[n++] = h[old & 0xF];
+            p = " new=0x";
+            for (; *p; p++) b[n++] = *p;
+            b[n++] = h[(val >> 12) & 0xF];
+            b[n++] = h[(val >> 8) & 0xF];
+            b[n++] = h[(val >> 4) & 0xF];
+            b[n++] = h[val & 0xF];
+            b[n++] = '\n'; b[n] = 0;
+            serial_write(b);
+        }
         outw(A.pm1a_cnt, val);
         if (A.pm1b_cnt) outw(A.pm1b_cnt, val);
     } else {
