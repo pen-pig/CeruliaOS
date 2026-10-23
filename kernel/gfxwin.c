@@ -2701,17 +2701,19 @@ static int gw_start_menu_mouse(int mx, int my, int buttons)
         /* 点击菜单外：关闭菜单（若点击任务栏由桌面层处理，这里交给调用方） */
         return 0;
     }
-    if (!(buttons & 1)) return 1;   /* 仅按下时处理 */
+    if (!(buttons & 1)) return 1;   /* 仅按下时处理；移动/释放不关菜单 */
 
     int row_h = gw_menu_row_h();   /* 与绘制共用，小屏自动压缩 */
     int list_y = my0 + gw_scale_y(54);
     int lw = mw - gw_scale_x(64);
+    int hit = 0;   /* 本次按下是否命中有效项（列表行 / 右侧设置电源重启） */
     if (mx < mx0 + lw) {
         int i = (my - list_y) / row_h;
         /* 与绘制一致：仅响应已绘制的行，避免小分辨率下菜单未绘制的底部区域误触关机/重启 */
         int max_row = GW_APP_COUNT + 2;
         if (i >= 0 && i <= max_row && my >= list_y &&
             list_y + (i + 1) * row_h <= my0 + mh - gw_scale_y(60)) {
+            hit = 1;
             gw_start_menu_active = 0;
             if (i < GW_APP_COUNT)
                 gw_launch_app(i);   /* 0..7 应用（含 Terminal=6、Paint=7） */
@@ -2727,16 +2729,26 @@ static int gw_start_menu_mouse(int mx, int my, int buttons)
         int sh = gw_scale_y(34);
         int sy0 = my0 + gw_scale_y(54);
         if (my >= sy0 && my < sy0 + sh) {
+            hit = 1;
             gw_start_menu_active = 0;
             gw_launch_app(GW_APP_SETTINGS);
         } else if (my >= sy0 + sh && my < sy0 + sh * 2) {
+            hit = 1;
             gw_start_menu_active = 0;
             system_shutdown();   /* 电源：关机 */
         } else if (my >= sy0 + sh * 2 && my < sy0 + sh * 3) {
+            hit = 1;
             gw_start_menu_active = 0;
             system_reboot();     /* 电源：重启 */
         }
     }
+    /* 按下但未命中任何有效项 = 点在菜单 rect 内的空白/非交互区（典型：被
+     * 菜单盖住的窗口区域，如 Files 标题栏左段 x∈[12,484) y<130）：
+     * 返回 0 让调用方关闭菜单并把事件继续交给窗口层。老实现一律 return 1
+     * 吞掉——同一标题栏在菜单内的一段完全无响应（不聚焦、拖不动、菜单也
+     * 不关），菜单外的一段却正常，两段行为不一致；且从窗口标题栏起拖的
+     * 拖动第一帧被吞，整段拖动失效（probe_chain CH-13/CH-16 钉此行为）。 */
+    if (!hit) return 0;
     return 1;
 }
 

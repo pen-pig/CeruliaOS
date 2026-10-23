@@ -62,6 +62,9 @@ APP_WH = {
     "settings": (680, 640, "Settings"),
     "browser":  (1000, 768, "Browser"),
     "about":    (640, 384, "About Cerulia"),
+    "terminal": (840, 640, "Terminal"),
+    "sysinfo":  (680, 555, "System Info"),
+    "clock":    (400, 512, "Clock"),
 }
 TITLE_CY_OFF = 6
 START_BTN = (24, 1008)
