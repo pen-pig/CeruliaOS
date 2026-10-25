@@ -63,6 +63,34 @@ MUTATIONS = {
            "                mx >= w->x - 16 && mx < w->x + w->w + 16) {\n"
            "                hit = w; break;      /* MUT: 容差盒 */\n"
            "            }"),
+    # M7：桌面层局部重绘退回全屏（gw_redraw_desktop_region -> gw_draw_desktop）
+    #     -> 拖动时每帧先把 260 万像素的整屏桌面擦一遍再画窗口，
+    #        screendump/肉眼看到"桌面闪过 -> 窗口才出现"的半成品帧
+    #        （dbg_flicker 首轮实测：24 帧 13 帧不完整、匹配率最低 0.19、
+    #        帧间 diff 峰值 47 万）。dbg_mut M7 的匹配率+跟手判据应变红。
+    #     只改函数体第一句：保留函数定义避免 "defined but not used"
+    #     （-Werror 直接编译失败，等于没测——M4/M6 踩过两次）。
+    #     附注：M6（去掉 blit 快路径、保留局部桌面重绘）实测**不**产生
+    #     可观测差异（probe_flicker 全量 20+16 帧 worst-match=1.00、
+    #     diff-peak 3.1 万），blit 是纯性能优化而非闪动修复，故不设闸门。
+    "M7": ("M7: drag leaves no half-drawn frame",
+           "static void gw_redraw_desktop_region(int x, int y, int w, int h)\n"
+           "{\n"
+           "    int mx, my;\n"
+           "\n"
+           "    if (w <= 0 || h <= 0) return;\n"
+           "    mx = mouse_get_x(); my = mouse_get_y();\n"
+           "\n"
+           "    if (gw_theme_gnome()) { gw_draw_desktop(); return; }",
+           "static void gw_redraw_desktop_region(int x, int y, int w, int h)\n"
+           "{\n"
+           "    int mx, my;\n"
+           "\n"
+           "    if (w <= 0 || h <= 0) return;\n"
+           "    gw_draw_desktop(); return;   /* MUT: 全屏桌面 */\n"
+           "    mx = mouse_get_x(); my = mouse_get_y();\n"
+           "\n"
+           "    if (gw_theme_gnome()) { gw_draw_desktop(); return; }"),
 }
 
 

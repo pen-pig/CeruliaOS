@@ -209,6 +209,70 @@ def main():
             "| want=%r got=%r" % (want, got))
         cleanup()
 
+        # ---- M7: 拖动全程无半成品帧 + 跟手 ----
+        # 变异：gw_drag_move 的显存内 32 位块搬移换回"旧位置∪新位置"合并区
+        #       重绘 -> 每帧全量重画整窗 ~1.1M 像素（含数千次文字/图标），
+        #       TCG 下单帧 200-400ms 超过鼠标包间隔 -> screendump 拍到
+        #       "桌面已擦、窗口还没画完"的半成品帧（用户报的"闪动"）。
+        # 判据：内容匹配率（与拖动前参考帧同区域逐点比，不用颜色常量）。
+        #       修复版实测缺失 <=0.05；变异版实测 frame5 缺失 0.81。
+        S.extend([os.path.join(ROOT, "temp", "dbgmut_s%d.ppm" % i)
+                  .replace("\\", "/") for i in range(4, 22)])
+        launch("files")
+        _h6, wins6 = state()
+        g6 = wins6[0] if wins6 else None
+        worst_loss = 0.0          # 最大缺失率；初值 0（不是 1：更新条件是取 max）
+        if g6:
+            IN_X, IN_Y = g6["x"] + 2, g6["y"] + 16
+            IN_W, IN_H = g6["w"] - 4, g6["h"] - 20
+            rp = S[shots[0] % len(S)]
+            shots[0] += 1
+            qmp.shot(rp)
+            _rw, _rh, rbuf = ppm_load(rp)
+            print("   [M6] g6=%r R0 title=%r content=%r"
+                  % ((g6["x"], g6["y"], g6["w"], g6["h"]),
+                     px(rbuf, _rw, g6["x"] + 200, g6["y"] + 6),
+                     px(rbuf, _rw, g6["x"] + 400, g6["y"] + 300)), flush=True)
+            qmp.move_to(g6["x"] + 100, g6["y"] + 2)
+            time.sleep(0.25)
+            qmp.hmc("mouse_button 1")
+            time.sleep(0.15)
+            lost_frames = 0
+            for i in range(12):
+                qmp.hmc("mouse_move 0 6")     # QMP 是相对增量
+                qmp.cy += 6
+                time.sleep(0.28)
+                p = S[shots[0] % len(S)]
+                shots[0] += 1
+                qmp.shot(p)
+                w, h, buf = ppm_load(p)
+                wy = g6["y"] + (i + 1) * 6
+                # 窗口必须**在新位置**（跟手）：新位标题栏中心是聚焦蓝。
+                # 变异版（合并区重绘太慢，整帧拍到"移动前的旧画面"）会让
+                # 匹配率反而完美（与 R0 相同）——只有这条能抓住它。
+                if px(buf, w, g6["x"] + 200, wy + 6) != (0, 105, 189):
+                    lost_frames += 1
+                same = tot = 0
+                for yy in range(0, IN_H, 3):
+                    ro = ((IN_Y + yy) * _rw + IN_X) * 3
+                    bo = ((wy + 16 + yy) * w + IN_X) * 3
+                    for xx in range(0, IN_W, 7):
+                        tot += 1
+                        if rbuf[ro + xx * 3:ro + xx * 3 + 3] == \
+                                buf[bo + xx * 3:bo + xx * 3 + 3]:
+                            same += 1
+                if tot:
+                    loss = 1.0 - same / tot
+                    if loss > worst_loss:
+                        worst_loss = loss
+            qmp.hmc("mouse_button 0")
+            time.sleep(0.4)
+        rep("M7: drag leaves no half-drawn frame",
+            worst_loss <= 0.10 and lost_frames == 0,
+            "| worst-loss=%.2f (<=0.10) stale-frames=%d (==0)"
+            % (worst_loss, lost_frames))
+        cleanup()
+
         allok = all(r[1] for r in RESULTS)
         print("total %d assertions, %s" % (len(RESULTS),
                                             "ALL PASS" if allok else "HAS FAILURES"))

@@ -786,6 +786,94 @@ def main():
             m.slots[0]["y"] = want[1]
         cleanup_all()
 
+        # ================= C15 拖动全程无半成品帧（blit 快路径）===========
+        # 老实现每帧用"旧位置∪新位置"合并区重绘：局部桌面 + **整窗内容全量
+        # 重画** ≈ 1.1M 像素/帧（880x640 窗口，含数千次文字/图标/渐变）。
+        # QEMU TCG 下单帧 200-400ms，超过鼠标包间隔（真机 PS/2 100Hz 只有
+        # 10ms）——screendump 与肉眼持续看到"桌面已擦、窗口还没画完"的半
+        # 成品帧（2026-10-25 用户报"闪动还是太严重"；dbg_flicker.py 实测：
+        # 24 帧里 4 成不完整、内容匹配率最低 19%、帧间 diff 峰值 47 万）。
+        # 修法 = 显存内 32 位块搬移整个窗口矩形（内容相对窗口不变），只重
+        # 画旧位置露出的 |d| 像素窄带。修复后：0/24 不完整、diff 峰值 4.7 万。
+        # 判据：逐帧内容匹配率（与拖动前参考帧比，半成品帧会掉到 0.9 以下；
+        # 正常帧 0.95+）。帧间 diff 只打印（20 倍差距，不设硬阈值防误报）。
+        # 两段之间必须**释放再按**：连续两次按同一窗标题栏会踩 400ms 双击
+        # 判定（TCG 下 GUI 任务 CPU 饥饿，事件延迟可达数百 ms，见 C14 注释）。
+        launch("files")
+        hdr15a, wins15a = kernel_state()
+        if not wins15a:
+            rep("C15: drag leaves no half-drawn frame", False, "| 没有窗口")
+        else:
+            g15 = wins15a[0]
+            IN_X, IN_Y = g15["x"] + 2, g15["y"] + 16
+            IN_W, IN_H = g15["w"] - 4, g15["h"] - 20
+            rpath = S[shots[0] % len(S)]
+            shots[0] += 1
+            qmp.shot(rpath)
+            _rw, _rh, rbuf = ppm_load(rpath)
+
+            def flick_round(dx, dy, n, step):
+                """一段小步进拖动：返回 (匹配率列表, 粗略 diff 峰值)。
+                dx/dy 只能是 (1,0) 或 (0,1)（内核快路径只覆盖纯横/纯竖）。"""
+                ratios, peak = [], 0
+                prev = None
+                hdr_g, wins_g = kernel_state()
+                if not wins_g:
+                    return [0.0], 0
+                gg = wins_g[0]
+                sx, sy = gg["x"] + 100, gg["y"] + 2
+                qmp.move_to(sx, sy)
+                time.sleep(0.2)
+                qmp.hmc("mouse_button 1")
+                time.sleep(0.15)
+                for i in range(n):
+                    qmp.hmc("mouse_move %d %d" % (dx * step, dy * step))
+                    qmp.cx += dx * step
+                    qmp.cy += dy * step
+                    time.sleep(0.28)
+                    p = S[shots[0] % len(S)]
+                    shots[0] += 1
+                    qmp.shot(p)
+                    w, h, buf = ppm_load(p)
+                    wx = gg["x"] + (i + 1) * step * dx
+                    wy = gg["y"] + (i + 1) * step * dy
+                    same = tot = 0
+                    for yy in range(0, IN_H, 3):
+                        ro = ((IN_Y + yy) * _rw + IN_X) * 3
+                        bo = ((wy + 16 + yy) * w + wx + 2) * 3
+                        for xx in range(0, IN_W, 7):
+                            tot += 1
+                            if rbuf[ro + xx * 3:ro + xx * 3 + 3] == \
+                                    buf[bo + xx * 3:bo + xx * 3 + 3]:
+                                same += 1
+                    ratios.append(same / tot if tot else 0.0)
+                    if prev is not None:
+                        d = 0
+                        for k in range(0, min(len(prev), len(buf)), 48):
+                            if prev[k] != buf[k]:
+                                d += 16
+                        if d > peak:
+                            peak = d
+                    prev = buf
+                qmp.hmc("mouse_button 0")
+                time.sleep(0.4)
+                return ratios, peak
+
+            ratios = []
+            peaks = []
+            for (fdx, fdy) in ((0, 1), (1, 0)):
+                r, pk = flick_round(fdx, fdy, 6, 6)
+                ratios.extend(r)
+                peaks.append(pk)
+            worst = min(ratios) if ratios else 0.0
+            rep("C15: drag leaves no half-drawn frame",
+                worst >= 0.90,
+                "| frames=%d worst-match=%.2f diff-peaks=%r"
+                % (len(ratios), worst, peaks))
+            m.slots[0]["x"] += 36
+            m.slots[0]["y"] += 36
+        cleanup_all()
+
         # report
         print("\n===== probe_combo2 results (seed=%d) =====" % seed)
         allok = True

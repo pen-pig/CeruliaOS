@@ -3307,7 +3307,139 @@ void gw_draw_all(void)
     gw_cursor_bg_valid = 0;    /* 全屏重绘后光标背景缓存失效：旧位置已被新画面覆盖，禁止用旧缓存恢复 */
 }
 
-/* 局部区域重绘：桌面渐变 + 相交图标 + 相交窗口（非聚焦先画） + 任务栏 + 开始菜单 */
+/* 桌面层局部重绘（只覆盖 rect 内像素）。
+ * gw_draw_desktop() 是无条件全屏（壁纸 + 水印 + Dock + 13 个图标）。
+ * 拖动窗口时主循环每帧调 gw_redraw_region，老实现它第一件事就是全屏画
+ * 桌面——等于每帧把整屏擦一遍再画窗口，扫描线上看到的就是"桌面闪过 →
+ * 窗口才出现"的持续闪动（2026-10-25 用户报"闪动还是太严重"的根因；
+ * 此前被误判成 screendump 抓中间帧，只加了截图等待掩盖症状）。
+ * 这里只碰 rect 内：壁纸按**绝对 y** 插值（gw_fill_vgrad 内部基准是
+ * 相对 j，直接套用会把颜色算错、接缝可见），水印/图标仅在与 rect
+ * 相交时才画。GNOME 主题的右下角橙环与左侧 Dock 无法廉价局部化，
+ * 回退全屏（GNOME 非默认主题，默认 Win10 走局部）。 */
+static void gw_redraw_desktop_region(int x, int y, int w, int h)
+{
+    int mx, my;
+
+    if (w <= 0 || h <= 0) return;
+    mx = mouse_get_x(); my = mouse_get_y();
+
+    if (gw_theme_gnome()) { gw_draw_desktop(); return; }
+
+    /* Win10 深蓝渐变壁纸：逐行颜色与 gw_fill_vgrad(0,0,GFX_W,GFX_H,
+     * 0x0C7BD5, 0x063B66) 一致，插值基准必须用绝对 y */
+    {
+        int tr = 0x0C, tg = 0x7B, tb = 0xD5;
+        int br = 0x06, bg = 0x3B, bb = 0x66;
+        for (int yy = y; yy < y + h; yy++) {
+            int a, ia;
+            uint32_t c;
+            if (yy < 0 || yy >= GFX_H) continue;
+            a = yy * 255 / (GFX_H - 1); ia = 255 - a;
+            c = (uint32_t)(((tr * ia + br * a) / 255) << 16)
+              | (uint32_t)(((tg * ia + bg * a) / 255) << 8)
+              | (uint32_t)(((tb * ia + bb * a) / 255));
+            gw_fill(x, yy, w, 1, c);
+        }
+    }
+    /* 右下角水印（仅相交时重画） */
+    {
+        int wx = GFX_W - gw_scale_x(60), wy = gw_desktop_bottom() - 12;
+        if (wx < x + w && wx + 7 * 8 > x && wy < y + h && wy + 8 > y)
+            gfx_draw_text(wx, wy, "Cerulia", 0x0F, 0x0B);
+    }
+    /* 桌面图标：只画与 rect 相交的（hover 高亮取当前鼠标位，与全屏路径一致） */
+    for (int i = 0; i < GW_DESK_ICONS; i++) {
+        int ix, iy, iw, ih;
+        if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
+        if (ix < x + w && ix + iw > x && iy < y + h && iy + ih > y)
+            gw_draw_desktop_icon(i, mx, my);
+    }
+}
+
+/* 拖动中的窗口平移：显存内整块搬移（32 位块拷贝），只重画旧位置露出的
+ * 窄带。
+ *
+ * 老实现每帧用"旧位置∪新位置"的合并区重绘：局部桌面 + **整窗内容全量
+ * 重画** ≈ 1.1M 像素/帧（880x640 的窗口，含数千次文字/图标/渐变调用）。
+ * QEMU TCG 下单帧 200-400ms，超过鼠标包间隔（真机 PS/2 100Hz 只有 10ms）
+ * —— screendump 与肉眼都会持续看到"桌面已擦、窗口还没画完"的半成品帧，
+ * 即用户报的"闪动还是太严重"。2026-10-25 dbg_flicker.py 实测：24 帧里
+ * 4 成不完整，内容匹配率最低掉到 19%，帧间 diff 峰值 47 万像素。
+ *
+ * 窗口平移时**内容相对窗口不变**，逐行搬移即可；只有旧位置露出的 |d|
+ * 像素窄带需要真正重绘（露出的是桌面/被本窗盖住的窗口，交给
+ * gw_redraw_region 恢复）。每帧工作量降到一次矩形搬运 + 一条 6px 窄带。
+ *
+ * 纯横/纯竖走本快路径；斜向回退合并区重绘（L 形差集不值得写第二套
+ * 逻辑，且斜拖帧率低、用户容忍度高）。
+ *
+ * 注意：拖动中窗口内 hover 不再逐帧刷新（blit 保留上一帧像素）——拖动
+ * 时鼠标相对窗口的位置几乎不变，hover 态本就稳定，影响可忽略。 */
+static void gw_blit_rect(int sx, int sy, int dx, int dy, int w, int h)
+{
+    int pxsz = (gfx_bpp == 4) ? 4 : (gfx_bpp == 2 ? 2 : 1);
+    int stride = (gfx_bpp == 4) ? (int)gfx_stride : GFX_W;
+    uint8_t *fb = (uint8_t *)gfx_fb;
+    int row_bytes = w * pxsz;
+    int n = row_bytes / 4;               /* 32 位块数；窗口宽 ≥240，行字节数必为 4 的倍数 */
+    int j0 = (dy > 0) ? h - 1 : 0;       /* 目标在下：从后往前，防行间覆盖 */
+    int jd = (dy > 0) ? -1 : 1;
+    int i0 = (dx > 0) ? n - 1 : 0;       /* 目标在右：从后往前，防行内覆盖 */
+    int id = (dx > 0) ? -1 : 1;
+
+    if (n <= 0) return;
+    for (int jj = 0; jj < h; jj++) {
+        int j = j0 + jj * jd;
+        int sy_j = sy + j, ty_j = dy + j;
+        if (sy_j < 0 || sy_j >= GFX_H || ty_j < 0 || ty_j >= GFX_H) continue;
+        {
+            uint32_t *s = (uint32_t *)(fb + (uint32_t)sy_j * stride * pxsz
+                                       + (uint32_t)sx * pxsz);
+            uint32_t *d = (uint32_t *)(fb + (uint32_t)ty_j * stride * pxsz
+                                       + (uint32_t)dx * pxsz);
+            for (int ii = 0; ii < n; ii++) {
+                int i = i0 + ii * id;
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
+static void gw_drag_move(gw_window_t *w)
+{
+    int ox = w->ghost_x, oy = w->ghost_y;
+    int nx = w->x, ny = w->y;
+    int dx = nx - ox, dy = ny - oy;
+
+    w->ghost_x = nx;
+    w->ghost_y = ny;
+    if (dx == 0 && dy == 0) return;
+
+    if (dx != 0 && dy != 0) {
+        int rx = (dx < 0) ? nx : ox;
+        int ry = (dy < 0) ? ny : oy;
+        gw_redraw_region(rx, ry, w->w + (dx < 0 ? -dx : dx),
+                         w->h + (dy < 0 ? -dy : dy));
+        return;
+    }
+
+    /* 1. 显存内搬移整个窗口矩形 */
+    gw_blit_rect(ox, oy, nx, ny, w->w, w->h);
+
+    /* 2. 旧位置露出的窄带：重绘成桌面/被盖窗口 */
+    if (dy > 0)
+        gw_redraw_region(ox, oy, w->w, dy);
+    else if (dy < 0)
+        gw_redraw_region(ox, oy + w->h + dy, w->w, -dy);
+    else if (dx > 0)
+        gw_redraw_region(ox, oy, dx, w->h);
+    else
+        gw_redraw_region(ox + w->w + dx, oy, -dx, w->h);
+}
+
+/* 局部区域重绘：桌面渐变（仅 rect 内）+ 相交图标 + 相交窗口（非聚焦先画）
+ * + 任务栏 + 开始菜单 */
 void gw_redraw_region(int x, int y, int w, int h)
 {
     if (x < 0) { w += x; x = 0; }
@@ -3316,7 +3448,7 @@ void gw_redraw_region(int x, int y, int w, int h)
     if (y + h > GFX_H) h = GFX_H - y;
     if (w <= 0 || h <= 0) return;
 
-    gw_draw_desktop();
+    gw_redraw_desktop_region(x, y, w, h);
 
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < GW_MAX_WINDOWS; i++) {
@@ -4238,15 +4370,12 @@ void gw_demo(void)
             if (gw_windows[i].used && gw_windows[i].moving) { dragging = 1; drag_w = &gw_windows[i]; break; }
         }
         if (dragging && drag_w) {
-            int ox = drag_w->ghost_x, oy = drag_w->ghost_y;
-            int nx = drag_w->x, ny = drag_w->y;
-            int rx = ox < nx ? ox : nx;
-            int ry = oy < ny ? oy : ny;
-            int rw = ((ox + drag_w->w > nx + drag_w->w) ? ox + drag_w->w : nx + drag_w->w) - rx;
-            int rh = ((oy + drag_w->h > ny + drag_w->h) ? oy + drag_w->h : ny + drag_w->h) - ry;
-            gw_redraw_region(rx, ry, rw, rh);
-            drag_w->ghost_x = nx;   /* 更新为本次位置，作为下一帧的旧位置 */
-            drag_w->ghost_y = ny;
+            /* 先按缓存擦掉旧光标，再搬窗口。顺序反了会把过时像素写回
+             * 旧光标位置（blit/窄带重绘已把那里画成新画面）——16x16 旧
+             * 画面残影，且 gw_redraw_region 末尾会置 gw_cursor_bg_valid=0，
+             * 晚了就再也擦不掉。 */
+            gw_cursor_restore_bg();
+            gw_drag_move(drag_w);
             gw_dirty = 0;
         }
 
@@ -4315,13 +4444,18 @@ void gw_demo(void)
         if (sec_changed && !taskbar_redrawn) {
             gw_draw_taskbar();
         }
-        /* 系统监视器：SysInfo 窗口打开时每秒刷新（运行时长/窗口数动态变化） */
+        /* 系统监视器：SysInfo 窗口打开时每秒刷新（运行时长/窗口数动态变化）。
+         * **只重绘该窗口本身**：老实现置 gw_dirty=1 走全屏重绘（260 万像素），
+         * TCG 下单次 200ms+——开着 System Info 就等于每秒一次整屏闪烁
+         * （2026-10-25 "闪动还是太严重"排查出的第二源；真机上也白烧
+         * 一整帧带宽）。gw_redraw_region 末尾会置 gw_cursor_bg_valid=0，
+         * 下方 save_bg 会按新画面重新保存，无残影。 */
         if (sec_changed) {
             for (int i = 0; i < GW_MAX_WINDOWS; i++) {
                 gw_window_t *w = &gw_windows[i];
                 if (w->used && !w->hidden &&
                     (unsigned long)w->user == (unsigned long)GW_APP_SYSINFO) {
-                    gw_dirty = 1;
+                    gw_redraw_region(w->x, w->y, w->w, w->h);
                     break;
                 }
             }
