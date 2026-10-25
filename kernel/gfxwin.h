@@ -67,6 +67,10 @@ struct gw_window {
     int move_dx, move_dy;   /* 拖动时鼠标偏移 */
     int ghost_x, ghost_y;   /* 移动动画 ghost 虚线框位置 */
     int minimized;          /* 最小化（隐藏）标记，点击桌面空白恢复 */
+    int app;                /* 应用索引（GW_APP_*）；非应用窗口 = -1。
+                             * 不能用 user 字段代替：gw_spawn_app 把
+                             * user 设为 (void*)idx，idx=0（Files）时
+                             * user==NULL，与"非应用窗口"无法区分 */
     int maximized;          /* 最大化标记（双击标题栏切换） */
     int save_x, save_y, save_w, save_h;   /* 最大化前的几何，还原用 */
     gw_draw_fn draw;

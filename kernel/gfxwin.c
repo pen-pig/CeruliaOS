@@ -42,6 +42,7 @@ extern void terminal_set_gfx_hook(void (*fn)(const char *));
 #include "games.h"
 #include "isr.h"
 #include "rtc.h"
+#include "serial.h"
 
 /* 前置声明：定义顺序在调用之后（gw_spawn_app / gw_demo 使用） */
 void gw_redraw_region(int x, int y, int w, int h);
@@ -383,9 +384,23 @@ static struct gw_theme gw_themes[GW_THEME_COUNT] = {
 static struct gw_theme *gw_cur_theme = &gw_themes[0];
 static uint32_t gw_accent = 0x0078D7u;
 static uint32_t gw_bg_rgb = 0xF3F3F3u;
+/* 标题渐变暗档 / 顶部亮边 / ghost / 按钮按压态用的强调色派生色：
+ * 与 8bpp DAC 路径（gw_set_theme 的 F1/F2 槽位、gfx_theme_accent）同一
+ * 公式。此前 16bpp 这几处硬编码 CLR_BLUE_DARK/CLR_BLUE_LIGHT，切到
+ * Contrast（accent=0x000000）等主题标题栏仍是深蓝——"QEMU 绿、真机坏"
+ * 类缺陷：8bpp 早就推导，16bpp 没跟上。 */
+static uint32_t gw_accent_dark = CLR_BLUE_DARK;
+static uint32_t gw_accent_light = CLR_BLUE_LIGHT;
 static int gw_theme_sel = 0;     /* 持久化的主题选择（跨 GUI 会话保持） */
 static int gw_dirty;             /* 前置声明：gw_set_theme 里置脏，定义在桌面层 */
 static int gw_gui_active = 0;    /* gw_demo 主循环运行中标志 */
+
+static void gw_update_accent_shades(void)
+{
+    uint32_t a = gw_accent;
+    gw_accent_dark = (a * 3) / 4;                  /* 暗一档 */
+    gw_accent_light = a + (0xFFFFFFu - a) / 3;     /* 亮一档 */
+}
 
 void gw_set_theme(int index)
 {
@@ -395,24 +410,10 @@ void gw_set_theme(int index)
     gw_cur_theme = &gw_themes[index];
     gw_accent = gw_cur_theme->accent;
     gw_bg_rgb = gw_cur_theme->bg_rgb;
-    /* 8bpp 回退：F0/F1/F2 槽位刷新为当前主题强调色系（16bpp 无影响） */
-    {
-        uint32_t a = gw_cur_theme->accent;
-        outb(0x3C8, 0xF0);
-        outb(0x3C9, (uint8_t)((a >> 16) & 0xFF) >> 2);
-        outb(0x3C9, (uint8_t)((a >> 8) & 0xFF) >> 2);
-        outb(0x3C9, (uint8_t)(a & 0xFF) >> 2);
-        uint32_t d = (a * 3) / 4;   /* 暗一档 */
-        outb(0x3C8, 0xF1);
-        outb(0x3C9, (uint8_t)((d >> 16) & 0xFF) >> 2);
-        outb(0x3C9, (uint8_t)((d >> 8) & 0xFF) >> 2);
-        outb(0x3C9, (uint8_t)(d & 0xFF) >> 2);
-        uint32_t l = a + (0xFFFFFFu - a) / 3;   /* 亮一档 */
-        outb(0x3C8, 0xF2);
-        outb(0x3C9, (uint8_t)((l >> 16) & 0xFF) >> 2);
-        outb(0x3C9, (uint8_t)((l >> 8) & 0xFF) >> 2);
-        outb(0x3C9, (l & 0xFF) >> 2);
-    }
+    gw_update_accent_shades();
+    /* 调色板槽位 F0/F1/F2 跟随主题：8bpp 走 DAC，16/32bpp 走 LUT
+     * （此前这里只写 DAC，16bpp 的 gfx_palette16 永远是默认蓝） */
+    gfx_theme_accent(gw_accent);
     /* GUI 运行中切主题（Settings 点击 / shell theme 命令）：请求整屏重绘 */
     if (gw_gui_active) gw_dirty = 1;
 }
@@ -599,6 +600,8 @@ void gw_init(void)
     gw_cur_theme = &gw_themes[gw_theme_sel];
     gw_accent = gw_cur_theme->accent;
     gw_bg_rgb = gw_cur_theme->bg_rgb;
+    gw_update_accent_shades();
+    gfx_theme_accent(gw_accent);
 }
 
 static void gw_bring_front(gw_window_t *w)
@@ -708,6 +711,7 @@ gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
         wnd->moving = 0;
         wnd->minimized = 0;
         wnd->maximized = 0;
+        wnd->app = -1;
         wnd->save_x = x; wnd->save_y = y; wnd->save_w = w; wnd->save_h = h;
         wnd->draw = NULL; wnd->key = NULL; wnd->click = NULL; wnd->mousedown = NULL;
         wnd->user = NULL;
@@ -789,14 +793,14 @@ static void gw_draw_ghost(gw_window_t *w)
     int x = w->ghost_x, y = w->ghost_y, ww = w->w, hh = w->h;
     for (int i = 0; i < ww; i += 4) {
         if (x + i >= 0 && x + i < GFX_W) {
-            if (y >= 0 && y < GFX_H) gw_px(x + i, y, CLR_BLUE_LIGHT);
-            if (y + hh - 1 >= 0 && y + hh - 1 < GFX_H) gw_px(x + i, y + hh - 1, CLR_BLUE_LIGHT);
+            if (y >= 0 && y < GFX_H) gw_px(x + i, y, gw_accent_light);
+            if (y + hh - 1 >= 0 && y + hh - 1 < GFX_H) gw_px(x + i, y + hh - 1, gw_accent_light);
         }
     }
     for (int i = 0; i < hh; i += 4) {
         if (y + i >= 0 && y + i < GFX_H) {
-            if (x >= 0 && x < GFX_W) gw_px(x, y + i, CLR_BLUE_LIGHT);
-            if (x + ww - 1 >= 0 && x + ww - 1 < GFX_W) gw_px(x + ww - 1, y + i, CLR_BLUE_LIGHT);
+            if (x >= 0 && x < GFX_W) gw_px(x, y + i, gw_accent_light);
+            if (x + ww - 1 >= 0 && x + ww - 1 < GFX_W) gw_px(x + ww - 1, y + i, gw_accent_light);
         }
     }
 }
@@ -811,6 +815,37 @@ static int gw_title_btn_hit(gw_window_t *w, int mx, int my)
         if (mx >= bx - 13 && mx < bx - 2) return 1;
     }
     return 0;
+}
+
+/* ---- 标题栏按钮（关/最小）连点保护 ----------------------------------
+ * 标题栏按钮被点 -> 窗口立刻隐藏/销毁 -> 同一屏幕坐标变成"桌面空白"
+ * -> 第二次按下走桌面分支 -> 触发"恢复 slot 最小的隐藏窗"：
+ *   * 连点最小化钮 = 最小化后立刻被恢复（等于没最小化，2026-10-24
+ *     probe_combo2 C9 实测：第二次点完内核转储 hid=0/foc=0）
+ *   * 双击关闭钮   = 顺带把别的隐藏窗拽出来
+ * 这里记下按钮被点时的坐标与时刻，400ms（同内核双击判定窗口）内同位置
+ * 的下一次按下直接消费掉，不做任何恢复。
+ * 注意：任务栏按钮的"点一下最小化、再点一下恢复"是**正常**语义，不受
+ * 本保护影响（任务栏按钮不隐藏自己）。 */
+static int      gw_tbtn_cx = -1, gw_tbtn_cy = -1;
+static uint32_t gw_tbtn_ctick = 0;
+
+static void gw_tbtn_arm(int mx, int my)
+{
+    gw_tbtn_cx = mx;
+    gw_tbtn_cy = my;
+    gw_tbtn_ctick = g_pit_ticks;
+}
+
+/* 返回 1 = 本次按下应被吞掉（是标题栏按钮的连点第二次） */
+static int gw_tbtn_consume(int mx, int my)
+{
+    if (gw_tbtn_cx < 0) return 0;
+    if (g_pit_ticks - gw_tbtn_ctick >= 400) { gw_tbtn_cx = -1; return 0; }
+    if (mx < gw_tbtn_cx - 8 || mx > gw_tbtn_cx + 8) return 0;
+    if (my < gw_tbtn_cy - 8 || my > gw_tbtn_cy + 8) return 0;
+    gw_tbtn_cx = -1;      /* 只消费一次 */
+    return 1;
 }
 
 static void gw_draw_window(gw_window_t *w)
@@ -837,13 +872,13 @@ static void gw_draw_window_body(gw_window_t *w, int with_content)
 
     /* 标题栏：活动 #0078D7 渐变，非活动灰渐变 */
     if (w->focused)
-        gw_fill_vgrad(x + 1, y + 1, ww - 2, GW_TITLE_H, gw_accent, CLR_BLUE_DARK);
+        gw_fill_vgrad(x + 1, y + 1, ww - 2, GW_TITLE_H, gw_accent, gw_accent_dark);
     else
         gw_fill_vgrad(x + 1, y + 1, ww - 2, GW_TITLE_H, 0x6E6E6Eu, 0x5A5A5Au);
 
     /* 聚焦窗口顶部 1px 亮边 */
     if (w->focused)
-        gw_fill(x + 1, y, ww - 2, 1, CLR_BLUE_LIGHT);
+        gw_fill(x + 1, y, ww - 2, 1, gw_accent_light);
 
     /* 标题文字 */
     uint8_t tbg = (w->focused) ? GW_C_BLUE_DARK : 0x08;
@@ -1001,7 +1036,7 @@ static void gw_draw_desktop_icon(int idx, int mx, int my)
     char l1[16], l2[16];
     gw_icon_name_lines(gw_desktop_icon_names[idx], l1, l2);
     int w1 = gw_strlen(l1), w2 = gw_strlen(l2);
-    uint32_t bgc = hover ? 0x005A9Eu : 0x202020u;
+    uint32_t bgc = hover ? gw_accent_dark : 0x202020u;
     int ny = iy + sz + 4;                               /* 名称区起点（图标下方） */
     int lines = w2 ? 2 : 1;
     gw_fill(ix + 1, ny - 1, iw - 2, (lines == 2 ? 17 : 8) + 1, bgc);
@@ -2669,6 +2704,7 @@ static gw_window_t *gw_spawn_app(int idx)
         break;
     }
     w->user = (void*)(unsigned long)idx;
+    w->app = idx;   /* 显式应用索引：user 在 idx=0 时是 NULL，无法区分 */
     return w;
 }
 
@@ -2909,15 +2945,32 @@ void gw_handle_mouse(int mx, int my, int buttons)
         }
     }
 
-    /* 拖动中的窗口优先命中（带容差，解决边界钳制后鼠标滑出标题栏导致拖不动） */
+    /* ★ 拖动 = 指针抓取（pointer grab）：**左键没松，拖拽就归该窗独占**，
+     * 不再要求光标留在标题栏附近的容差盒里。
+     *
+     * 老实现用 ±8/±16 的容差盒去找"拖动中的窗口"，等价于给单包位移设了
+     * 上限：向上拖要求 step <= move_dy+8，向下拖要求 step < 20-move_dy。
+     * 于是快速拖动（真机 PS/2 100Hz 甩动单包可达 20px）会当场掉出容差，
+     * hit 落到别的窗口/桌面，拖动态再也找不回来——窗口一步不动，直到释按
+     * 收场。实测（2026-10-24 combo2 C8 op#70，drag(slot1 clock -> 0,83)，
+     * 12px 步进向上拖）：模型认为窗口到了 (0,83)，内核还停在 (581,467)；
+     * tests/dbg_dragv.py 用 20px 步进复现同一条路径。
+     *
+     * 抓取期间不做任何几何判据：拖过任务栏/桌面图标/别的窗口都不中断，
+     * 统一由释按（gw_end_drags）收场。 */
     gw_window_t *hit = NULL;
     for (int i = 0; i < GW_MAX_WINDOWS; i++) {
         gw_window_t *w = &gw_windows[i];
         if (w->used && !w->hidden && w->moving) {
-            if (my >= w->y - 8 && my < w->y + GW_TITLE_H + 8 &&
-                mx >= w->x - 16 && mx < w->x + w->w + 16) {
-                hit = w; break;
+            if (!(buttons & 1)) {
+                /* 按钮已松：清残留并吞掉本次释按。不能让它继续往下走——
+                 * 否则释按会被当成一次内容区 click 派发给光标下的窗口 */
+                gw_end_drags();
+                last_btn = buttons;
+                return;
             }
+            hit = w;
+            break;
         }
     }
     if (!hit) {
@@ -2932,8 +2985,16 @@ void gw_handle_mouse(int mx, int my, int buttons)
         }
     }
     if (!hit) {
-        /* 桌面空白：恢复最近最小化窗口 */
+        /* 桌面空白：恢复**slot 最小**的最小化窗口（按 slot 序扫，第一个
+         * hidden 的就是它）——不是"最近最小化的那个"。probe_fuzz A3 钉死
+         * 这条语义：先最小化 slot1 再最小化 slot0，点桌面恢复的是 slot0。 */
         if (pressed) {
+            /* 标题栏按钮（关/最小）的连点第二次：吞掉，不恢复任何窗口
+             * ——否则"连点最小化"= 最小化后立刻被恢复（见 gw_tbtn_consume） */
+            if (gw_tbtn_consume(mx, my)) {
+                last_btn = buttons;
+                return;
+            }
             for (int i = 0; i < GW_MAX_WINDOWS; i++) {
                 gw_window_t *w = &gw_windows[i];
                 if (w->used && w->hidden) { gw_restore(w); break; }
@@ -2946,18 +3007,16 @@ void gw_handle_mouse(int mx, int my, int buttons)
     int title_btn = gw_title_btn_hit(hit, mx, my);
     if (title_btn) {
         if (pressed) {
-            if (title_btn == 2) gw_close(hit);
-            else if (title_btn == 1) gw_minimize(hit);
+            if (title_btn == 2) { gw_close(hit); gw_tbtn_arm(mx, my); }
+            else if (title_btn == 1) { gw_minimize(hit); gw_tbtn_arm(mx, my); }
         }
         last_btn = buttons;
         return;
     }
 
-    /* 拖动态续命判据必须含容差（与优先命中判据的 ±8 一致）：鼠标单帧
-     * 步进超过标题栏高度时（快速竖向拖动 / 低帧率 / QEMU 大步注入），
-     * 光标会落到标题栏下方一点——严格判据会让事件掉进内容区分支，
-     * 拖动当场中断且再也回不来（用户侧现象"有时拖得动有时拖不动"，
-     * 竖向快拖必现；横向不受影响，因为分支判据从不限制 x）。 */
+    /* 标题栏（或已被抓取的拖动态）进入拖动分支。
+     * hit->moving 为真是抓取态：光标在哪都不影响（见上方 pointer grab
+     * 的说明），所以这里不需要任何容差判据。 */
     if (hit->moving || my < hit->y + GW_TITLE_H) {
         /* 标题栏双击：最大化/还原（400ms 内两次按下同一窗口标题栏） */
         static uint32_t last_title_tick = 0;
@@ -3024,8 +3083,132 @@ void gw_handle_mouse(int mx, int my, int buttons)
     last_btn = buttons;
 }
 
+/* ==================================================================
+ * 窗口状态串口转储（F12 触发，探针对账用）
+ * ------------------------------------------------------------------
+ * 为什么需要：GUI 探针（tests/probe_*.py）必须与内核**真实**窗口状态
+ * 逐字段对账，否则"模型说关掉了、屏幕上也没了"这种一致性假象无法
+ * 区分是探针模型错了还是内核真有 bug。2026-10-24 实测 C7 场景：
+ * 探针模型说 notepad 已关闭，内核里它其实还在屏上（只是失焦），
+ * 光看截图分不清是谁错——有了这份转储，一次 F12 就能定位到是
+ * 模型错位还是内核行为与模型不符。
+ *
+ * 通道：**必须** serial_write 直写 COM1。GUI 模式下 terminal_writestring
+ * 已被 g_gfx_hook 重定向进 GUI 终端窗口缓冲，ezos_console_write 的输出
+ * 永远不进串口（见 ezos_console_write 的重定向链）。
+ *
+ * 格式：每行 [GW] 前缀 + 空格分隔的 key=value，机器可解析：
+ *   [GW] seq=7 n=3 focus=1 menu=0 mx=640 my=512
+ *   [GW] w slot=0 app=1 x=116 y=97 w=760 h=640 hid=0 foc=0 max=0
+ *   [GW] end
+ * seq= 自增序号：探针按 F12 后只认**自己那一份**（seq 等于它发出的
+ *       F12 次数），避免拿"上一次迟到"的转储跟当前模型比出假漂移。
+ * focus=99 表示无聚焦窗；app=99 表示非应用窗口（gw_create 直接建、
+ *         没走 gw_spawn_app）；tbx=-1 表示该窗口没有任务栏按钮。
+ * ================================================================== */
+static int gw_sdec(char *b, int n, uint32_t v)
+{
+    char tmp[12];
+    int t = 0;
+    if (!v) tmp[t++] = '0';
+    while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+    while (t) b[n++] = tmp[--t];
+    return n;
+}
+
+static int gw_skey(char *b, int n, const char *k)
+{
+    while (*k) b[n++] = *k++;
+    return n;
+}
+
+static void gw_dump_state_serial(void)
+{
+    char buf[256];
+    int n, i, used = 0, fslot = 99;
+    /* 自增序号：探针按 F12 后会**等自己那一份**转储。若内核忙/串口缓冲慢，
+     * 探针可能先读到**上一次请求迟到**的转储——拿旧状态跟当前模型比就会
+     * 报出根本不存在的"状态漂移"（2026-10-24 C8 op#75 实测：模型刚拖动
+     * 完的位置 vs 上一拍的旧转储 -> 假红）。seq 让探针能精确认领自己的
+     * 那一份，读不到就继续等，而不是拿旧的凑合。 */
+    static uint32_t seq = 0;
+    seq++;
+
+    for (i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used) used++;
+    /* 聚焦 slot：与探针模型的 focused 语义一致（gw_bring_front 唯一
+     * 置 focused=1 的地方；gw_minimize/gw_close 会清掉） */
+    for (i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].focused) { fslot = i; break; }
+
+    n = 0;
+    n = gw_skey(buf, n, "[GW] seq=");
+    n = gw_sdec(buf, n, seq);
+    n = gw_skey(buf, n, " n=");
+    n = gw_sdec(buf, n, (uint32_t)used);
+    n = gw_skey(buf, n, " focus=");
+    n = gw_sdec(buf, n, (uint32_t)fslot);
+    n = gw_skey(buf, n, " menu=");
+    n = gw_sdec(buf, n, gw_start_menu_active ? 1u : 0u);
+    n = gw_skey(buf, n, " mx=");
+    n = gw_sdec(buf, n, (uint32_t)mouse_get_x());
+    n = gw_skey(buf, n, " my=");
+    n = gw_sdec(buf, n, (uint32_t)mouse_get_y());
+    buf[n++] = '\n';
+    buf[n] = 0;
+    serial_write(buf);
+
+    for (i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used) continue;
+        n = 0;
+        n = gw_skey(buf, n, "[GW] w slot=");
+        n = gw_sdec(buf, n, (uint32_t)i);
+        n = gw_skey(buf, n, " app=");
+        n = gw_sdec(buf, n, w->app >= 0 ? (uint32_t)w->app : 99u);
+        n = gw_skey(buf, n, " x=");
+        n = gw_sdec(buf, n, (uint32_t)w->x);
+        n = gw_skey(buf, n, " y=");
+        n = gw_sdec(buf, n, (uint32_t)w->y);
+        n = gw_skey(buf, n, " w=");
+        n = gw_sdec(buf, n, (uint32_t)w->w);
+        n = gw_skey(buf, n, " h=");
+        n = gw_sdec(buf, n, (uint32_t)w->h);
+        n = gw_skey(buf, n, " hid=");
+        n = gw_sdec(buf, n, w->hidden ? 1u : 0u);
+        n = gw_skey(buf, n, " foc=");
+        n = gw_sdec(buf, n, w->focused ? 1u : 0u);
+        n = gw_skey(buf, n, " max=");
+        n = gw_sdec(buf, n, w->maximized ? 1u : 0u);
+        /* 任务栏按钮矩形：探针要按**内核真值**恢复最小化窗 / 点关闭，
+         * 用模型算的位置会落到别的按钮上——按钮宽度上限内核是
+         * gw_scale_x(180)=360，探针模型一直写的 180，标题一长就错位。 */
+        {
+            int tbx = -1, tw = 0;
+            for (int b = 0; ; b++) {
+                gw_window_t *bw;
+                if (!gw_taskbar_btn_rect(b, &bw, &tbx, &tw)) { tbx = -1; tw = 0; break; }
+                if (bw == w) break;
+            }
+            n = gw_skey(buf, n, " tbx=");
+            n = gw_sdec(buf, n, (uint32_t)tbx);
+            n = gw_skey(buf, n, " tw=");
+            n = gw_sdec(buf, n, (uint32_t)tw);
+        }
+        buf[n++] = '\n';
+        buf[n] = 0;
+        serial_write(buf);
+    }
+    serial_write("[GW] end\n");
+}
+
 void gw_handle_key(int key)
 {
+    /* F12：窗口状态串口转储（探针对账用）。必须在**任何**窗口焦点状态
+     * 下都能触发——放在转发给应用 key 回调之前，否则有焦点窗口时
+     * 键会被应用吃掉（Notepad/Terminal 都会吞字符）。 */
+    if (key == KEY_F12) { gw_dump_state_serial(); return; }
+
     /* Alt+Tab：循环切换到下一个可见窗口 */
     if (key == KEY_ALT_TAB) {
         int start = 0;
@@ -3063,12 +3246,12 @@ void gw_handle_key(int key)
 
 void gw_button_ex(int x, int y, int w, int h, const char *label, uint8_t color, int pressed)
 {
-    uint32_t base = 0x0078D7u;
+    uint32_t base = gw_accent;
     if (color == GW_C_GRAY_SLIDER) base = 0xE6E6E6u;
     else if (color == 0x0F) base = 0xFFFFFFu;
-    gw_fill(x, y, w, h, pressed ? CLR_BLUE_DARK : base);
+    gw_fill(x, y, w, h, pressed ? gw_accent_dark : base);
     if (pressed || color != GW_C_GRAY_SLIDER)
-        gw_frame(x, y, w, h, 0x005A9Eu);
+        gw_frame(x, y, w, h, gw_accent_dark);
     else
         gw_frame(x, y, w, h, 0xC8C8C8u);
     int tx = x + (w - gw_strlen(label) * 8) / 2;
@@ -4003,8 +4186,8 @@ int gw_launch_gui_game(int idx)
 void gw_demo(void)
 {
     gw_gui_active = 1;
-    gw_init();
-    gw_win10_palette();
+    gw_win10_palette();   /* 先写默认 Win10 槽位 */
+    gw_init();            /* 再恢复持久化主题（刷新 F0/F1/F2 覆盖默认） */
     gw_quit = 0;
     gw_dirty = 1;
     /* GUI 模式下 shell 输出重定向到终端窗口缓冲 */

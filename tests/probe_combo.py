@@ -63,8 +63,9 @@ APP_WH = {
     "browser":  (1000, 768, "Browser"),
     "about":    (640, 384, "About Cerulia"),
     "terminal": (840, 640, "Terminal"),
-    "sysinfo":  (680, 555, "System Info"),
+    "sysinfo":  (680, 554, "System Info"),
     "clock":    (400, 512, "Clock"),
+    "paint":    (274, 179, "Paint"),   # PT_TB_W+PT_CW+8 x PT_CH+GW_TITLE_H+7
 }
 TITLE_CY_OFF = 6
 START_BTN = (24, 1008)
@@ -146,10 +147,19 @@ class Wins(object):
 
 
 def rm(path):
+    """删文件，但**任何异常都必须吞掉**。
+
+    沙箱的 safe-delete hook 会拦 os.remove（连"打开着供 QEMU 写的串口
+    log"都拦），且抛出的**不是 OSError** 而是 hook 自己的异常类型——
+    只捕 OSError 会在探针刚打出 "PASS boot reaches shell" 之后炸掉，
+    现象"莫名退出码 1、没有任何 FAIL"（2026-10-25 fuzz 42e 实测：
+    rm(temp/fuzz_serial.log) 被拦 -> RuntimeError 冒到 main 外）。
+    这里删不掉无所谓：串口 log 是覆盖写，QEMU 用 file: 模式会自己截断。
+    """
     try:
         if os.path.isfile(path):
             os.remove(path)
-    except OSError:
+    except Exception:
         pass
 
 
@@ -205,14 +215,21 @@ class Qmp(object):
         for ch in s:
             self.key(ch)
 
-    def move_to(self, x, y):
+    def move_to(self, x, y, step=12, delay=0.04):
+        """相对移动到 (x,y)。step 是每帧最大像素步进。
+
+        step=12 用于精确点击（内核 PS/2 鼠标是相对设备，单次位移过大会
+        被 9 位有符号增量截断成 ±255/包而走偏）。停车位这类"只要大致
+        到那附近"的移动用大 step（64）以省时间——内核对无按键的纯移动
+        不敏感，只影响 hover 重绘。
+        """
         while self.cx != x or self.cy != y:
-            dx = max(-12, min(12, x - self.cx))
-            dy = max(-12, min(12, y - self.cy))
+            dx = max(-step, min(step, x - self.cx))
+            dy = max(-step, min(step, y - self.cy))
             self.hmc("mouse_move %d %d" % (dx, dy))
             self.cx += dx
             self.cy += dy
-            time.sleep(0.04)
+            time.sleep(delay)
         time.sleep(0.12)
 
     def click(self, x, y):
@@ -233,14 +250,20 @@ class Qmp(object):
         self.hmc("mouse_button 0")
         time.sleep(0.4)
 
-    def drag(self, x0, y0, x1, y1):
-        """按住拖动：标题栏按下 -> 分步移动 -> 释放在终点"""
+    def drag(self, x0, y0, x1, y1, step=12):
+        """按住拖动：标题栏按下 -> 分步移动 -> 释放在终点
+
+        step 是**每个鼠标包的位移**。默认 12（等价于真机 100Hz 下
+        1200px/s 的常规拖动）；step=24 用于钉"快速拖动不掉窗"——真机
+        PS/2 甩动单包可达 20px，内核必须靠指针抓取而不是几何容差去
+        维持拖动态（2026-10-24 combo2 C14）。
+        """
         self.move_to(x0, y0)
         self.hmc("mouse_button 1")
         time.sleep(0.12)
         while self.cx != x1 or self.cy != y1:
-            dx = max(-12, min(12, x1 - self.cx))
-            dy = max(-12, min(12, y1 - self.cy))
+            dx = max(-step, min(step, x1 - self.cx))
+            dy = max(-step, min(step, y1 - self.cy))
             self.hmc("mouse_move %d %d" % (dx, dy))
             self.cx += dx
             self.cy += dy
@@ -252,6 +275,15 @@ class Qmp(object):
     def shot(self, path):
         # 不预删：screendump 直接覆盖写。沙箱对单 turn 累计删除数有阈值
         # （~50），预删会把 finally 的清理额度耗尽触发拦截。
+        #
+        # ★ screendump 之前必须等：QEMU 的 screendump 与内核写 LFB **并发**，
+        #   内核正在重绘时拍到的是半成品帧。局部重绘路径
+        #   (gw_redraw_region) 先全屏画桌面、再画与区域相交的窗口，于是
+        #   半成品帧表现为"桌面图标在、窗口整窗不见了"
+        #   （2026-10-24 combo2 C2a 实测：sysinfo 整窗消失，只剩桌面图标绿；
+        #    dbg_c2c 复现：F12 后立刻拍=坏帧，+1.5s 再拍=正常）。
+        #   内核静止后 LFB 不再变，等待即可；实测全屏重绘最长约 1s。
+        time.sleep(float(os.environ.get("EZOS_SHOT_SETTLE", "1.2")))
         self.hmc("screendump " + path)
         time.sleep(0.4)
         return path

@@ -35,6 +35,10 @@ void gfx_init(void);            // 初始化图形模式（优先 VBE 多分辨�
 void gfx_restore_text(void);    // 恢复 80x25 文本模式
 void gfx_text_font_init(void);  // 启动时把内置 8x16 字体写入 VGA plane 2，统一文本模式字体
 void gfx_set_palette(void);     // 设置 256 色调色板
+/* 主题强调色刷新 Win10 调色板槽位 F0/F1/F2（8bpp 走 DAC，16/32bpp 走 LUT）。
+ * 切主题时 gfxwin 调用；此前只有 8bpp 的 DAC 被刷新，16bpp 的
+ * gfx_palette16[0xF0..0xF2] 永远是 gfx_set_palette 的默认蓝。 */
+void gfx_theme_accent(uint32_t accent);
 void gfx_load_font(void);       // 从 VGA 字体 ROM 读取 8x8 字体
 void gfx_putpixel(int x, int y, uint8_t color);
 void gfx_fill_rect(int x, int y, int w, int h, uint8_t color);

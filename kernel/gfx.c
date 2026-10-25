@@ -621,6 +621,50 @@ void gfx_set_palette(void) {
     }
 }
 
+/* 单个调色板槽位按当前 bpp 写入（16bpp=RGB565，32bpp=0xAARRGGBB 且
+ * 通道序随 gfx_fmt；8bpp 由调用方走 DAC） */
+static void gfx_pal_slot(int i, uint32_t rgb)
+{
+    uint8_t r = (uint8_t)(rgb >> 16), g = (uint8_t)(rgb >> 8), b = (uint8_t)rgb;
+    if (gfx_bpp == 2) {
+        gfx_palette16[i] = rgb565(r, g, b);
+    } else if (gfx_bpp == 4) {
+        if (gfx_fmt == 1)
+            gfx_palette32[i] = (uint32_t)b | ((uint32_t)g << 8) |
+                               ((uint32_t)r << 16) | 0xFF000000u;
+        else
+            gfx_palette32[i] = (uint32_t)r | ((uint32_t)g << 8) |
+                               ((uint32_t)b << 16) | 0xFF000000u;
+    }
+}
+
+void gfx_theme_accent(uint32_t accent)
+{
+    uint32_t d = (accent * 3) / 4;                  /* 暗一档 */
+    uint32_t l = accent + (0xFFFFFFu - accent) / 3; /* 亮一档 */
+    if (gfx_bpp != 2 && gfx_bpp != 4) {
+        /* 8bpp：DAC（6 位）——与 gfxwin 旧的 gw_set_theme 内联块一致 */
+        outb(0x3C8, 0xF0);
+        outb(0x3C9, (uint8_t)((accent >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((accent >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(accent & 0xFF) >> 2);
+        outb(0x3C8, 0xF1);
+        outb(0x3C9, (uint8_t)((d >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((d >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(d & 0xFF) >> 2);
+        outb(0x3C8, 0xF2);
+        outb(0x3C9, (uint8_t)((l >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((l >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(l & 0xFF) >> 2);
+        return;
+    }
+    /* 16/32bpp：putpixel 走 LUT，不刷新则标题文字背景（GW_C_BLUE_DARK）
+     * 永远是 gfx_set_palette 写死的默认蓝，与主题 accent 脱钩 */
+    gfx_pal_slot(0xF0, accent);
+    gfx_pal_slot(0xF1, d);
+    gfx_pal_slot(0xF2, l);
+}
+
 // ---- 从 VGA 字体 ROM 读 8x8 字体（旧实现，先留着） ----
 //void gfx_load_font(void) {
 //    outb(0x3CE, 0x04); outb(0x3CF, 0x02);
