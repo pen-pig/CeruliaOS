@@ -1,0 +1,321 @@
+/*
+ * syscall.c - 系统调用实现 + 用户态启动（步骤 4c）
+ */
+#include "syscall.h"
+#include "idt.h"
+#include "tty.h"
+#include "keyboard.h"
+#include "paging.h"
+#include "panic.h"
+#include "task.h"
+#include "fd.h"
+#include "fs.h"
+#include "net.h"
+
+/* kernel_entry.asm */
+extern void syscall_entry(void);
+extern int  enter_usermode(uint32_t entry, uint32_t user_esp);
+extern uint32_t g_user_exited;
+
+static uint32_t g_syscalls;
+
+/* ---------- 无 libc 的小工具 ---------- */
+static uint32_t us_len(const char *s) {
+    uint32_t n = 0;
+    while (s && s[n]) n++;
+    return n;
+}
+
+static void us_copy(void *dst, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+}
+
+/* ---------- 用户指针校验（安全边界） ---------- */
+/*
+ * 要求 [va, va+len) 范围内每一页都：
+ *   1) 已映射（present）——否则内核解引用用户指针会 #PF
+ *   2) 带 PTE_US——否则用户可借系统调用读写任意内核内存
+ *   3) writable=1 时还须带 PTE_RW——内核会写这块内存。少了这条，
+ *      用户只要传一个只读页（将来 .text 按 W^X 映射为 RO 就是），
+ *      就能让内核在解引用时 #PF 崩溃，等于一条本地 DoS。
+ * 长度 0 视为通过（无需解引用）。
+ */
+static int user_range_ok(uint32_t va, uint32_t len, int writable) {
+    if (len == 0) return 1;
+    if (va + len < va) return 0;                 /* 地址环绕 */
+    uint32_t first = va & ~(uint32_t)0xFFF;
+    uint32_t last  = (va + len - 1) & ~(uint32_t)0xFFF;
+    for (uint32_t p = first; ; p += 0x1000u) {
+        uint32_t phys = 0, flags = 0;
+        if (paging_query(p, &phys, &flags) != 0) return 0;
+        if (!(flags & PTE_US)) return 0;
+        if (writable && !(flags & PTE_RW)) return 0;
+        if (p == last) break;
+    }
+    return 1;
+}
+
+/* 系统调用陷入时压好的完整寄存器帧地址，由 syscall_entry 汇编在 call 之前存好
+ * （boot/kernel_entry.asm）。用它是为了**摆脱对 C 函数 prologue 的依赖**——
+ * 之前在 syscall_handler 第一条语句读 esp 再按固定下标索引，那个下标随编译器
+ * 生成的 prologue（push 几个 callee-saved、sub 多少局部空间）变化，函数一改就静默错位。
+ * 布局（相对该基址，单位字节）：
+ *   +0 eax  +4 ebx  +8 ecx  +12 edx        （syscall_handler 的四个参数槽）
+ *   +16 edi +20 esi +24 ebp +28 esp        （pusha 区前半）
+ *   +32 ebx +36 edx +40 ecx +44 eax        （pusha 区后半）
+ *   +48 gs  +52 fs  +56 es  +60 ds
+ *   +64 EIP +68 CS  +72 EFLAGS +76 ESP +80 SS   （int 0x80 从 ring3 陷入的 iret 帧）
+ */
+extern uint32_t g_syscall_frame;
+
+/* ---------- 系统调用分发 ---------- */
+int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
+
+    g_syscalls++;
+    task_t *cur = task_current();
+
+    switch (num) {
+    case SYS_WRITE: {
+        uint32_t fd = a1;
+        const char *buf = (const char *)a2;
+        uint32_t n = a3;
+        if (!user_range_ok(a2, n, 0)) return -1;   /* 只读访问用户缓冲 */
+        if (cur == 0) return -1;
+        return fd_write(&cur->fds, (int)fd, (const uint8_t *)buf, n);
+    }
+    case SYS_READ: {
+        /* 步骤 8a：stdin 是阻塞读——键盘缓冲空时 fd_read 会把当前任务
+         * 睡到 IRQ1（keyboard_block），其它 fd 照旧同步返回。 */
+        uint32_t fd = a1;
+        char *buf = (char *)a2;
+        uint32_t n = a3;
+        if (!user_range_ok(a2, n, 1)) return -1;   /* 内核要写，必须可写 */
+        if (cur == 0) return -1;
+        return fd_read(&cur->fds, (int)fd, (uint8_t *)buf, n);
+    }
+    case SYS_OPEN: {
+        /* 文件名是用户指针：逐字节校验并拷进内核栈缓冲 */
+        const char *u_name = (const char *)a1;
+        int flags = (int)a2;
+        char kname[FD_MAX_NAME];
+        uint32_t i = 0;
+        while (i < FD_MAX_NAME - 1) {
+            if (!user_range_ok(a1 + i, 1, 0)) return -1;
+            char c = u_name[i];
+            if (c == '\0') break;
+            kname[i] = c;
+            i++;
+        }
+        if (i >= FD_MAX_NAME - 1) return -1;       /* 未遇 NUL：过长 */
+        kname[i] = '\0';
+        if (cur == 0) return -1;
+        return fd_open(&cur->fds, kname, flags);
+    }
+    case SYS_CLOSE: {
+        uint32_t fd = a1;
+        if (cur == 0) return -1;
+        return fd_close(&cur->fds, (int)fd);
+    }
+    case SYS_PIPE: {
+        /* ebx = 用户态 int fds[2]，内核写回两个 fd 号（须可写）。
+         * 与 read 同一风格：失败返回 -1。 */
+        int *fds = (int *)a1;
+        if (!user_range_ok(a1, 2u * sizeof(int), 1)) return -1;
+        if (cur == 0) return -1;
+        return fd_pipe(&cur->fds, fds);
+    }
+    case SYS_LSEEK: {
+        uint32_t fd = a1;
+        int32_t offset = (int32_t)a2;
+        int whence = (int)a3;
+        if (cur == 0) return -1;
+        return fd_lseek(&cur->fds, (int)fd, offset, whence);
+    }
+    case SYS_SOCKCALL: {
+        /* Linux i386 socketcall(102) style: ebx=subcmd, ecx=user u32 args[5].
+         * The args array itself is copied in here; pointers INSIDE it
+         * are validated by net.c at point of use (net_sockcall). */
+        const uint32_t *ua = (const uint32_t *)a2;
+        uint32_t ka[5];
+        if (!user_range_ok(a2, sizeof(ka), 0)) return -1;
+        for (int i = 0; i < 5; i++) ka[i] = ua[i];
+        return net_sockcall(a1, ka);
+    }
+    case SYS_FORK: {
+        /* 复制当前用户进程：父返回子 pid，子返回 0；非用户进程或失败返回 -1。
+         * fesp 携带父进程的用户寄存器帧，使子进程从 fork 调用点之后原样继续。 */
+        if (cur == 0 || cur->is_user == 0) return -1;
+        int rc_fork = task_fork((void *)g_syscall_frame);
+        return rc_fork;
+    }
+    case SYS_WAITPID: {
+        /* 等待指定 pid 退出并取退出码（阻塞睡眠，非忙等）。
+         * ebx=pid，ecx=status 用户指针（可为 0），edx=options：
+         *   0      阻塞直到退出（或被其它 waiter 收走）
+         *   WNOHANG 子进程还在跑则立即返回 0（不收割），已退出则回收并返回 pid */
+        int pid = (int)a1;
+        int *status = (int *)a2;
+        int options = (int)a3;
+        if (status != 0 && !user_range_ok(a2, sizeof(int), 1)) return -1;
+        int code = task_wait_pid_opt(pid, options);
+        if (code == -1) return -1;              /* pid 不存在/已被收走 */
+        if (code == -2) return 0;               /* WNOHANG：仍在运行，未收割 */
+        if (status != 0) *status = code;        /* 退出码写回用户空间 */
+        return pid;                             /* waitpid 成功返回被等进程的 pid */
+    }
+    case SYS_GETPID:
+        /* libc getpid()：返回当前进程的 pid（用户态后台任务打印 [n] pid 用）。 */
+        return (cur != 0) ? (int)cur->pid : 0;
+    case SYS_READDIR: {
+        /* ebx=路径（用户指针，逐字节校验拷进核内缓冲，同 SYS_OPEN），
+         * ecx=用户 user_dirent_t[]（与内核 fs_dir_entry_t 同布局），
+         * edx=容量。一次性填完：成功返回条目数（0=空目录），失败 -1。
+         *
+         * 输出缓冲**校验后直写**（fs_read_dir_path 直接写用户内存），与
+         * SYS_READ 让 fd_read 直写用户缓冲同一风格——内核侧不留 static
+         * 暂存，多任务并发各自写各自的页，没有共享状态可踩。
+         * 乘法前先查 edx 上界：count*sizeof 回绕会把校验长度变成 0，
+         * 之后的大段写入全部落在未校验内存上（本项目经典事故形态）。 */
+        uint32_t max = a3;
+        if (max == 0 || max > MAX_READDIR_ENTRIES) return -1;
+        if (!user_range_ok(a2, max * (uint32_t)sizeof(fs_dir_entry_t), 1))
+            return -1;
+        char kpath[256];
+        uint32_t i = 0;
+        while (i < sizeof(kpath) - 1) {
+            if (!user_range_ok(a1 + i, 1, 0)) return -1;
+            char c = ((const char *)a1)[i];
+            if (c == '\0') break;
+            kpath[i] = c;
+            i++;
+        }
+        if (i >= sizeof(kpath) - 1) return -1;       /* 未遇 NUL：过长 */
+        kpath[i] = '\0';
+        return fs_read_dir_path(kpath, (fs_dir_entry_t *)a2, (int)max);
+    }
+    case SYS_STAT: {
+        /* ebx=路径（逐字节拷核内），ecx=用户 user_stat_t*（8 字节：
+         * +0 uint32 size, +4 uint8 is_dir，其余为对齐填充）。
+         * 存在写回属性返回 0；不存在/未挂载 -1。 */
+        char kpath[256];
+        uint32_t i = 0;
+        while (i < sizeof(kpath) - 1) {
+            if (!user_range_ok(a1 + i, 1, 0)) return -1;
+            char c = ((const char *)a1)[i];
+            if (c == '\0') break;
+            kpath[i] = c;
+            i++;
+        }
+        if (i >= sizeof(kpath) - 1) return -1;
+        kpath[i] = '\0';
+        if (!user_range_ok(a2, 8, 1)) return -1;
+        uint32_t size = 0;
+        uint8_t is_dir = 0;
+        if (fs_stat(kpath, &size, &is_dir) != 0) return -1;
+        uint8_t *out = (uint8_t *)a2;
+        out[0] = (uint8_t)(size & 0xFF);
+        out[1] = (uint8_t)((size >> 8) & 0xFF);
+        out[2] = (uint8_t)((size >> 16) & 0xFF);
+        out[3] = (uint8_t)((size >> 24) & 0xFF);
+        out[4] = is_dir;
+        return 0;
+    }
+    case SYS_EXIT:
+        if (cur != 0 && cur->is_user) {
+            /* 用户进程退出（步骤 6c）：拆地址空间、关 fd、记退出码并让出 CPU。
+             * 它不会返回——本任务的 ring3 上下文就此作废。 */
+            process_exit((int)a1);
+        }
+        /* utest 的内建用户程序：同步演示路径（task 0 上跑，没有独立地址空间），
+         * 靠 g_user_exited 让 syscall_entry 直接回到 enter_usermode() 的调用者 */
+        g_user_exited = 1;
+        return (int)a1;
+    default:
+        return -1;
+    }
+}
+
+uint32_t syscall_count(void) { return g_syscalls; }
+
+void syscall_init(void) {
+    /* 0xEE = 32-bit 中断门，DPL=3：允许 ring3 执行 int 0x80。
+     * 用 0x8E（DPL=0）的话用户态 int 0x80 会直接 #GP。 */
+    idt_set_gate(SYSCALL_VECTOR, (uint32_t)syscall_entry, 0x08, 0xEE);
+}
+
+/* ---------- 内建用户程序 ---------- */
+/*
+ * 32-bit 平面机器码（无重定位，装载到 USER_CODE_VA）：
+ *
+ *   mov eax, SYS_WRITE ; mov ebx, 1 ; mov ecx, msg1 ; mov edx, len1 ; int 0x80
+ *   mov eax, SYS_WRITE ; mov ebx, 1 ; mov ecx, msg2 ; mov edx, len2 ; int 0x80
+ *   mov eax, SYS_EXIT  ; mov ebx, 0 ; int 0x80
+ *   msg1 / msg2（紧跟在代码后，地址在装载时回填）
+ *
+ * 两条 write 各往返一次 ring3->ring0->ring3，足以证明返回路径正确。
+ * imm32 的偏移：ecx@11, edx@16（第一条）；ecx@33, edx@38（第二条）。
+ */
+static const uint8_t user_prog[] = {
+    0xB8, 0x01, 0x00, 0x00, 0x00,       /* 00 mov eax,1        */
+    0xBB, 0x01, 0x00, 0x00, 0x00,       /* 05 mov ebx,1        */
+    0xB9, 0x00, 0x00, 0x00, 0x00,       /* 10 mov ecx,imm32    */
+    0xBA, 0x00, 0x00, 0x00, 0x00,       /* 15 mov edx,imm32    */
+    0xCD, 0x80,                         /* 20 int 0x80         */
+    0xB8, 0x01, 0x00, 0x00, 0x00,       /* 22 mov eax,1        */
+    0xBB, 0x01, 0x00, 0x00, 0x00,       /* 27 mov ebx,1        */
+    0xB9, 0x00, 0x00, 0x00, 0x00,       /* 32 mov ecx,imm32    */
+    0xBA, 0x00, 0x00, 0x00, 0x00,       /* 37 mov edx,imm32    */
+    0xCD, 0x80,                         /* 42 int 0x80         */
+    0xB8, 0x02, 0x00, 0x00, 0x00,       /* 44 mov eax,2        */
+    0xBB, 0x00, 0x00, 0x00, 0x00,       /* 49 mov ebx,0        */
+    0xCD, 0x80,                         /* 54 int 0x80         */
+};
+#define USER_PROG_SIZE   sizeof(user_prog)      /* 56 */
+
+static const char user_msg1[] = "[ring3] hello from user mode (int 0x80 write)\n";
+static const char user_msg2[] = "[ring3] second syscall returned to ring3 OK\n";
+
+int usermode_run_demo(void) {
+    /* 1) 用户页：代码页 + 栈页，都是 identity 物理页，权限加 PTE_US */
+    uint32_t stack_page = USER_STACK_TOP - 0x1000u;
+    if (paging_map(USER_CODE_VA, USER_CODE_VA, PAGING_USR_FLAGS) != 0) return -1;
+    if (paging_map(stack_page, stack_page, PAGING_USR_FLAGS) != 0) return -1;
+
+    /* 2) 装入程序 + 回填字符串地址 */
+    uint8_t *code = (uint8_t *)USER_CODE_VA;
+    us_copy(code, user_prog, USER_PROG_SIZE);
+
+    char *m1 = (char *)(USER_CODE_VA + USER_PROG_SIZE);
+    uint32_t l1 = us_len(user_msg1);
+    us_copy(m1, user_msg1, l1 + 1);
+
+    char *m2 = m1 + l1 + 1;
+    uint32_t l2 = us_len(user_msg2);
+    us_copy(m2, user_msg2, l2 + 1);
+
+    *(uint32_t *)(code + 11) = (uint32_t)m1;
+    *(uint32_t *)(code + 16) = l1;
+    *(uint32_t *)(code + 33) = (uint32_t)m2;
+    *(uint32_t *)(code + 38) = l2;
+
+    /* 3) 用户态执行期间若崩，panic 屏能显示这条上下文 */
+    panic_set_context("ring3 user program");
+
+    /* 4) 切入 ring3。用户程序 SYS_EXIT 前不返回。 */
+    int rc = enter_usermode(USER_CODE_VA, USER_STACK_TOP);
+
+    panic_set_context("shell");
+    return rc;
+}
+
+/* 供 shell/自检调用：确认安全边界确实拒绝非用户页（只读语义） */
+int syscall_user_range_ok(uint32_t va, uint32_t len) {
+    return user_range_ok(va, len, 0);
+}
+
+/* 自检用可写语义：拒绝"已映射用户页但只读"的情况 */
+int syscall_user_range_rw(uint32_t va, uint32_t len) {
+    return user_range_ok(va, len, 1);
+}

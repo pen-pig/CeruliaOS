@@ -1,0 +1,18 @@
+﻿== phase ping: guest `ping 10.0.2.2` ==
+D:\Python315\python3.15t.exe : Traceback (most recent call last):
+所在位置 行:15 字符: 2025
++ ... st_dns")) { D:\Python315\python3.15t.exe -u tests\$t.py *> out_$t.txt ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\MyOS\src\tests\test_netapp.py", line 344, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "D:\MyOS\src\tests\test_netapp.py", line 337, in main
+    phase_ping()
+    ~~~~~~~~~~^^
+  File "D:\MyOS\src\tests\test_netapp.py", line 250, in phase_ping
+    assert arp_done, "guest never ARP-requested the peer"
+           ^^^^^^^^
+AssertionError: guest never ARP-requested the peer

@@ -1,0 +1,1236 @@
+/*
+ * fs.c - 文件系统统一分发层（exFAT / FAT12 / FAT16 / FAT32 + ext4/NTFS/F2FS/EROFS 只读）
+ *
+ * 挂载策略：
+ *   1) 首选数据盘（默认从盘 1）优先：先试 exFAT，再扫 MBR 各分区挂 FAT，
+ *      然后依次探测 ext4 / NTFS / F2FS / EROFS（含整盘 superfloppy 卷）；
+ *   2) 首选盘无文件系统时依次尝试其余驱动器（0-3，含副 ATA 总线）；
+ *   3) 全部失败：首选盘有介质返回 -2（可触发格式化），无介质返回 -1。
+ *
+ * fs_create_file 统一为 create-or-replace 语义：先删旧文件再建新文件，
+ * 修复记事本/vi/write 对已存在文件二次保存失败的存量问题。
+ *
+ * 只读文件系统（ext4/NTFS/F2FS/EROFS）：
+ *   - 读/列目录/cd 正常工作，cwd 由本层拼接为绝对路径后交给驱动；
+ *   - 写操作（create/delete/mkdir）返回 -1，fs_is_readonly() 供上层提示。
+ */
+#include "fs.h"
+#include "exfat.h"
+#include "fat.h"
+#include "ext4.h"
+#include "ntfs.h"
+#include "f2fs.h"
+#include "erofs.h"
+#include "refs.h"
+#include "ata.h"
+#include "ahci.h"
+#include "sysvol.h"
+#include "dmesg.h"
+#include "fsck.h"
+#include "task.h"
+#include "irqflags.h"
+#include "user.h"
+
+/* 布局一致性编译期检查：三种目录项结构被互相强转（cmd_ls 直接拿
+ * fat_dir_entry_t* / exfat_dir_entry_t* 当 fs_dir_entry_t* 用，省一份拷贝），
+ * 所以必须逐字节一致。**只比 sizeof 是不够的**：把 size 和 is_dir 换个顺序，
+ * 结构体总长不变、旧断言照样通过，而读出来的 size 会变成 is_dir 拼上填充
+ * 字节的垃圾——所以每个字段的偏移也要卡住。 */
+_Static_assert(sizeof(fs_dir_entry_t) == sizeof(exfat_dir_entry_t),
+               "fs_dir_entry_t / exfat_dir_entry_t size mismatch");
+_Static_assert(sizeof(fs_dir_entry_t) == sizeof(fat_dir_entry_t),
+               "fs_dir_entry_t / fat_dir_entry_t size mismatch");
+#define FS_DE_SAME_FIELD(other, field)                                      \
+    _Static_assert(__builtin_offsetof(fs_dir_entry_t, field) ==             \
+                   __builtin_offsetof(other, field),                        \
+                   "dir entry layout mismatch on field " #field)
+FS_DE_SAME_FIELD(exfat_dir_entry_t, name);
+FS_DE_SAME_FIELD(exfat_dir_entry_t, size);
+FS_DE_SAME_FIELD(exfat_dir_entry_t, is_dir);
+FS_DE_SAME_FIELD(fat_dir_entry_t, name);
+FS_DE_SAME_FIELD(fat_dir_entry_t, size);
+FS_DE_SAME_FIELD(fat_dir_entry_t, is_dir);
+
+static int      fs_type_cur = FS_NONE;
+static uint8_t  fs_drive_cur = 0;
+static uint8_t  fs_preferred_drive = 1;    /* 数据盘默认从盘 */
+static fs_info_t fs_volume;
+static char     ro_cwd[256] = "/";         /* 只读文件系统的 cwd（绝对路径） */
+static uint32_t fs_generation;
+static int fs_operation_busy;
+static wait_queue_t fs_operation_waiters = { -1 };
+
+void fs_operation_lock(void) {
+    uint32_t flags = irq_save_disable();
+    while (fs_operation_busy) {
+        task_sleep(&fs_operation_waiters, 2);
+        asm volatile("cli" ::: "memory");
+    }
+    fs_operation_busy = 1;
+    irq_restore(flags);
+}
+
+void fs_operation_unlock(void) {
+    uint32_t flags = irq_save_disable();
+    fs_operation_busy = 0;
+    task_wake_all(&fs_operation_waiters);
+    irq_restore(flags);
+}
+
+uint32_t fs_mount_generation(void) { return fs_generation; }
+
+/* 分区表项的合法起始扇区上限（128GB/512B 扇区），过滤损坏表项 */
+#define FS_PART_LBA_LIMIT 0x08000000u
+
+static uint32_t fs_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void fs_fill_info(void) {
+    fs_volume.type = (uint8_t)fs_type_cur;
+    fs_volume.drive = fs_drive_cur;
+    if (fs_type_cur == FS_EXFAT) {
+        const exfat_info_t *e = exfat_get_info();
+        fs_volume.part_start = (uint32_t)e->partition_offset;
+        fs_volume.bytes_per_sector = e->bytes_per_sector;
+        fs_volume.sectors_per_cluster = e->sectors_per_cluster;
+        fs_volume.cluster_count = e->cluster_count;
+        fs_volume.volume_sectors = (uint32_t)e->volume_length;
+    } else if (fs_type_cur == FS_EXT4) {
+        const ext4_info_t *x = ext4_get_info();
+        fs_volume.part_start = x->part_start;
+        fs_volume.bytes_per_sector = x->bytes_per_sector;
+        fs_volume.sectors_per_cluster = x->sectors_per_cluster;
+        fs_volume.cluster_count = x->cluster_count;
+        fs_volume.volume_sectors = x->volume_sectors;
+    } else if (fs_type_cur == FS_NTFS) {
+        const ntfs_info_t *n = ntfs_get_info();
+        fs_volume.part_start = n->part_start;
+        fs_volume.bytes_per_sector = n->bytes_per_sector;
+        fs_volume.sectors_per_cluster = n->sectors_per_cluster;
+        fs_volume.cluster_count = n->cluster_count;
+        fs_volume.volume_sectors = n->volume_sectors;
+    } else if (fs_type_cur == FS_F2FS) {
+        const f2fs_info_t *f = f2fs_get_info();
+        fs_volume.part_start = f->part_start;
+        fs_volume.bytes_per_sector = f->bytes_per_sector;
+        fs_volume.sectors_per_cluster = f->sectors_per_cluster;
+        fs_volume.cluster_count = f->cluster_count;
+        fs_volume.volume_sectors = f->volume_sectors;
+    } else if (fs_type_cur == FS_EROFS) {
+        const erofs_info_t *r = erofs_get_info();
+        fs_volume.part_start = r->part_start;
+        fs_volume.bytes_per_sector = r->bytes_per_sector;
+        fs_volume.sectors_per_cluster = r->sectors_per_cluster;
+        fs_volume.cluster_count = r->cluster_count;
+        fs_volume.volume_sectors = r->volume_sectors;
+    } else if (fs_type_cur == FS_REFS) {
+        const refs_info_t *r = refs_get_info();
+        fs_volume.part_start = r->part_start;
+        fs_volume.bytes_per_sector = r->bytes_per_sector;
+        fs_volume.sectors_per_cluster = r->sectors_per_cluster;
+        fs_volume.cluster_count = r->cluster_count;
+        fs_volume.volume_sectors = r->volume_sectors;
+    } else {
+        const fat_info_t *f = fat_get_info();
+        fs_volume.part_start = f->part_start;
+        fs_volume.bytes_per_sector = f->bytes_per_sector;
+        fs_volume.sectors_per_cluster = f->sectors_per_cluster;
+        fs_volume.cluster_count = f->cluster_count;
+        fs_volume.volume_sectors = f->total_sectors;
+    }
+}
+
+/* 在 drive 上尝试挂载 FAT：扫 MBR 主分区 + superfloppy；成功返回 12/16/32 */
+static int fat_try_mount(uint8_t drive) {
+    uint8_t sec[512];
+    if (ata_read_sector(drive, 0, sec) != 0) return 0;
+
+    if (sec[510] == 0x55 && sec[511] == 0xAA) {
+        int has_part = 0;
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *entry = sec + 446 + i * 16;
+            if (entry[4] == 0) continue;
+            has_part = 1;
+            uint32_t start = entry[8] | ((uint32_t)entry[9] << 8) |
+                             ((uint32_t)entry[10] << 16) | ((uint32_t)entry[11] << 24);
+            uint32_t len = entry[12] | ((uint32_t)entry[13] << 8) |
+                           ((uint32_t)entry[14] << 16) | ((uint32_t)entry[15] << 24);
+            if (start == 0 || start >= FS_PART_LBA_LIMIT || len == 0) continue;
+            int t = fat_mount(drive, start);
+            if (t == 12 || t == 16 || t == 32) return t;
+        }
+        if (has_part) return 0;   /* 有分区表但都不是 FAT：不再按 superfloppy 解析 */
+    }
+
+    /* 无 MBR 签名（或空分区表）：整盘 FAT 卷 */
+    int t = fat_mount(drive, 0);
+    if (t == 12 || t == 16 || t == 32) return t;
+    return 0;
+}
+
+/* 只读文件系统探测函数类型：(drive, 卷起始 LBA) -> 0=挂载成功 */
+typedef int (*fs_ro_probe_fn)(uint8_t drive, uint32_t part_start);
+
+/* 扫 MBR 主分区 + superfloppy 尝试只读文件系统；成功返回 1 */
+static int fs_scan_ro(uint8_t drive, fs_ro_probe_fn probe) {
+    uint8_t sec[512];
+    if (ata_read_sector(drive, 0, sec) != 0) return 0;
+
+    if (sec[510] == 0x55 && sec[511] == 0xAA) {
+        int has_part = 0;
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *entry = sec + 446 + i * 16;
+            if (entry[4] == 0) continue;
+            has_part = 1;
+            uint32_t start = fs_rd32(entry + 8);
+            uint32_t len = fs_rd32(entry + 12);
+            if (start == 0 || start >= FS_PART_LBA_LIMIT || len == 0) continue;
+            if (probe(drive, start) == 0) return 1;
+        }
+        if (has_part) return 0;   /* 有分区表但都不匹配：不再按 superfloppy 解析 */
+    }
+    return probe(drive, 0) == 0;  /* 无 MBR 签名：整盘卷 */
+}
+
+/* 在 drive 上尝试挂载四种只读文件系统；成功置 fs_type_cur 并返回 1 */
+static int fs_try_ro_drives(uint8_t drive) {
+    if (fs_scan_ro(drive, ext4_mount)) {
+        fs_type_cur = FS_EXT4;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        /* 挂载即修复：崩溃窗口留下的"位图已分配、目录树够不到"的孤儿
+         * inode 在第一次挂载时回收。FAT/exFAT 走显式 fsck -a。 */
+        uint32_t e4n = 0;
+        if (ext4_fsck_repair(&e4n) == 0 && e4n > 0)
+            fsck_repair_note("ext4", e4n, "orphan inode(s)");
+        return 1;
+    }
+    if (fs_scan_ro(drive, ntfs_mount)) {
+        fs_type_cur = FS_NTFS;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+    if (fs_scan_ro(drive, f2fs_mount)) {
+        fs_type_cur = FS_F2FS;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+    if (fs_scan_ro(drive, erofs_mount)) {
+        fs_type_cur = FS_EROFS;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+    if (fs_scan_ro(drive, refs_mount)) {
+        fs_type_cur = FS_REFS;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+    return 0;
+}
+
+/* 在 drive 上尝试任意文件系统；成功置 fs_type_cur 并返回 1 */
+static int fs_try_drive(uint8_t drive) {
+    /* 快速判存：空插槽对 IDENTIFY 无应答，避免后续读盘等满超时 */
+    if (!ata_drive_present(drive)) return 0;
+
+    /* exFAT 后端：exfat_init 自带 MBR 扫描与 superfloppy 回退 */
+    exfat_set_drive(drive);
+    if (exfat_init() == 0) {
+        fs_type_cur = FS_EXFAT;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+
+    int t = fat_try_mount(drive);
+    if (t == 12 || t == 16 || t == 32) {
+        fs_type_cur = t;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
+
+    /* 只读文件系统：ext4 -> NTFS -> F2FS -> EROFS */
+    return fs_try_ro_drives(drive);
+}
+
+static int fs_is_fat(void) {
+    return fs_type_cur == FS_FAT12 || fs_type_cur == FS_FAT16 || fs_type_cur == FS_FAT32;
+}
+
+/* 绝对路径型驱动（ext4/NTFS/F2FS/EROFS/ReFS）：cwd 由本层拼接，驱动收绝对路径 */
+static int fs_is_ro(void) {
+    return fs_type_cur == FS_EXT4 || fs_type_cur == FS_NTFS ||
+           fs_type_cur == FS_F2FS || fs_type_cur == FS_EROFS ||
+           fs_type_cur == FS_REFS;
+}
+
+/* 真只读卷：仅 EROFS（ROM 文件系统，按设计无写入者；ext4/NTFS/F2FS 已支持写） */
+int fs_is_readonly(void) {
+    return fs_type_cur == FS_EROFS;
+}
+
+static int fs_init_locked(void) {
+    if (fs_type_cur != FS_NONE) return 0;    /* 已挂载：幂等返回，保留 cwd */
+
+    /* 单盘环境（VMware / U 盘启动 H1c）：引导与数据同在 drive 0。
+     * 双盘布局（QEMU E2E：drive 0=引导镜像，drive 1=数据盘）首选 1 不变；
+     * 首选缺席且 drive 0 带 MBR 分区表时把首选切到 0——
+     * exfat/fat 后端只挂 MBR 里的数据分区，不碰 LBA0 引导代码；
+     * 无分区表的裸镜像（QEMU 引导盘形态）不切，保持原有失败路径。 */
+    if (fs_preferred_drive != 0
+        && !ata_drive_present(fs_preferred_drive)
+        && ata_drive_present(0)) {
+        static uint8_t mbr0[512];
+        if (ata_read_sector(0, 0, mbr0) == 0
+            && mbr0[510] == 0x55 && mbr0[511] == 0xAA) {
+            for (int i = 0; i < 4; i++) {
+                if (mbr0[446 + i * 16 + 4] != 0) {
+                    fs_preferred_drive = 0;
+                    dmesg_write("FS: single-disk layout, data volume on drive 0\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    /* 1) 首选数据盘 */
+    if (fs_try_drive(fs_preferred_drive)) return 0;
+
+    /* 2) 其余数据驱动器 1-3（含副 ATA 总线）。
+     *    0 号盘是引导盘，不参与自动回退挂载，防止误识别后写入破坏启动镜像
+     *    （用户仍可显式 setdrive 0 挂载）。 */
+    for (uint8_t d = 1; d < 4; d++) {
+        if (d == fs_preferred_drive) continue;
+        if (fs_try_drive(d)) return 0;
+    }
+
+    /* 2b) USB 大容量存储（drive 12..15）。
+     *    从 U 盘启动的机器上 ATA 是空的，不扫这一段就永远挂不上文件系统 ——
+     *    开机一行 "FS: no disk [FAIL]"，然后 shell 里什么文件都看不到。USB
+     *    启动盘是 H1c 的目标形态，这条回退让它真的可用。
+     *    没插 U 盘时 usbmsc_read_sector 立刻返回 -1（msc_get 拿不到设备就
+     *    返回 NULL），不会卡住引导。 */
+    for (uint8_t d = USBMSC_DRIVE_BASE; d < USBMSC_DRIVE_BASE + 4; d++) {
+        if (d == fs_preferred_drive) continue;
+        if (fs_try_drive(d)) return 0;
+    }
+
+    /* 3) 全部失败：区分"有盘无文件系统"与"无介质" */
+    if (!ata_drive_present(fs_preferred_drive)) return -1;
+    uint8_t sec[512];
+    if (ata_read_sector(fs_preferred_drive, 0, sec) == 0) return -2;
+    return -1;
+}
+
+int fs_init(void) {
+    fs_operation_lock();
+    int rc = fs_init_locked();
+    fs_operation_unlock();
+    return rc;
+}
+
+int fs_ready(void) { return fs_type_cur != FS_NONE; }
+
+const char *fs_type_name(void) {
+    switch (fs_type_cur) {
+    case FS_EXFAT: return "exFAT";
+    case FS_FAT12: return "FAT12";
+    case FS_FAT16: return "FAT16";
+    case FS_FAT32: return "FAT32";
+    case FS_EXT4:  return "ext4";
+    case FS_NTFS:  return "NTFS";
+    case FS_F2FS:  return "F2FS";
+    case FS_EROFS: return "EROFS";
+    case FS_REFS:  return "ReFS";
+    default:       return "none";
+    }
+}
+
+const fs_info_t *fs_get_info(void) { return &fs_volume; }
+
+void fs_set_drive(uint8_t drive) {
+    if (drive >= BLK_MAX_DRIVE || !user_is_admin() || user_storage_pinned()) return;
+    fs_operation_lock();
+    fs_preferred_drive = drive;
+    if (fs_type_cur != FS_NONE) {
+        fs_generation++;
+        fs_type_cur = FS_NONE;      /* 强制下次 fs_init 重新扫描 */
+        exfat_reset_cwd();          /* 旧盘 cwd 不能带到新盘 */
+        ro_cwd[0] = '/';
+        ro_cwd[1] = 0;
+    }
+    fs_operation_unlock();
+}
+
+/* 格式化前抹掉卷头部的旧文件系统签名。
+ *
+ * 踩过：format 只写自己的元数据、不清盘，于是旧卷的魔数原样留在原地——
+ * 把一张 exFAT 盘格成 ext4，重启后 fs_init 先探测到残留的 "EXFAT" 又挂回
+ * exFAT，用户看到的是"格式化了但没生效"，而且旧文件还在。
+ * 清卷起点后 16 个扇区（8KB）足够盖住所有 FS 的签名区，又不至于把整盘
+ * 写一遍（16MB 盘 PIO 全盘写要好几秒）。MBR 本身在 LBA 0，不动它。 */
+#define FS_WIPE_SECTORS 16
+
+/* 卷起点：MBR 里第一个有效分区的 LBA；裸盘（无分区表）用 1。
+ *
+ * 格式化写到这里，挂载也从这里读——两处必须一致，否则就是"清 A 处、
+ * 写 B 处"：旧签名留在真正被探测的位置，重启后挂回上一个文件系统，
+ * 而 shell 里刚刚 format 完一切正常，看起来毫无异常。
+ * 以前各 xxx_format 都写死 part_start=1，在虚拟机里测不出来（测试盘
+ * 的分区确实在 LBA 1），但真实硬盘/U 盘的分区起点普遍是 2048，上真机
+ * 就废。现在由 fs.c 统一解析一次，再作为参数传给每个 format。 */
+#define FS_PART_LBA_DEFAULT 1
+static uint32_t fs_volume_start(uint8_t drive) {
+    uint8_t sec[512];
+    if (ata_read_sector(drive, 0, sec) != 0) return FS_PART_LBA_DEFAULT;
+    if (sec[510] != 0x55 || sec[511] != 0xAA) return FS_PART_LBA_DEFAULT;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = sec + 446 + i * 16;
+        if (e[4] == 0) continue;
+        uint32_t s = fs_rd32(e + 8);
+        uint32_t l = fs_rd32(e + 12);
+        if (s == 0 || s >= FS_PART_LBA_LIMIT || l == 0) continue;
+        return s;
+    }
+    return FS_PART_LBA_DEFAULT;
+}
+
+static void fs_wipe_head(uint8_t drive, uint32_t start) {
+    ata_write_zero_sectors(drive, start, FS_WIPE_SECTORS);
+}
+
+static int fs_format_locked(int fs_type) {
+    /* 0 号盘是引导盘：拒绝格式化，防止把启动镜像抹掉 */
+    if (fs_preferred_drive == 0) return -1;
+    if (fs_type != FS_EXFAT && fs_type != FS_FAT12 && fs_type != FS_FAT16 &&
+        fs_type != FS_FAT32 && fs_type != FS_EXT4 && fs_type != FS_NTFS &&
+        fs_type != FS_F2FS && fs_type != FS_REFS) return -1;
+
+    /* 卷起点只在这里解析一次，清签名与写元数据共用同一个值 */
+    uint32_t start = fs_volume_start(fs_preferred_drive);
+    fs_generation++;
+    fs_type_cur = FS_NONE;         /* 即使格式化中途失败，旧卷也不再可用 */
+    fs_wipe_head(fs_preferred_drive, start);   /* 旧签名不清，重启会挂回旧 FS */
+
+    if (fs_type == FS_EXFAT) {
+        exfat_set_drive(fs_preferred_drive);
+        exfat_reset_cwd();
+        if (exfat_format(start) != 0) return -1;
+    } else if (fs_type == FS_FAT12 || fs_type == FS_FAT16 || fs_type == FS_FAT32) {
+        /* fat_format 写 MBR/BPB/FAT/根目录后立即挂载（含 cwd 重置） */
+        if (fat_format(fs_preferred_drive, fs_type, start) != fs_type) return -1;
+    } else if (fs_type == FS_EXT4) {
+        if (ext4_format(fs_preferred_drive, start) != 0) return -1;
+    } else if (fs_type == FS_NTFS) {
+        if (ntfs_format(fs_preferred_drive, start) != 0) return -1;
+    } else if (fs_type == FS_F2FS) {
+        if (f2fs_format(fs_preferred_drive, start) != 0) return -1;
+    } else if (fs_type == FS_REFS) {
+        if (refs_format(fs_preferred_drive, start) != 0) return -1;
+    } else {
+        /* EROFS 为只读 ROM 文件系统，不支持格式化 */
+        return -1;
+    }
+    fs_type_cur = fs_type;
+    fs_drive_cur = fs_preferred_drive;
+    ro_cwd[0] = '/';
+    ro_cwd[1] = 0;
+    fs_fill_info();
+    return 0;
+}
+
+int fs_format(int fs_type) {
+    if (!user_is_admin() || user_storage_pinned()) return -1;
+    fs_operation_lock();
+    int rc = fs_format_locked(fs_type);
+    fs_operation_unlock();
+    return rc;
+}
+
+/* ============ 只读文件系统分发 ============ */
+
+static int ro_read_file(const char *path, uint8_t *b, uint32_t m) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_read_file(path, b, m);
+    case FS_NTFS:  return ntfs_read_file(path, b, m);
+    case FS_F2FS:  return f2fs_read_file(path, b, m);
+    case FS_EROFS: return erofs_read_file(path, b, m);
+    case FS_REFS:  return refs_read_file(path, b, m);
+    default:       return -1;
+    }
+}
+
+static uint32_t ro_get_file_size(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_get_file_size(path);
+    case FS_NTFS:  return ntfs_get_file_size(path);
+    case FS_F2FS:  return f2fs_get_file_size(path);
+    case FS_EROFS: return erofs_get_file_size(path);
+    case FS_REFS:  return refs_get_file_size(path);
+    default:       return 0;
+    }
+}
+
+static int ro_read_dir(const char *path, fs_dir_entry_t *e, int n) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_read_dir(path, e, n);
+    case FS_NTFS:  return ntfs_read_dir(path, e, n);
+    case FS_F2FS:  return f2fs_read_dir(path, e, n);
+    case FS_EROFS: return erofs_read_dir(path, e, n);
+    case FS_REFS:  return refs_read_dir(path, e, n);
+    default:       return -1;
+    }
+}
+
+static int ro_is_dir(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_is_dir(path);
+    case FS_NTFS:  return ntfs_is_dir(path);
+    case FS_F2FS:  return f2fs_is_dir(path);
+    case FS_EROFS: return erofs_is_dir(path);
+    case FS_REFS:  return refs_is_dir(path);
+    default:       return -1;
+    }
+}
+
+static uint32_t ro_get_file_clusters(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_get_file_clusters(path);
+    case FS_NTFS:  return ntfs_get_file_clusters(path);
+    case FS_F2FS:  return f2fs_get_file_clusters(path);
+    case FS_EROFS: return erofs_get_file_clusters(path);
+    case FS_REFS:  return refs_get_file_clusters(path);
+    default:       return 0;
+    }
+}
+
+static uint32_t ro_used_clusters(void) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_get_info()->used_clusters;
+    case FS_NTFS:  return ntfs_get_info()->used_clusters;
+    case FS_F2FS:  return f2fs_get_info()->used_clusters;
+    case FS_EROFS: return erofs_get_info()->used_clusters;
+    case FS_REFS:  return refs_get_info()->used_clusters;
+    default:       return 0;
+    }
+}
+
+/* 绝对路径型驱动的写入分发（EROFS 只读，走 default 拒绝） */
+static int ro_create_file(const char *path, const uint8_t *data, uint32_t size) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_create_file(path, data, size, (uint16_t)user_current_uid(),
+                                         (uint16_t)user_current_gid());
+    case FS_NTFS:  return ntfs_create_file(path, data, size);
+    case FS_F2FS:  return f2fs_create_file(path, data, size);
+    case FS_REFS:  return refs_create_file(path, data, size);
+    default:       return -1;
+    }
+}
+
+static int ro_delete_file(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_delete_file(path);
+    case FS_NTFS:  return ntfs_delete_file(path);
+    case FS_F2FS:  return f2fs_delete_file(path);
+    case FS_REFS:  return refs_delete_file(path);
+    default:       return -1;
+    }
+}
+
+static int ro_mkdir(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_mkdir(path, 0755u, (uint16_t)user_current_uid(),
+                                   (uint16_t)user_current_gid());
+    case FS_NTFS:  return ntfs_mkdir(path);
+    case FS_F2FS:  return f2fs_mkdir(path);
+    case FS_REFS:  return refs_mkdir(path);
+    default:       return -1;
+    }
+}
+
+static int ro_rmdir(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_rmdir(path);
+    case FS_NTFS:  return ntfs_rmdir(path);
+    case FS_F2FS:  return f2fs_rmdir(path);
+    case FS_REFS:  return refs_rmdir(path);
+    default:       return -1;      /* EROFS：只读卷，拒绝删目录 */
+    }
+}
+
+/* 把 name（相对 cwd 或绝对路径）规范化为绝对路径写入 out；0=成功 */
+static int fs_ro_abs(const char *name, char *out, uint32_t outsz) {
+    char raw[512];
+    uint32_t rl = 0;
+    if (name[0] == '/') {
+        while (name[rl] && rl < sizeof(raw) - 1) { raw[rl] = name[rl]; rl++; }
+    } else {
+        for (uint32_t i = 0; ro_cwd[i] && rl < sizeof(raw) - 1; i++)
+            raw[rl++] = ro_cwd[i];
+        if (rl && raw[rl - 1] != '/' && rl < sizeof(raw) - 1) raw[rl++] = '/';
+        for (uint32_t i = 0; name[i] && rl < sizeof(raw) - 1; i++)
+            raw[rl++] = name[i];
+    }
+    raw[rl] = 0;
+
+    /* 分段规范化：处理 "." 与 ".." */
+    uint32_t segs[64], seglens[64];
+    int ns = 0;
+    uint32_t i = 0;
+    while (raw[i]) {
+        while (raw[i] == '/') i++;
+        uint32_t st = i;
+        while (raw[i] && raw[i] != '/') i++;
+        uint32_t l = i - st;
+        if (l == 0) continue;
+        if (l == 1 && raw[st] == '.') continue;
+        if (l == 2 && raw[st] == '.' && raw[st + 1] == '.') {
+            if (ns > 0) ns--;
+            continue;
+        }
+        if (ns >= 64) return -1;
+        segs[ns] = st;
+        seglens[ns] = l;
+        ns++;
+    }
+
+    uint32_t o = 0;
+    for (int s = 0; s < ns; s++) {
+        if (o + seglens[s] + 1 >= outsz) return -1;
+        out[o++] = '/';
+        for (uint32_t k = 0; k < seglens[s]; k++) out[o++] = raw[segs[s] + k];
+    }
+    if (o == 0) {
+        if (outsz < 2) return -1;
+        out[o++] = '/';
+    }
+    out[o] = 0;
+    return 0;
+}
+
+/* ============ 系统卷当前目录（相对路径解析） ============ */
+
+/* "" = 不在系统卷；"/bin" 或 "/system"（带斜杠，方便直接拼与直接显示） */
+static char g_sysvol_cwd[8];
+
+const char *fs_sysvol_cwd(void) {
+    return g_sysvol_cwd;
+}
+
+int fs_set_sysvol_cwd(const char *dir) {
+    if (dir == 0 || dir[0] == 0) { g_sysvol_cwd[0] = 0; return 0; }
+    const char *p = dir;
+    while (*p == '/') p++;
+    if (*p == 0) { g_sysvol_cwd[0] = 0; return 0; }
+    uint32_t n = 0;
+    g_sysvol_cwd[n++] = '/';
+    while (*p && *p != '/' && n + 1 < sizeof(g_sysvol_cwd)) {
+        char c = *p++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);   /* 统一小写 */
+        g_sysvol_cwd[n++] = c;
+    }
+    g_sysvol_cwd[n] = 0;
+    if (*p != 0 && *p != '/') { g_sysvol_cwd[0] = 0; return -1; }  /* 过长 */
+    return 0;
+}
+
+static int fs_ext4_search(char *path, int include_leaf);
+
+/* Canonicalize before checking the home boundary, and pass the very same
+ * canonical path to exFAT. Reject alternate separators and components the
+ * backend could truncate; exFAT has no symlinks or hard links. */
+static int fs_account_path(const char *name, char *out, uint32_t outsz) {
+    char raw[512];
+    if (fs_absolute_path(*name ? name : ".", raw, sizeof(raw)) != 0) return -1;
+    uint32_t used = 0;
+    const char *p = raw;
+    while (*p) {
+        while (*p == '/') p++;
+        const char *part = p;
+        while (*p && *p != '/') {
+            if (*p == '\\' || (uint8_t)*p < 32) return -1;
+            p++;
+        }
+        uint32_t n = (uint32_t)(p - part);
+        if (!n || (n == 1 && part[0] == '.')) continue;
+        if (n == 2 && part[0] == '.' && part[1] == '.') {
+            while (used && out[used - 1] != '/') used--;
+            if (used) used--;
+            continue;
+        }
+        if (n > 127 || used + n + 1 >= outsz) return -1;
+        out[used++] = '/';
+        for (uint32_t i = 0; i < n; i++) out[used++] = part[i];
+    }
+    if (!used) out[used++] = '/';
+    out[used] = 0;
+    if (sysvol_is_path(out)) return 0;
+
+    const char *home = user_home();
+    uint32_t i = 0;
+    for (; home[i]; i++) {
+        char c = out[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != home[i]) return -1;
+        out[i] = c;
+    }
+    if (out[i] != '/' && out[i] != 0) return -1;
+    return fs_ext4_search(out, 0);
+}
+
+int fs_resolve_path(const char *name, char *out, uint32_t outsz) {
+    if (name == 0 || out == 0 || outsz < 2) return -1;
+    if (user_confined()) return fs_account_path(name, out, outsz);
+    /* The cd-specific meaning of '..' is handled in fs_change_dir_locked.
+     * Other operations on relative names in /bin or /system never hit disk. */
+    if (g_sysvol_cwd[0] == 0 || name[0] == '/') {
+        uint32_t n = 0;
+        while (name[n] && n + 1 < outsz) { out[n] = name[n]; n++; }
+        if (name[n] != 0) return -1;
+        out[n] = 0;
+        return 0;
+    }
+    uint32_t cwdlen = 0;
+    while (g_sysvol_cwd[cwdlen]) cwdlen++;
+    uint32_t namelen = 0;
+    while (name[namelen]) namelen++;
+    if (cwdlen + 1 + namelen + 1 > outsz) return -1;
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < cwdlen; k++) out[n++] = g_sysvol_cwd[k];
+    out[n++] = '/';
+    for (uint32_t k = 0; k < namelen; k++) out[n++] = name[k];
+    out[n] = 0;
+    return 0;
+}
+
+/* ============ 分发 API ============ */
+
+/* ============ Unix 权限（P2）============ */
+
+/* root 全过；文件 owner == 当前用户走 owner 位组，gid 对上走 group 位组，否则 other */
+static int fs_perm_pass(uint16_t mode, uint16_t fuid, uint16_t fgid, int shift) {
+    uint32_t cur_uid = user_current_uid();
+    if (user_is_admin()) return 1;
+    uint32_t bits;
+    if (fuid == cur_uid) bits = ((uint32_t)mode >> 6) & 7u;
+    else if (fgid == user_current_gid()) bits = ((uint32_t)mode >> 3) & 7u;
+    else bits = (uint32_t)mode & 7u;
+    return (bits >> shift) & 1u;
+}
+
+static int fs_ext4_search(char *path, int include_leaf) {
+    if (fs_type_cur != FS_EXT4 || !user_confined()) return 0;
+    uint16_t mode, uid, gid;
+    if (ext4_stat_perm("/", &mode, &uid, &gid) != 0 ||
+        !fs_perm_pass(mode, uid, gid, 0)) return -1;
+    for (char *p = path + 1; ; p++) {
+        if (*p != '/' && *p != 0) continue;
+        char sep = *p;
+        if (!sep && !include_leaf) break;
+        *p = 0;
+        int rc = ext4_stat_perm(path, &mode, &uid, &gid);
+        *p = sep;
+        if (rc != 0 || !fs_perm_pass(mode, uid, gid, 0)) return -1;
+        if (!sep) break;
+    }
+    return 0;
+}
+
+static void fs_perm_show(uint16_t *mode, uint16_t *uid, uint16_t *gid, uint16_t bits, uint16_t owner) {
+    if (mode) *mode = bits;
+    if (uid)  *uid = owner;
+    if (gid)  *gid = owner;
+}
+
+static int fs_home_owner(const char *path) {
+    char abs[256], name[USER_NAME_MAX + 1];
+    if (fs_absolute_path(*path ? path : ".", abs, sizeof(abs)) != 0) return -1;
+    const char *expected = "/home/";
+    uint32_t i = 0;
+    for (; expected[i]; i++) {
+        char c = abs[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != expected[i]) return -1;
+    }
+    uint32_t j = 0;
+    for (; abs[i] && abs[i] != '/'; i++) {
+        char c = abs[i];
+        if (j == USER_NAME_MAX) return -1;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        name[j++] = c;
+    }
+    name[j] = 0;
+    return user_uid_of(name);
+}
+
+int fs_get_perm(const char *path, uint16_t *mode, uint16_t *uid, uint16_t *gid) {
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) {
+        uint32_t n;
+        uint8_t dir;
+        char bin[64];
+        if (sysvol_stat(full, &n, &dir) != 0) return -1;
+        fs_perm_show(mode, uid, gid, dir || sysvol_resolve_bin(full, bin, sizeof(bin)) == 0 ?
+                                     0555u : 0444u, 0);
+        return 0;
+    }
+    if (fs_type_cur == FS_EXT4) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ext4_stat_perm(abs, mode, uid, gid);
+    }
+    if (fs_type_cur == FS_EXFAT || fs_is_fat()) {
+        uint32_t n;
+        uint8_t dir;
+        int rc = fs_type_cur == FS_EXFAT ? exfat_stat(full, &n, &dir) : fat_stat(full, &n, &dir);
+        if (rc != 0) return -1;
+        int owner = fs_home_owner(full);
+        fs_perm_show(mode, uid, gid, owner >= 0 ? (dir ? 0700u : 0600u) :
+                     (dir ? 0777u : 0666u), owner >= 0 ? (uint16_t)owner : 0);
+        return 0;
+    }
+    return -1;      /* ntfs/f2fs/refs/erofs：无 Unix mode 体系 */
+}
+
+int fs_check_read(const char *path) {
+    uint16_t m, fu, fg;
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    if (fs_get_perm(full, &m, &fu, &fg) != 0) return 0; /* backend handles a missing leaf */
+    return fs_perm_pass(m, fu, fg, 2) ? 0 : -1;
+}
+
+int fs_check_write(const char *path) {
+    uint16_t m, fu, fg;
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0 || sysvol_is_path(full) ||
+        fs_is_readonly()) return -1;
+    if (fs_get_perm(full, &m, &fu, &fg) != 0) return fs_type_cur == FS_EXT4 ? -1 : 0;
+    return fs_perm_pass(m, fu, fg, 1) ? 0 : -1;
+}
+
+int fs_check_exec(const char *path) {
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    if (fs_type_cur != FS_EXT4 || user_is_admin()) return 0;
+    uint16_t m, uid, gid;
+    return fs_get_perm(full, &m, &uid, &gid) == 0 && fs_perm_pass(m, uid, gid, 0) ? 0 : -1;
+}
+
+/* 绝对路径 -> 父目录（"/a/b/c" -> "/a/b"；"/a" -> "/"） */
+static void fs_parent_of(const char *abs, char *out, uint32_t outsz) {
+    uint32_t n = 0;
+    while (abs[n]) n++;
+    while (n > 1 && abs[n - 1] != '/') n--;
+    if (n <= 1) { out[0] = '/'; out[1] = 0; return; }
+    for (uint32_t i = 0; i + 1 < n && i < outsz - 1; i++) out[i] = abs[i];
+    out[n - 1 < outsz - 1 ? n - 1 : outsz - 1] = 0;
+}
+
+int fs_check_parent_write(const char *path) {
+    uint16_t m, fu, fg;
+    char full[256], abs[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0 || sysvol_is_path(full) ||
+        fs_is_readonly() || fs_absolute_path(full, abs, sizeof(abs)) != 0) return -1;
+    char parent[256];
+    fs_parent_of(abs, parent, sizeof(parent));
+    if (user_confined() && fs_resolve_path(parent, full, sizeof(full)) != 0) return -1;
+    if (fs_get_perm(parent, &m, &fu, &fg) != 0) return fs_type_cur == FS_EXT4 ? -1 : 0;
+    return fs_perm_pass(m, fu, fg, 1) && fs_perm_pass(m, fu, fg, 0) ? 0 : -1;
+}
+
+int fs_chmod(const char *path, uint16_t mode) {
+    uint16_t m, fu, fg;
+    if (fs_get_perm(path, &m, &fu, &fg) != 0) return -1;
+    if (!user_is_admin() && fu != user_current_uid()) return -2;
+    if (fs_type_cur != FS_EXT4) return -3;    /* FAT/exFAT/其他：无 mode 存储 */
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    char abs[512];
+    if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+    return ext4_set_perm(abs, mode, fu, fg);
+}
+
+int fs_chown(const char *path, uint32_t uid) {
+    uint16_t m, fu, fg;
+    if (fs_get_perm(path, &m, &fu, &fg) != 0) return -1;
+    if (!user_is_admin()) return -2;
+    if (fs_type_cur != FS_EXT4) return -3;
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    char abs[512];
+    if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+    return ext4_set_perm(abs, m, (uint16_t)uid, fg);
+}
+
+int fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
+    /* 系统卷（内核内置只读）：/bin 与 /system 不走任何磁盘后端。
+     * 放在最前面——它是内存里的，与 fs_type_cur 是否挂载无关，
+     * 这样数据盘被 format 之后这些文件依然可读。 */
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return sysvol_read(full, buffer, max_size);
+    if (fs_check_read(full) != 0) return -2;   /* Unix 权限：r 位 */
+    if (fs_type_cur == FS_EXFAT) return exfat_read_file(full, buffer, max_size);
+    if (fs_is_fat()) return fat_read_file(full, buffer, max_size);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_read_file(abs, buffer, max_size);
+    }
+    return -1;
+}
+
+uint32_t fs_get_file_size(const char *name) {
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return 0;
+    if (sysvol_is_path(full)) return sysvol_size(full);
+    if (fs_type_cur == FS_EXFAT) return exfat_get_file_size(full);
+    if (fs_is_fat()) return fat_get_file_size(full);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return 0;
+        return ro_get_file_size(abs);
+    }
+    return 0;
+}
+
+/* stat：存在经 size/is_dir 写回属性返回 0，不存在/未挂载 -1。
+ * 与 fs_get_file_size 同一套路由，只是多带回一个 is_dir。 */
+static int fs_stat_backend(const char *full, uint32_t *size, uint8_t *is_dir) {
+    if (sysvol_is_path(full)) return sysvol_stat(full, size, is_dir);
+    if (fs_type_cur == FS_EXFAT) return exfat_stat(full, size, is_dir);
+    if (fs_is_fat()) return fat_stat(full, size, is_dir);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        /* ro_is_dir 契约：1=目录 / 0=文件 / -1=不存在（各只读后端统一）。
+         * 不拿 size==0 当"不存在"——空文件也是合法存在的文件。 */
+        int d = ro_is_dir(abs);
+        if (d < 0) return -1;
+        *size = ro_get_file_size(abs);
+        *is_dir = (d == 1) ? 1u : 0u;
+        return 0;
+    }
+    return -1;
+}
+
+int fs_stat(const char *name, uint32_t *size, uint8_t *is_dir) {
+    if (!name || !size || !is_dir) return -1;
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    return fs_stat_backend(full, size, is_dir);
+}
+
+int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
+    /* 系统卷只读：写 /bin、/system 一律拒绝（哪怕是磁盘卷已挂载）。
+     * 这是"格式化数据分区不影响系统"的另一半——系统目录不可写。
+     * 注意 name 先经 fs_resolve_path：站在 /bin 里 `write x hi` 会被解析成
+     * /bin/x，然后在这里被拒，而不是悄悄写到数据盘根目录去。 */
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;
+    if (fs_type_cur == FS_NONE) return -1;
+    uint32_t old_size;
+    uint8_t old_dir;
+    if (fs_stat(full, &old_size, &old_dir) == 0) {
+        if (old_dir) return -1;
+        if (fs_check_write(full) != 0) return -2;
+    } else if (fs_check_parent_write(full) != 0) return -2;
+    if (fs_type_cur == FS_EXFAT) return exfat_create_file(full, data, size);
+    if (fs_is_fat()) {
+        fat_delete_file(full);
+        return fat_create_file(full, data, size);
+    }
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_create_file(abs, data, size);   /* 驱动内部含 replace 语义 */
+    }
+    return -1;      /* EROFS：拒绝写入 */
+}
+
+int fs_delete_file(const char *name) {
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (fs_check_parent_write(full) != 0) return -2;   /* Unix 权限：删文件看父目录 w */
+    if (fs_type_cur == FS_EXFAT) return exfat_delete_file(full);
+    if (fs_is_fat()) return fat_delete_file(full);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_delete_file(abs);
+    }
+    return -1;      /* EROFS：拒绝删除 */
+}
+
+int fs_list_root(void) {
+    if (user_confined()) return -1;
+    if (fs_type_cur == FS_EXFAT) return exfat_list_root();
+    if (fs_is_fat()) return fat_list_root();
+    return -1;
+}
+
+int fs_read_dir(fs_dir_entry_t *entries, int max_entries) {
+    if (user_confined() || g_sysvol_cwd[0])
+        return fs_read_dir_path(fs_cwd_path(), entries, max_entries);
+    if (fs_type_cur == FS_EXFAT)
+        return exfat_read_dir((exfat_dir_entry_t *)entries, max_entries);
+    if (fs_is_fat())
+        return fat_read_dir((fat_dir_entry_t *)entries, max_entries);
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs("", full, sizeof(full)) != 0) return -1;
+        return ro_read_dir(full, entries, max_entries);
+    }
+    return -1;
+}
+
+/* 带路径的列目录：/bin、/system 走系统卷，其余沿用当前磁盘卷的 cwd。
+ *
+ * 之所以另开一个入口而不是给 fs_read_dir 加参数：fs_read_dir 的签名被
+ * exFAT/FAT/只读三套后端和 shell、vi、desktop 等多处调用，改签名要动一条
+ * 长链；这里是新增能力，老行为一点不动，回归风险为零。 */
+int fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries) {
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) {
+        /* 非目录路径必须 -1，与磁盘后端对齐：sysvol_list 对"表内文件"和
+         * "不存在的路径"都返回 0（没有条目匹配），而 0 在调用方眼里等于
+         * "空目录"——用户态 readdir 一个文件时分不出 ENOTDIR 和"这目录
+         * 是空的"，ls 一个不存在的目录也会安静地打印空。 */
+        uint32_t sz;
+        uint8_t d;
+        if (sysvol_stat(full, &sz, &d) != 0 || d == 0) return -1;
+        return sysvol_list(full, entries, max_entries);
+    }
+    /* 每个后端都真的按路径列那个目录。以前只有 exFAT/FAT 接了，其余后端
+     * 退化成"忽略参数列 cwd"——`ls SD` 答非所问，是纯简化，不是能力不够：
+     * ext4/ntfs/f2fs/refs/erofs 的 read_dir 本身就吃 path 参数。 */
+    if (fs_type_cur == FS_EXFAT)
+        return exfat_read_dir_path(full, (exfat_dir_entry_t *)entries, max_entries);
+    if (fs_type_cur == FS_FAT12 || fs_type_cur == FS_FAT16 || fs_type_cur == FS_FAT32)
+        return fat_read_dir_path(full, (fat_dir_entry_t *)entries, max_entries);
+    if (fs_is_ro()) {
+        /* RO 驱动只吃绝对路径：相对名先过 fs_ro_abs 再分发，子目录 ls 才正确 */
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        if (fs_ext4_search(abs, 1) != 0 || fs_check_read(abs) != 0) return -1;
+        return ro_read_dir(abs, entries, max_entries);
+    }
+    return -1;
+}
+
+static int fs_change_dir_locked(const char *name, int check_account) {
+    if (name == 0 || name[0] == 0) return -1;
+    char confined[256];
+    if (check_account && user_confined()) {
+        if (fs_account_path(name, confined, sizeof(confined)) != 0) return -1;
+        if (!sysvol_is_path(confined) && fs_ext4_search(confined, 1) != 0) return -1;
+        name = confined;
+    }
+
+    /* 站在系统卷里 `cd /` 或 `cd ..`：只是离开系统卷，磁盘 cwd 不动。
+     * `cd .` 原地不动。 */
+    if (g_sysvol_cwd[0] != 0) {
+        if (name[0] == '.' && name[1] == 0) return 0;
+        if ((name[0] == '/' && name[1] == 0) ||
+            (name[0] == '.' && name[1] == '.' && name[2] == 0)) {
+            g_sysvol_cwd[0] = 0;
+            return 0;
+        }
+    }
+
+    /* /bin 与 /system：系统卷只读、没有目录簇可切，把 cwd 记在 fs 层，
+     * 让后续的 ls / cat / 相对路径都跟着走（fs_resolve_path 负责拼接）。 */
+    if (sysvol_is_path(name)) {
+        if (fs_set_sysvol_cwd(name) != 0) return -1;
+        /* 子路径（/bin/foo）不接受：系统卷只有一层 */
+        const char *p = name;
+        while (*p == '/') p++;
+        while (*p && *p != '/') p++;
+        if (*p == '/') { g_sysvol_cwd[0] = 0; return -1; }
+        return 0;
+    }
+
+    int rc = -1;
+    if (fs_type_cur == FS_EXFAT) rc = exfat_change_dir(name);
+    else if (fs_is_fat()) rc = fat_change_dir(name);
+    else if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(name, abs, sizeof(abs)) != 0) return -1;
+        if (ro_is_dir(abs) != 1) return -1;
+        uint32_t i = 0;
+        while (abs[i] && i < sizeof(ro_cwd) - 1) { ro_cwd[i] = abs[i]; i++; }
+        ro_cwd[i] = 0;
+        rc = 0;
+    }
+    if (rc == 0) g_sysvol_cwd[0] = 0;
+    return rc;
+}
+
+int fs_change_dir(const char *name) {
+    fs_operation_lock();
+    int rc = fs_change_dir_locked(name, 1);
+    fs_operation_unlock();
+    return rc;
+}
+
+/* Only the account subsystem calls these, after checking authorization.
+ * Bypass home resolution for the fixed database and an authenticated home. */
+static int fs_account_dir_locked(const char *path, uint32_t uid, uint16_t mode, int existing_ok) {
+    uint32_t size;
+    uint8_t dir;
+    if (fs_stat_backend(path, &size, &dir) == 0) return existing_ok && dir ? 0 : -1;
+    if (fs_type_cur == FS_EXFAT) return exfat_mkdir(path);
+    if (fs_is_fat()) return fat_mkdir(path);
+    if (fs_type_cur == FS_EXT4) return ext4_mkdir(path, mode, (uint16_t)uid, (uint16_t)uid);
+    return fs_is_ro() ? ro_mkdir(path) : -1;
+}
+
+int fs_save_account_db(const void *data, uint32_t size) {
+    fs_operation_lock();
+    int rc = -1;
+    if (fs_type_cur == FS_EXFAT && fs_account_dir_locked("/etc", 0, 0755u, 1) == 0) {
+        rc = exfat_create_file(FS_ACCOUNT_DB, data, size);
+        uint32_t marker_size;
+        uint8_t marker_dir;
+        if (rc == 0 && exfat_stat(FS_ACCOUNT_MARKER, &marker_size, &marker_dir) != 0)
+            exfat_create_file(FS_ACCOUNT_MARKER, (const uint8_t *)"CCA2\n", 5);
+    }
+    fs_operation_unlock();
+    return rc;
+}
+
+static int fs_make_account_home_locked(const char *home, uint32_t uid, int existing_ok) {
+    uint32_t size;
+    uint8_t dir;
+    /* A removable UEFI image may mount its ESP as the only available FAT
+     * volume. Logging in must not write profile directories to the ESP. */
+    if (fs_is_fat() && fs_stat_backend("/EFI/BOOT", &size, &dir) == 0 && dir)
+        return -1;
+    int had_parent = fs_stat_backend("/home", &size, &dir) == 0;
+    if (fs_account_dir_locked("/home", 0, 0755u, 1) != 0) return -1;
+    int rc = fs_account_dir_locked(home, uid, 0700u, existing_ok);
+    if (rc != 0 && !had_parent) {
+        /* If the data disk fills, don't leave an unusable new /home behind. */
+        if (fs_type_cur == FS_EXFAT) exfat_rmdir("/home");
+        else if (fs_is_fat()) fat_rmdir("/home");
+        else if (fs_is_ro()) ro_rmdir("/home");
+    }
+    return rc;
+}
+
+int fs_prepare_account_home(const char *home, uint32_t uid, int existing_ok) {
+    fs_operation_lock();
+    int rc = fs_make_account_home_locked(home, uid, existing_ok);
+    fs_operation_unlock();
+    return rc;
+}
+
+void fs_enter_account_home(const char *home, uint32_t uid) {
+    fs_operation_lock();
+    if (fs_make_account_home_locked(home, uid, 1) != 0 || fs_change_dir_locked(home, 0) != 0) {
+        /* Fallback is public read-only, never the root of the data volume. */
+        fs_set_sysvol_cwd("/system");
+    }
+    fs_operation_unlock();
+}
+
+int fs_mkdir(const char *name) {
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (fs_check_parent_write(full) != 0) return -2;
+    if (fs_type_cur == FS_EXFAT) return exfat_mkdir(full);
+    if (fs_is_fat()) return fat_mkdir(full);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_mkdir(abs);
+    }
+    return -1;      /* EROFS：拒绝建目录 */
+}
+
+int fs_rmdir(const char *name) {
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (user_confined()) {
+        /* The canonical home has two slash-delimited components. */
+        const char *p = full + 6;
+        while (*p && *p != '/') p++;
+        if (!*p) return -1;
+    }
+    if (fs_check_parent_write(full) != 0) return -2;
+    if (fs_type_cur == FS_EXFAT) return exfat_rmdir(full);
+    if (fs_is_fat()) return fat_rmdir(full);
+    if (fs_is_ro()) {
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_rmdir(abs);
+    }
+    return -1;
+}
+
+const char *fs_cwd_path(void) {
+    if (g_sysvol_cwd[0] != 0) return g_sysvol_cwd;   /* "/bin"、"/system" */
+    if (fs_type_cur == FS_EXFAT) return exfat_cwd_path();
+    if (fs_is_fat()) return fat_cwd_path();
+    if (fs_is_ro()) return ro_cwd;
+    return "/";
+}
+
+int fs_absolute_path(const char *name, char *out, uint32_t outsz) {
+    if (!name || !*name || !out || outsz < 2) return -1;
+    uint32_t n = 0;
+    if (*name != '/') {
+        for (const char *cwd = fs_cwd_path(); *cwd; cwd++) {
+            if (n + 1 >= outsz) return -1;
+            out[n++] = *cwd;
+        }
+        if (n == 0 || out[n - 1] != '/') {
+            if (n + 1 >= outsz) return -1;
+            out[n++] = '/';
+        }
+    }
+    while (*name) {
+        if (n + 1 >= outsz) return -1;
+        out[n++] = *name++;
+    }
+    out[n] = 0;
+    return 0;
+}
+
+uint32_t fs_count_used_clusters(void) {
+    if (fs_type_cur == FS_EXFAT) return exfat_count_used_clusters();
+    if (fs_is_fat()) return fat_count_used_clusters();
+    if (fs_is_ro()) return ro_used_clusters();
+    return 0;
+}
+
+uint32_t fs_get_file_clusters(const char *name) {
+    char confined[256];
+    if (user_confined()) {
+        if (fs_account_path(name, confined, sizeof(confined)) != 0 ||
+            sysvol_is_path(confined)) return 0;
+        name = confined;
+    }
+    if (fs_type_cur == FS_EXFAT) return exfat_get_file_clusters(name);
+    if (fs_is_fat()) return fat_get_file_clusters(name);
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs(name, full, sizeof(full)) != 0) return 0;
+        return ro_get_file_clusters(full);
+    }
+    return 0;
+}

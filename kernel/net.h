@@ -1,0 +1,164 @@
+/*
+ * net.h - IPv4/UDP/TCP 协议栈 + socket 层（步骤 7.3）
+ *
+ * 定位：rtl8139.c 之下的协议处理全部上收到本模块——
+ *   rtl8139.c 只管"帧进帧出"（RX 环/TX 描述符/IRQ），收到完整以太帧后
+ *   调 net_input()；本模块做 ARP/ICMP/UDP/TCP 解析、socket 收发缓冲、
+ *   系统调用实现。
+ *
+ * 阻塞模型（步骤 8a 起）：等待不再忙轮询——recvfrom/accept/ARP 解析
+ * 睡在 net 等待队列上（task_sleep，全程 cli，丢失唤醒被结构性排除），
+ * 由 rtl8139 rx_drain 的 net_rx_wake()（IRQ11 或轮询路径都会走）与
+ * IRQ0 的 task_timer_tick（超时）唤醒。任务睡眠后会被切走或停机
+ * （sti;hlt），中断照常投递——旧的"不能在系统调用里等 IRQ"约束随
+ * 可睡眠阻塞一起消失。循环顶的 net_poll() 保留为兜底排水。
+ *
+ * socket 归属：每个 socket 记 owner pid（0 = 内核）。进程退出不挂接
+ * process_exit（不动调度器），改为懒回收：socket() 发现表满时，把
+ * owner pid 已不存在的条目收掉。教学取舍，注释在 sock_alloc。
+ *
+ * ABI：SYS_SOCKCALL(102)，ebx=子命令，ecx=用户态 u32 args[5]。
+ * 参数里的用户指针由本模块在使用前经 syscall_user_range_ok/_rw 校验。
+ */
+#ifndef NET_H
+#define NET_H
+
+#include "types.h"
+
+/* socket 类型（SC_SOCKET 的 a0） */
+#define SOCK_TYPE_UDP 0u
+#define SOCK_TYPE_TCP 1u
+
+/* sockcall 子命令（参数为用户态 u32 args[5] 的槽位） */
+#define SC_SOCKET   0u   /* a0=type                        -> sock id   */
+#define SC_BIND     1u   /* a0=sock, a1=port               -> 0/-1      */
+#define SC_LISTEN   2u   /* a0=sock(TCP)                   -> 0/-1      */
+#define SC_ACCEPT   3u   /* a0=sock(监听), a1=timeout_ms    -> conn id   */
+#define SC_SENDTO   4u   /* a0=sock, a1=buf, a2=len,
+                          * a3=dst_ip(大端打包), a4=dst_port -> 发送字节数 */
+#define SC_RECVFROM 5u   /* a0=sock, a1=buf, a2=len, a3=timeout_ms,
+                          * a4=out 指针(u32[2]: src ip/port，可为 0)
+                          *                               -> 收到字节数/0=EOF/-1 */
+#define SC_CLOSE    6u   /* a0=sock                        -> 0/-1      */
+#define SC_CONNECT  7u   /* a0=sock, a1=dst_ip(大端), a2=dst_port,
+                          * a3=timeout_ms（步骤 7.4 主动打开）  -> 0/-1   */
+
+/* rtl8139.c 收到完整以太帧（不含 CRC）后调入；返回后缓冲可复用 */
+int net_input(const uint8_t *frame, uint32_t len);
+
+/* sockcall 分发（args 已由 syscall.c 拷入内核；内含的用户指针未校验） */
+int net_sockcall(uint32_t subcmd, const uint32_t a[5]);
+
+/* 阻塞等待期间推进网络收包（轮询 RX，不依赖 IRQ） */
+void net_poll(void);
+
+/* 步骤 7.4：TCP 重传定时器——由 IRQ0（isr.c 的 irq0_handler）每 tick 调用，
+ * 内部按 TCP_TICK_MS 节流；系统调用上下文由 net_poll 一并调用。IRQ 上下文
+ * 安全（重传走 rtl8139_send，自带 IF 保护）。 */
+void net_tick(void);
+
+/* ---- 网络上层演示（shell 命令 ping / httpd 的后端） ---- */
+
+/* 主动 ping：发 ICMP echo request 并睡等匹配 reply。
+ * 返回 0 = 收到（*rtt_ms = 往返毫秒）、1 = 超时、-1 = 发送失败。
+ * 只能在任务上下文调用（内部会 task_sleep）。 */
+int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms);
+
+/* 简易 HTTP 服务：监听 80，服务**一个** GET 连接（回固定 200 页面 + FIN）
+ * 后返回。返回 0 = 已服务、1 = 30s 无连接、-1 = 端口占用/内存不足/发送失败。
+ * 不做常驻监听：shell 无 Ctrl-C 中断机制，accept 常驻会让 shell 永久阻塞。 */
+int net_httpd_once(void);
+
+/* ---------- 内核内部 TCP 客户端（不经 sockcall，故不做用户指针校验） ----------
+ * 系统调用路径要过 uptr_ok，内核自己用会被判非法。**仅供内核内部模块
+ * 调用**，调用方须自行保证指针有效。
+ * connect 返回 sock 下标（>=0）或 -1；send/recv 返回字节数，
+ * recv 返回 0 = 对端 FIN 正常 EOF，-1 = 超时或出错；close 幂等。 */
+int  net_tcp_connect(uint32_t dst_ip_be, uint16_t port, uint32_t timeout_ms);
+int  net_tcp_send(int sid, const void *buf, uint32_t len, uint32_t timeout_ms);
+int  net_tcp_recv(int sid, void *buf, uint32_t maxlen, uint32_t timeout_ms);
+void net_tcp_close(int sid);
+
+/* ---- DHCP 客户端（RFC 2131：DISCOVER/OFFER/REQUEST/ACK + T1/T2 续租） ----
+ * 只能在任务上下文调用（内部睡等响应）。会覆盖 rtl8139 的 IP 配置。
+ * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
+ * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。
+ * timeout_ms 是每一轮等待的上限（DISCOVER 与 REQUEST 各最多 3 轮）。 */
+int net_dhcp(uint32_t timeout_ms);
+
+/* ---- DNS 解析器（RFC 1035，只查 A 记录） ----
+ * 服务器来源：net_dns_set_server() 手动配的优先，否则用 DHCP 下发的
+ * option 6（**全部**收下，最多 4 个）；第一个超时就换下一个。
+ * 跨网段时自动走网关（帧给网关，IP 目的仍是服务器）。
+ * 只在任务上下文调用（内部睡等响应）。
+ * 结果按应答里的 TTL 缓存（8 条）：命中直接返回，一个包都不发。
+ * 返回：0 = 成功（*out_ip_be 网络序，可能是缓存里的）、1 = 超时无人应答、
+ * -1 = 参数/发送失败、-2 = 应答里没有 A 记录（含 NXDOMAIN）、
+ * -3 = 没有 DNS 服务器可问。 */
+int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms);
+void net_dns_set_server(uint32_t be);
+uint32_t net_dns_server(void);   /* 实际会用的第一个（0 = 没有） */
+uint32_t net_dns_server_count(void);          /* 服务器表项数 */
+uint32_t net_dns_server_at(uint32_t i);       /* 第 i 个（越界返回 0） */
+
+/* 只查缓存、不发包：命中返回 1 并写 *out_ip_be（shell 用它标注 cached）。 */
+int net_dns_cache_lookup(const char *name, uint32_t *out_ip_be);
+void    net_dns_cache_clear(void);            /* `dns flush` */
+uint32_t net_dns_cache_hits(void);            /* 累计命中次数 */
+uint32_t net_dns_cache_entries(void);         /* 当前有效表项数 */
+
+/* ---- SNTP 客户端（RFC 4330，只做客户端，一次查询） ----
+ * 只在任务上下文调用（内部睡等响应）。只认 mode=4 的应答，取偏移 40 的
+ * transmit timestamp（1900 纪元）换算成 Unix 秒。
+ * 返回：0 = 成功（*out_unix_sec）、1 = 超时、-1 = 参数/发送失败、
+ * -2 = 应答格式非法。 */
+int net_ntp(uint32_t server_ip_be, uint32_t *out_unix_sec, uint32_t timeout_ms);
+
+/* 租约是否生效（0 = 从未成功或尚未运行 dhcp） */
+int net_dhcp_valid(void);
+
+/* 取当前租约（网络序；未下发的字段为 0）。任一指针可为 0。 */
+void net_dhcp_lease(uint32_t *ip, uint32_t *mask, uint32_t *router,
+                    uint32_t *dns, uint32_t *lease);
+
+/* ---- netdev 统一层：e1000 在位优先用 e1000，否则 rtl8139。
+ * 内核里所有"用网卡"的调用点（协议栈/命令/横幅）一律走这组，不感知型号；
+ * init 不在此层（kernel.c 启动序里 e1000 优先、互斥取一）。 ---- */
+int      netdev_present(void);
+const char *netdev_name(void);       /* "e1000" / "rtl8139" */
+int      netdev_send(const uint8_t *frame, uint32_t len);
+void     netdev_poll(void);
+const uint8_t *netdev_mac(void);
+void     netdev_mac_str(char *out);  /* out 至少 18 字节 */
+const uint8_t *netdev_ip(void);
+void     netdev_set_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d);
+void     netdev_ip_str(char *out);   /* out 至少 16 字节 */
+uint32_t netdev_base(void);          /* rtl8139=IO base，e1000=MMIO base */
+uint8_t  netdev_irq(void);
+uint32_t netdev_rx_packets(void);
+uint32_t netdev_rx_errors(void);
+uint32_t netdev_tx_packets(void);
+uint32_t netdev_tx_busy(void);
+uint32_t netdev_irq_count(void);
+void     netdev_rx_debug(uint32_t *a, uint32_t *b, uint32_t *c);
+
+/* 步骤 8a：rtl8139 在 rx_drain 排完一批包后调用——踢醒睡在 net 等待
+ * 队列上的 recvfrom/accept/ARP 解析（task_wake_all，IRQ 上下文安全）。
+ * 轮询路径（syscall 内 net_poll）同样会走到，重复唤醒无害（惊群自查）。 */
+void net_rx_wake(void);
+
+/* 统计（nic 命令 / E2E） */
+uint32_t net_udp_rx(void);
+uint32_t net_udp_tx(void);
+uint32_t net_tcp_rx(void);
+uint32_t net_tcp_tx(void);
+uint32_t net_tcp_rtx(void);   /* 步骤 7.4：重传次数 */
+uint32_t net_arp_replied(void);
+uint32_t net_icmp_replied(void);
+uint32_t net_ip_drops(void);   /* 收包侧丢弃：首部校验和错 + 分片（不重组） */
+uint32_t net_arp_entries(void);
+uint32_t net_sock_count(void);
+uint32_t net_ping_reqs(void);
+uint32_t net_ping_matched(void);
+
+#endif

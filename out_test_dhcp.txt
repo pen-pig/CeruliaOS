@@ -1,0 +1,62 @@
+﻿== test_dhcp: DHCP client (D/O/R/A) ==
+-- A normal lease --
+---- serial tail ----
+
+---- ping tail ----
+
+   FAIL lease acquired
+   FAIL got offered address 10.0.2.66
+   FAIL netmask parsed
+   FAIL router parsed
+   FAIL dns parsed
+   FAIL lease parsed (3600s)
+   PASS no timeout/NAK branch taken
+   FAIL DISCOVER received
+   FAIL REQUEST received
+   FAIL `nic` shows the lease
+   FAIL ping gateway works on the new address
+   FAIL gateway actually saw ICMP echoes
+   FAIL outgoing packets really use the leased address
+-- B silent server --
+---- serial tail ----
+
+---- nic tail ----
+
+   FAIL reported timeout
+   PASS no bogus success
+   FAIL server really stayed silent
+   FAIL address unchanged (still 10.0.2.15)
+-- C NAK --
+---- serial tail ----
+
+D:\Python315\python3.15t.exe : Traceback (most recent call last):
+所在位置 行:15 字符: 2025
++ ... st_dns")) { D:\Python315\python3.15t.exe -u tests\$t.py *> out_$t.txt ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\MyOS\src\tests\test_dhcp.py", line 645, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "D:\MyOS\src\tests\test_dhcp.py", line 634, in main
+    res = fn()
+  File "D:\MyOS\src\tests\test_dhcp.py", line 527, in case_nak
+    ok2, out2 = run_cmd(qmp, serial, "nic", "ip: 10.0.2.15", 25.0)
+                ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 237, in run_cmd
+    qmp.type_line(cmd)
+    ~~~~~~~~~~~~~^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 192, in type_line
+    self.hmc("sendkey " + key)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 185, in hmc
+    return self.cmd("human-monitor-command", **{"command-line": c})
+           ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 176, in cmd
+    self.f.flush()
+    ~~~~~~~~~~~~^^
+  File "D:\Python315\Lib\socket.py", line 756, in write
+    return self._sock.send(b)
+           ~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。

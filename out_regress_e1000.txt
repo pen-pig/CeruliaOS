@@ -1,0 +1,17 @@
+﻿== test_e1000: e1000 NIC driver E2E ==
+   PASS claimed the e1000 device
+   PASS MAC matches -device mac=
+   PASS no rtl8139 fallback
+   PASS lease acquired
+   PASS got offered address 10.0.2.66
+   PASS no timeout/NAK branch taken
+   PASS DISCOVER received
+   PASS REQUEST received
+   PASS DISCOVER checksums valid
+   PASS ping gateway works on the new address
+   PASS gateway actually saw ICMP echoes
+   PASS outgoing packets really use the leased address
+   PASS `nic` shows e1000 identity
+   PASS base is MMIO (not port io)
+
+14/14 passed

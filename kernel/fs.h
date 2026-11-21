@@ -1,0 +1,132 @@
+/*
+ * fs.h - 文件系统统一分发层
+ *
+ * 职责：
+ *   - MBR 分区扫描（含 superfloppy 整盘卷）
+ *   - exFAT / FAT12 / FAT16 / FAT32（可写）自动识别与挂载
+ *   - ext4 / NTFS / F2FS / EROFS（只读）自动识别与挂载
+ *   - 对内核其余部分提供与具体文件系统无关的 fs_* API
+ *   - fs_create_file 为 create-or-replace 语义（覆盖写）
+ */
+#ifndef FS_H
+#define FS_H
+
+#include "types.h"
+
+/* 当前挂载的文件系统类型 */
+#define FS_NONE  0
+#define FS_EXFAT 1
+#define FS_FAT12 12
+#define FS_FAT16 16
+#define FS_FAT32 32
+/* 只读文件系统（refs：GRUB fs 驱动 / Linux 内核源码） */
+#define FS_EXT4  4
+#define FS_NTFS  5
+#define FS_F2FS  6
+#define FS_EROFS 7
+#define FS_REFS  8
+
+/* 目录项输出结构（与 exfat_dir_entry_t / fat_dir_entry_t 布局一致） */
+typedef struct {
+    char     name[256];
+    uint32_t size;
+    uint8_t  is_dir;
+} fs_dir_entry_t;
+
+/* 通用卷信息（两种后端的公共字段子集） */
+typedef struct {
+    uint8_t  type;                /* FS_* */
+    uint8_t  drive;               /* ATA 驱动器号 0-3 */
+    uint32_t part_start;          /* 卷起始绝对 LBA */
+    uint16_t bytes_per_sector;
+    uint8_t  sectors_per_cluster;
+    uint32_t cluster_count;       /* 数据簇总数 */
+    uint32_t volume_sectors;      /* 卷总扇区数 */
+} fs_info_t;
+
+/* 挂载：0=成功（已挂载任意文件系统）；-1=无介质；-2=有介质但无可识别文件系统 */
+int fs_init(void);
+
+/* 是否已挂载 */
+int fs_ready(void);
+
+/* 当前挂载是否为只读文件系统（ext4/NTFS/F2FS/EROFS） */
+int fs_is_readonly(void);
+
+/* 类型名："exFAT" / "FAT12" / "FAT16" / "FAT32" / "ext4" / "NTFS" / "F2FS" / "EROFS" / "ReFS" / "none" */
+const char *fs_type_name(void);
+
+/* 挂载后卷信息（未挂载时 type==FS_NONE） */
+const fs_info_t *fs_get_info(void);
+
+/* Serialize multi-step file operations with mount changes. May sleep; callers
+ * neither nest the guard nor take it in an interrupt handler. */
+void fs_operation_lock(void);
+void fs_operation_unlock(void);
+uint32_t fs_mount_generation(void);
+
+/* 切换首选数据盘（0-3；下次 fs_init 重新扫描挂载） */
+void fs_set_drive(uint8_t drive);
+
+/* Local account storage is not exposed through the user API/syscalls. */
+#define FS_ACCOUNT_DB "/etc/accounts.db"
+#define FS_ACCOUNT_MARKER "/etc/multiuser.on"
+int fs_save_account_db(const void *data, uint32_t size);
+int fs_prepare_account_home(const char *home, uint32_t uid, int existing_ok);
+void fs_enter_account_home(const char *home, uint32_t uid);
+
+/* 将首选数据盘格式化为指定文件系统（FS_EXFAT/FS_FAT12/FS_FAT16/FS_FAT32；
+ * 只读 FS（ext4/NTFS/F2FS/EROFS）不支持格式化返回 -1；
+ * 拒绝格式化 0 号引导盘。成功后立即挂载为该类型） */
+int fs_format(int fs_type);
+
+/* ---- 以下 API 语义与原 exfat_* 完全一致 ---- */
+int      fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size);
+uint32_t fs_get_file_size(const char *name);
+int      fs_create_file(const char *name, const uint8_t *data, uint32_t size);
+int      fs_delete_file(const char *name);
+int      fs_list_root(void);
+int      fs_read_dir(fs_dir_entry_t *entries, int max_entries);
+/* 带路径的列目录：/bin 与 /system 走内核内置只读系统卷，其余走当前磁盘卷 */
+int      fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries);
+/* stat：存在经 size/is_dir 写回属性返回 0；不存在/未挂载返回 -1。
+ * 文件大小超出 32 位时饱和至 UINT32_MAX，不得截断成较小的大小。 */
+int      fs_stat(const char *name, uint32_t *size, uint8_t *is_dir);
+int      fs_change_dir(const char *name);
+int      fs_mkdir(const char *name);
+int      fs_rmdir(const char *name);   /* 删空目录；非目录/非空/不存在均 -1 */
+const char *fs_cwd_path(void);
+/* Capture a path independent of future cd commands; reject overflow. */
+int fs_absolute_path(const char *name, char *out, uint32_t outsz);
+
+/* ---- 系统卷当前目录（cd /bin、cd /system 之后的相对路径解析） ----
+ *
+ * 系统卷是内核内置的只读 blob，没有目录簇，磁盘卷那套 cwd 完全管不到它。
+ * 之前 shell 只在呈现层记着 cwd（`cd /system` 后 ls / pwd 看着对，但
+ * `cat version` 仍报 no such file，只有绝对路径 `/system/version` 能用）。
+ * cwd 下沉到本层后，所有 fs_* 入口统一先过 fs_resolve_path()，
+ * 相对路径才真的可用；写操作解析成 /bin/... 后仍会被系统卷的只读检查拒掉。
+ *
+ * fs_sysvol_cwd() 返回 ""（不在系统卷）或 "/bin"、"/system"（带斜杠）。 */
+const char *fs_sysvol_cwd(void);
+int fs_set_sysvol_cwd(const char *dir);   /* "" 清空；"/bin"、"/system" 或裸名 */
+/* 相对名 -> 绝对路径。不在系统卷 / 已是绝对路径 / "." / ".." 一律原样返回。
+ * 失败（缓冲不足或空指针）返回 -1。 */
+int fs_resolve_path(const char *name, char *out, uint32_t outsz);
+uint32_t fs_count_used_clusters(void);
+uint32_t fs_get_file_clusters(const char *name);
+
+/* ---- Unix 权限（P2）----
+ * ext4 有真实 mode/uid/gid；FAT/exFAT 显示基于主目录的合成权限，系统卷只读。
+ * 检查函数返回 0=允许 -1=拒绝；各写入口权限拒绝时返回 -2（区别于 -1=不存在）。
+ * 管理员绕过 Unix mode；其他账户按 owner/group/other 位判定。 */
+int fs_get_perm(const char *path, uint16_t *mode, uint16_t *uid, uint16_t *gid);
+int fs_check_read(const char *path);
+int fs_check_write(const char *path);          /* 已有文件的 w 位 */
+int fs_check_exec(const char *path);
+int fs_check_parent_write(const char *path);   /* 父目录 w+x：创建/删除/建目录用 */
+/* chmod/chown：0=成功 -1=路径不存在 -2=权限不足（非 owner/root） -3=卷不支持（FAT/exFAT 等） */
+int fs_chmod(const char *path, uint16_t mode);
+int fs_chown(const char *path, uint32_t uid);  /* 仅 root */
+
+#endif

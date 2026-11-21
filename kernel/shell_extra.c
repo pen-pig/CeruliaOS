@@ -1,0 +1,3393 @@
+/*
+ * shell_extra.c - Cerulia 命令行增强模块
+ *
+ * 借鉴来源：MikanOS (https://github.com/uchan-nos/mikanOS, Apache-2.0)
+ *   - MakeArgVector(): 把整行命令按空白拆分为 argv/argc 的参数解析框架
+ *   - ls 详细模式 / hexdump / mem / echo / help 等命令语义
+ *
+ * 适配层：ezos_console_* 把 Cerulia tty 文本终端与键盘驱动桥接为
+ * 轻量 console 接口，使上层命令实现与具体终端解耦（最小改动兼容）。
+ *
+ * 编译环境：i686-elf-gcc，-ffreestanding，无 libc。
+ */
+
+#include "shell_extra.h"
+#include "gfx.h"
+#include "version.h"
+#include "tty.h"
+#include "keyboard.h"
+#include "types.h"
+#include "port.h"
+#include "fs.h"
+#include "isr.h"
+#include "dmesg.h"
+#include "kmalloc.h"
+#include "http.h"
+#include "paging.h"
+#include "syscall.h"
+#include "pmm.h"
+#include "lockselftest.h"
+#include "elf.h"
+#include "exec.h"
+#include "fpu.h"
+#include "calc.h"
+#include "task.h"
+#include "fd.h"
+#include "pci.h"
+#include "rtl8139.h"
+#include "net.h"
+#include "serial.h"
+#include "acpi.h"
+#include "ata.h"
+#include "stackchk.h"   /* 任务内核栈守卫：stackchk / stackchk selftest */
+#include "oomtest.h"    /* OOM 演练：oomtest */
+#include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
+#include "rust_bridge.h"    /* Rust / Zig 侧实现 */
+#include "mouse.h"          /* mouse_selftest / mouse_protocol / 指针状态 */
+#include "webview.h"        /* wv_parse_mem / wv_dump（htmltest 自检） */
+
+/* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
+static const char *ips_of(uint32_t be);
+/* "a.b.c.d" -> 网络序 u32（定义在 ips_of 旁边）；成功返回 1 */
+static int parse_ipv4(const char *s, uint32_t *be);
+
+
+
+void ezos_console_putchar(char c) {
+    terminal_putchar(c);
+}
+
+void ezos_console_write(const char *s) {
+    terminal_writestring(s);
+}
+
+void ezos_console_print_dec(uint32_t num) {
+    char buf[16];
+    int len = 0;
+    if (num == 0) {
+        terminal_putchar('0');
+        return;
+    }
+    while (num > 0) {
+        buf[len++] = '0' + (num % 10);
+        num /= 10;
+    }
+    while (len > 0) terminal_putchar(buf[--len]);
+}
+
+void ezos_console_print_hex32(uint32_t val) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 28; i >= 0; i -= 4) {
+        terminal_putchar(hex[(val >> i) & 0xF]);
+    }
+}
+
+void ezos_console_print_hex_byte(uint8_t val) {
+    static const char hex[] = "0123456789ABCDEF";
+    terminal_putchar(hex[val >> 4]);
+    terminal_putchar(hex[val & 0x0F]);
+}
+
+/* 行编辑读取：回显字符、支持退格；返回长度（Esc 返回 -1） */
+int ezos_console_readline(char *buf, int maxlen) {
+    int n = 0;
+    while (1) {
+        int c = keyboard_getchar();
+        if (c == 0) {
+            /* 步骤 8a：没键就睡（IRQ1 唤醒 / 30s 超时兜底），不再忙轮询——
+             * shell 空闲时 CPU 停在 hlt 上，风扇/功耗友好，也让出片给
+             * 其它任务。仅任务上下文可睡：shell 正是任务 0。 */
+            keyboard_block();
+            continue;
+        }
+        if (c == 27) return -1;
+        if (c == '\n') {
+            terminal_putchar('\n');
+            buf[n] = '\0';
+            return n;
+        }
+        if (c == '\b') {
+            if (n > 0) {
+                n--;
+                terminal_putchar('\b');
+                terminal_putchar(' ');
+                terminal_putchar('\b');
+            }
+            continue;
+        }
+        if (n < maxlen - 1) {
+            buf[n++] = (char)c;
+            terminal_putchar((char)c);
+        }
+    }
+}
+
+/* ==================================================================
+ * 2. 工具函数（freestanding，无 libc）
+ * ================================================================== */
+
+static int x_tolower(char c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+
+static int x_strcasecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = x_tolower(*a), cb = x_tolower(*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return *a - *b;
+}
+
+static int x_atoi(const char *s) {
+    int result = 0;
+    while (*s >= '0' && *s <= '9') {
+        int d = *s - '0';
+        if (result > (2147483647 - d) / 10) return 2147483647;  /* 溢出钳制 */
+        result = result * 10 + d;
+        s++;
+    }
+    return result;
+}
+
+static int x_hex_char_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static uint32_t x_htoi(const char *s) {
+    uint32_t result = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    while (*s) {
+        int v = x_hex_char_val(*s);
+        if (v < 0) break;
+        result = (result << 4) | v;
+        s++;
+    }
+    return result;
+}
+
+/* ==================================================================
+ * 3. argv 参数解析框架（借鉴 MikanOS MakeArgVector）
+ *
+ * 把一行输入按空白拆成 argv[0..argc-1]，token 拷贝到内部 argbuf。
+ * MikanOS 原版使用 C++ lambda + Error 返回；此处以 C 语言最小化改写。
+ * ================================================================== */
+
+#define EZOS_MAX_ARGS 16
+#define EZOS_ARGBUF_SIZE 256
+
+typedef struct {
+    int argc;
+    char *argv[EZOS_MAX_ARGS];
+    char argbuf[EZOS_ARGBUF_SIZE];
+} ezos_args_t;
+
+static void ezos_parse_args(const char *line, ezos_args_t *a) {
+    int argc = 0;
+    int argbuf_index = 0;
+
+    a->argc = 0;
+    while (*line == ' ') line++;
+    if (*line == '\0') return;
+
+    while (1) {
+        if (argc >= EZOS_MAX_ARGS || argbuf_index >= EZOS_ARGBUF_SIZE) break;
+
+        a->argv[argc] = &a->argbuf[argbuf_index];
+        while (*line != '\0' && *line != ' ' && argbuf_index < EZOS_ARGBUF_SIZE - 1) {
+            a->argbuf[argbuf_index++] = *line++;
+        }
+        a->argbuf[argbuf_index++] = '\0';
+        argc++;
+
+        while (*line == ' ') line++;
+        if (*line == '\0') break;
+    }
+    a->argc = argc;
+}
+
+/* ==================================================================
+ * 4. 命令别名表
+ * ================================================================== */
+
+#define MAX_ALIASES 16
+#define ALIAS_NAME_MAX 24
+#define ALIAS_CMD_MAX 96
+
+static char alias_names[MAX_ALIASES][ALIAS_NAME_MAX];
+static char alias_cmds[MAX_ALIASES][ALIAS_CMD_MAX];
+static int alias_count = 0;
+
+const char *shell_extra_lookup_alias(const char *name) {
+    for (int i = 0; i < alias_count; i++) {
+        if (x_strcasecmp(name, alias_names[i]) == 0) {
+            return alias_cmds[i];
+        }
+    }
+    return NULL;
+}
+
+/* ==================================================================
+ * 5. 新命令实现
+ * ================================================================== */
+
+/* ver: 显示内核版本 */
+void cmd_ver(const char *args) {
+    (void)args;
+    ezos_console_write("Cerulia Kernel version " EZOS_VERSION " (i386)\n");
+}
+
+/* sysinfo: 汇总系统信息（CPU / 内存 / 时间 / 版本） */
+static uint8_t x_cmos_read(uint8_t reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static uint8_t x_bcd2dec(uint8_t v) {
+    return (uint8_t)((v & 0x0F) + ((v >> 4) * 10));
+}
+
+static void x_print_cpu_vendor(void) {
+    uint32_t eax, ebx, ecx, edx;
+    char vendor[13];
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
+    ((uint32_t*)vendor)[0] = ebx;
+    ((uint32_t*)vendor)[1] = edx;
+    ((uint32_t*)vendor)[2] = ecx;
+    vendor[12] = '\0';
+    ezos_console_write(vendor);
+}
+
+void cmd_sysinfo(const char *args) {
+    (void)args;
+
+    ezos_console_write("Cerulia System Information\n");
+    ezos_console_write("------------------------\n");
+    ezos_console_write("Version : " EZOS_VERSION " (i386)\n");
+    ezos_console_write("CPU     : ");
+    x_print_cpu_vendor();
+    ezos_console_write("\n");
+
+    uint16_t mem_kb = (uint16_t)((x_cmos_read(0x16) << 8) | x_cmos_read(0x15));
+    uint16_t ext_kb = (uint16_t)((x_cmos_read(0x18) << 8) | x_cmos_read(0x17));
+    ezos_console_write("Base mem: ");
+    ezos_console_print_dec(mem_kb);
+    ezos_console_write(" KB\n");
+    ezos_console_write("Ext  mem: ");
+    ezos_console_print_dec(ext_kb);
+    ezos_console_write(" KB\n");
+    ezos_console_write("Total   : ");
+    ezos_console_print_dec(mem_kb + ext_kb);
+    ezos_console_write(" KB\n");
+
+    uint8_t hour = x_bcd2dec(x_cmos_read(0x04));
+    uint8_t minute = x_bcd2dec(x_cmos_read(0x02));
+    uint8_t second = x_bcd2dec(x_cmos_read(0x00));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+    ezos_console_write("Time    : ");
+    if (hour < 10) ezos_console_putchar('0');
+    ezos_console_print_dec(hour);
+    ezos_console_putchar(':');
+    if (minute < 10) ezos_console_putchar('0');
+    ezos_console_print_dec(minute);
+    ezos_console_putchar(':');
+    if (second < 10) ezos_console_putchar('0');
+    ezos_console_print_dec(second);
+    ezos_console_write("\n");
+
+    uint8_t year = x_bcd2dec(x_cmos_read(0x09));
+    uint8_t month = x_bcd2dec(x_cmos_read(0x08));
+    uint8_t day = x_bcd2dec(x_cmos_read(0x07));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
+    ezos_console_write("Date    : ");
+    ezos_console_print_dec(year + 2000);
+    ezos_console_putchar('-');
+    if (month < 10) ezos_console_putchar('0');
+    ezos_console_print_dec(month);
+    ezos_console_putchar('-');
+    if (day < 10) ezos_console_putchar('0');
+    ezos_console_print_dec(day);
+    ezos_console_write("\n");
+}
+
+/* type / which: 查询命令类型（内建 / 别名 / 外部 / 未知） */
+extern int shell_is_builtin(const char *name);
+
+static void x_type_common(const char *args, int which_mode) {
+    char name[64];
+    int i = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && i < 63) name[i++] = *args++;
+    name[i] = '\0';
+
+    if (i == 0) {
+        ezos_console_write(which_mode ? "Usage: which <command>\n" : "Usage: type <command>\n");
+        return;
+    }
+
+    if (shell_is_builtin(name)) {
+        ezos_console_write(name);
+        ezos_console_write(which_mode ? ": built-in command\n" : " is a shell builtin\n");
+        return;
+    }
+    if (shell_extra_lookup_alias(name)) {
+        ezos_console_write(name);
+        ezos_console_write(which_mode ? ": aliased command\n" : " is an alias\n");
+        return;
+    }
+    if (fs_init() == 0) {
+        /* 检查当前目录是否存在同名文件 */
+        char dummy[1];
+        if (fs_get_file_size(name) > 0) {
+            ezos_console_write(name);
+            ezos_console_write(which_mode ? ": external file\n" : " is a file in cwd\n");
+            return;
+        }
+        (void)dummy;
+    }
+    ezos_console_write(name);
+    ezos_console_write(which_mode ? ": not found\n" : ": not found\n");
+}
+
+void cmd_type(const char *args) {
+    x_type_common(args, 0);
+}
+
+void cmd_which(const char *args) {
+    x_type_common(args, 1);
+}
+
+/* alias: 列出 / 定义命令别名。语法 alias [name=value] [name...] */
+void cmd_alias(const char *args) {
+    if (*args == '\0') {
+        if (alias_count == 0) {
+            ezos_console_write("No aliases defined.\n");
+            return;
+        }
+        for (int i = 0; i < alias_count; i++) {
+            ezos_console_write("alias ");
+            ezos_console_write(alias_names[i]);
+            ezos_console_write("='");
+            ezos_console_write(alias_cmds[i]);
+            ezos_console_write("'\n");
+        }
+        return;
+    }
+
+    /* 首个 token 若含 '='，则视为 name=value（value 取到行尾，支持空格与引号） */
+    const char *p = args;
+    while (*p == ' ') p++;
+    const char *name_start = p;
+    while (*p && *p != '=' && *p != ' ') p++;
+    if (*p == '=') {
+        int nl = (int)(p - name_start);
+        if (nl <= 0 || nl >= ALIAS_NAME_MAX) {
+            ezos_console_write("alias: invalid name\n");
+            return;
+        }
+        char name[ALIAS_NAME_MAX];
+        for (int i = 0; i < nl; i++) name[i] = name_start[i];
+        name[nl] = '\0';
+
+        p++;
+        const char *value = p;
+        int vl = 0;
+        while (value[vl] && value[vl] != '\n' && value[vl] != '\r') vl++;
+        while (vl > 0 && (value[vl - 1] == ' ' || value[vl - 1] == '\t')) vl--;
+        if (vl >= 2 && value[0] == '\'' && value[vl - 1] == '\'') {
+            value++;
+            vl -= 2;
+        }
+        if (vl <= 0 || vl >= ALIAS_CMD_MAX) {
+            ezos_console_write("alias: invalid value\n");
+            return;
+        }
+
+        int slot = alias_count;
+        for (int i = 0; i < alias_count; i++) {
+            if (x_strcasecmp(alias_names[i], name) == 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= MAX_ALIASES) {
+            ezos_console_write("alias: table full\n");
+            return;
+        }
+        for (int i = 0; i <= nl; i++) alias_names[slot][i] = name[i];
+        for (int i = 0; i < vl; i++) alias_cmds[slot][i] = value[i];
+        alias_cmds[slot][vl] = '\0';
+        if (slot == alias_count) alias_count++;
+        return;
+    }
+
+    /* 无 '='：全部作为别名名查询 */
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    for (int k = 0; k < a.argc; k++) {
+        const char *v = shell_extra_lookup_alias(a.argv[k]);
+        if (v) {
+            ezos_console_write("alias ");
+            ezos_console_write(a.argv[k]);
+            ezos_console_write("='");
+            ezos_console_write(v);
+            ezos_console_write("'\n");
+        } else {
+            ezos_console_write(a.argv[k]);
+            ezos_console_write(": alias not found\n");
+        }
+    }
+}
+
+/* unalias: 删除命令别名 */
+void cmd_unalias(const char *args) {
+    char name[ALIAS_NAME_MAX];
+    int i = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && i < ALIAS_NAME_MAX - 1) name[i++] = *args++;
+    name[i] = '\0';
+
+    if (i == 0) {
+        ezos_console_write("Usage: unalias <name>\n");
+        return;
+    }
+    for (int k = 0; k < alias_count; k++) {
+        if (x_strcasecmp(alias_names[k], name) == 0) {
+            for (int m = k; m < alias_count - 1; m++) {
+                for (int j = 0; j < ALIAS_NAME_MAX; j++) alias_names[m][j] = alias_names[m + 1][j];
+                for (int j = 0; j < ALIAS_CMD_MAX; j++) alias_cmds[m][j] = alias_cmds[m + 1][j];
+            }
+            alias_count--;
+            ezos_console_write("Unaliased: ");
+            ezos_console_write(name);
+            ezos_console_write("\n");
+            return;
+        }
+    }
+    ezos_console_write("unalias: ");
+    ezos_console_write(name);
+    ezos_console_write(": not found\n");
+}
+
+
+/* uptime: 开机时长（PIT 1000Hz tick 计） */
+void cmd_uptime(const char *args) {
+    (void)args;
+    uint32_t ticks = g_pit_ticks;
+    /* 顺带锁存 ch0 counter（诊断时钟用：counter 按需读，不走 IRQ） */
+    outb(0x43, 0x00);
+    uint16_t cnt = (uint16_t)(inb(0x40) | (inb(0x40) << 8));
+    ezos_console_write("up ");
+    ezos_console_print_dec(ticks / 1000);
+    ezos_console_write("s (ticks ");
+    ezos_console_print_dec(ticks);
+    ezos_console_write(" c ");
+    ezos_console_print_dec(cnt);
+    ezos_console_write(")\n");
+}
+
+/* dmesg [n] - 回看内核环形日志（默认全部；n = 最近 n 行） */
+void cmd_dmesg(const char *args) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    int n = 0;                             /* 0 = 全部 */
+    if (a.argc >= 1) {
+        n = x_atoi(a.argv[0]);
+        if (n < 0) n = 0;
+    }
+    ezos_console_write("dmesg: last ");
+    ezos_console_print_dec(dmesg_lines());
+    ezos_console_write(" line(s) buffered\n");
+    int dumped = dmesg_dump(ezos_console_putchar, n);
+    if (dumped == 0) ezos_console_write("(empty)\n");
+}
+
+/* kmtest - 堆分配器自检：分配/释放/合并/越界检测演练 */
+/* utest：ring3 + 系统调用自检。
+ *   1) 内核侧断言：非用户页（.bss.hi 的 0x00100000）必须被 user_range_ok 拒绝
+ *   2) 映射用户页 -> 装入内建用户程序 -> enter_usermode() 切入 ring3
+ *   3) 用户程序两次 SYS_WRITE（各往返一次 ring3->ring0->ring3）后 SYS_EXIT
+ *   4) 校验退出码与系统调用计数
+ * 用户程序的输出直接由 SYS_WRITE 打到终端，穿插在本函数输出之间。 */
+void cmd_utest(const char *args) {
+    (void)args;
+    ezos_console_write("usermode demo (step 4):\n");
+
+    /* 1) 安全边界"拒绝"侧（此刻用户页尚未映射）
+     *    只测拒绝不够：校验逻辑若写反到"一律拒绝"，测试同样会显示通过，
+     *    而真实的用户 write 会全部失败——必须正反两侧都验。 */
+    int rej_kernel = (syscall_user_range_ok(0x00100000u, 4) == 0);  /* 已映射但无 PTE_US */
+    int rej_unmap  = (syscall_user_range_ok(0x05000000u, 4) == 0);  /* 完全未映射 */
+    ezos_console_write("  kernel page rejected: ");
+    ezos_console_write(rej_kernel ? "yes [OK]\n" : "NO [FAIL]\n");
+    ezos_console_write("  unmapped page rejected: ");
+    ezos_console_write(rej_unmap ? "yes [OK]\n" : "NO [FAIL]\n");
+
+    /* 2) ring3 实跑（用户输出在此之间直接打印） */
+    uint32_t before = syscall_count();
+    ezos_console_write("  entering ring 3 at 0x00400000...\n");
+
+    int rc = usermode_run_demo();
+
+    ezos_console_write("  back in ring 0, exit code ");
+    ezos_console_print_dec((uint32_t)rc);
+    ezos_console_write(", syscalls ");
+    ezos_console_print_dec(syscall_count() - before);
+    ezos_console_write("\n");
+
+    /* 3) 安全边界"放行"侧：此时用户代码页已映射且带 US|RW */
+    int ok_user = (syscall_user_range_ok(0x00400000u, 4) == 1);
+    int ok_rw   = (syscall_user_range_rw(0x00400000u, 4) == 1);
+    ezos_console_write("  user page accepted: ");
+    ezos_console_write(ok_user ? "yes [OK]\n" : "NO [FAIL]\n");
+    ezos_console_write("  user page writable: ");
+    ezos_console_write(ok_rw ? "yes [OK]\n" : "NO [FAIL]\n");
+
+    int ok = rej_kernel && rej_unmap && ok_user && ok_rw &&
+             (rc == 0) && (syscall_count() - before == 3);
+    ezos_console_write(ok ? "  result: PASS\n" : "  result: FAIL\n");
+}
+
+/* pagetest：分页自检（identity 一致性 + 动态映射/读写/解映射）。
+ * 不主动触发 #PF——破坏性缺页测试用 `crash pf`。 */
+/* 自检明细输出：带简单着色——块里含 FAIL 整块红、含 [OK]/PASS 整块绿，
+ * 其余默认色。只改 VGA 属性，文本字符一个不动（E2E 靠 OCR 断言文本）。 */
+static void pg_puts(const char *s) {
+    int has_fail = 0, has_ok = 0;
+    for (const char *q = s; q[0]; q++) {
+        if (q[0] == 'F' && q[1] == 'A' && q[2] == 'I' && q[3] == 'L')
+            has_fail = 1;
+        if ((q[0] == '[' && q[1] == 'O' && q[2] == 'K' && q[3] == ']') ||
+            (q[0] == 'P' && q[1] == 'A' && q[2] == 'S' && q[3] == 'S'))
+            has_ok = 1;
+    }
+    if (has_fail)      terminal_setcolor(0x0C);
+    else if (has_ok)   terminal_setcolor(0x0A);
+    ezos_console_write(s);
+    terminal_setcolor(0x07);
+}
+
+/* elftest：ELF 加载器自检（步骤 5b） */
+void cmd_elftest(const char *args) {
+    (void)args;
+    int fail = elf_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    } else {
+        ezos_console_write("  result: PASS\n");
+    }
+}
+
+/* exec：从盘上装载 ELF32 用户程序并在 ring3 执行（步骤 5d） */
+void cmd_exec(const char *args) {
+    /* 第一个空白之前是文件名，其余原样作为用户程序的命令行参数 */
+    char name[64];
+    int i = 0;
+    while (args[i] != '\0' && args[i] != ' ' && i < 63) { name[i] = args[i]; i++; }
+    name[i] = '\0';
+    const char *rest = args + i;
+    while (*rest == ' ') rest++;
+
+    if (name[0] == '\0') {
+        ezos_console_write("exec: usage: exec <file> [args...]\n");
+        return;
+    }
+
+    ezos_console_write("exec: loading ");
+    ezos_console_write(name);
+    ezos_console_write(" ...\n");
+
+    const char *why = 0;
+    int rc = exec_file(name, rest, &why);
+    if (rc < 0) {
+        ezos_console_write("exec: ");
+        ezos_console_write(name);
+        ezos_console_write(": ");
+        ezos_console_write(why ? why : "failed");
+        ezos_console_write("\n");
+        return;
+    }
+    ezos_console_write("exec: ");
+    ezos_console_write(name);
+    ezos_console_write(" exited with code ");
+    ezos_console_print_dec((uint32_t)rc);
+    ezos_console_write("\n");
+}
+
+/* calc：浮点计算器（步骤 5e）。
+ * 递归下降解析 + x87 求值，语法见 calc.h。
+ * 结果打印：整数不带小数点，其余固定 6 位小数（四舍五入）。 */
+void cmd_calc(const char *args) {
+    if (args == 0 || args[0] == '\0') {
+        ezos_console_write("calc <expr> - floating point calculator\n");
+        ezos_console_write("  ops: + - * / % ^ ( )\n");
+        ezos_console_write("  funcs: sqrt sin cos tan exp ln log abs floor ceil round\n");
+        ezos_console_write("  consts: pi e\n");
+        ezos_console_write("  examples:\n");
+        ezos_console_write("    calc 1.5*2+1\n");
+        ezos_console_write("    calc sqrt(2)\n");
+        ezos_console_write("    calc sin(pi/6)*100\n");
+        return;
+    }
+
+    if (!fpu_available()) {
+        ezos_console_write("calc: no FPU present on this machine\n");
+        return;
+    }
+
+    double v;
+    const char *err = 0;
+    if (calc_eval(args, &v, &err) != 0) {
+        ezos_console_write("calc: ");
+        ezos_console_write(err ? err : "error");
+        ezos_console_write("\n");
+        return;
+    }
+
+    ezos_console_write("= ");
+    /* 打印：四舍五入到 6 位小数；round(x*1e6)/1e6 会引入双重舍入误差，
+     * 但显示 6 位小数时不可见，且实现只需一次 x87 调整。 */
+    double r = v;
+    if (r < 0) { ezos_console_write("-"); r = -r; }
+    double scaled = r * 1000000.0 + 0.5;      /* 舍入 */
+    uint32_t whole = (uint32_t)(scaled / 1000000.0);
+    uint32_t frac  = (uint32_t)(scaled - (double)whole * 1000000.0);
+    /* 舍入可能进位到 1e6（如 0.9999996） */
+    if (frac >= 1000000u) { whole += 1; frac -= 1000000u; }
+    ezos_console_print_dec(whole);
+    if (frac != 0) {
+        ezos_console_write(".");
+        char digits[7];
+        for (int i = 5; i >= 0; i--) { digits[i] = (char)('0' + frac % 10u); frac /= 10u; }
+        digits[6] = '\0';
+        /* 去掉尾部的 0（0.5 而不是 0.500000） */
+        int end = 6;
+        while (end > 0 && digits[end - 1] == '0') end--;
+        digits[end] = '\0';
+        ezos_console_write(digits);
+    }
+    ezos_console_write("\n");
+}
+
+/* selftest：一键运行所有子系统自检（步骤 5e） */
+/* ---------- 自检报告 ---------- */
+/*
+ * 内核没有 snprintf，所以手工把字符串与十进制数拼进定长缓冲。
+ *
+ * 为什么要同时写 dmesg：开机自检发生在 shell 起来之前，屏幕一滚就再也看不到，
+ * 进环形缓冲后才能用 `dmesg` 事后回看（panic 屏也带最近几行）。
+ *
+ * 顺带给每一项记耗时：PIT 是 1000Hz，一个 tick = 1ms，哪个子系统变慢一眼可见。
+ * 每项还带上自己的关键指标（堆用量、映射页数、物理页用量…），
+ * 这样自检不只是"PASS/FAIL"，出问题时能直接看出是哪个量不对。
+ */
+static void st_puts(char *b, uint32_t *p, uint32_t cap, const char *s) {
+    while (*s && *p + 1 < cap) b[(*p)++] = *s++;
+}
+static void st_putd(char *b, uint32_t *p, uint32_t cap, uint32_t v) {
+    char t[12];
+    int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + (v % 10u)); v /= 10u; }
+    while (n && *p + 1 < cap) b[(*p)++] = t[--n];
+}
+
+/* 一行自检结果：<prefix><name>: PASS|FAIL  (<detail>)  [<ms> ms]
+ * 终端输出时 PASS 绿 / FAIL 红（只改 VGA 属性，文本字符不变）；
+ * dmesg 那份保持完整纯文本。 */
+static void st_report_ex(const char *prefix, const char *name, int fails,
+                         uint32_t t0, const char *detail, int to_console) {
+    char line[200];
+    uint32_t p = 0;
+    st_puts(line, &p, sizeof(line), prefix);
+    st_puts(line, &p, sizeof(line), name);
+    st_puts(line, &p, sizeof(line), ": ");
+    uint32_t mark = p;                       /* 判定词起点 */
+    st_puts(line, &p, sizeof(line), fails ? "FAIL" : "PASS");
+    uint32_t mark2 = p;                      /* 判定词终点 */
+    if (detail && detail[0]) {
+        st_puts(line, &p, sizeof(line), "  (");
+        st_puts(line, &p, sizeof(line), detail);
+        st_puts(line, &p, sizeof(line), ")");
+    }
+    st_puts(line, &p, sizeof(line), "  [");
+    st_putd(line, &p, sizeof(line), g_pit_ticks - t0);
+    st_puts(line, &p, sizeof(line), " ms]\n");
+    line[p] = '\0';
+    /* dmesg 那份走 dmesg_record（**不**写串口）：上屏时 terminal_putchar
+     * 已经把每个字符镜像到 COM1 了，这里再写一遍串口日志上就是双份。 */
+    dmesg_record(line);                      /* 完整纯文本行进日志 */
+    if (!to_console) return;                 /* 静默路径：只进 dmesg，不上屏 */
+    char save0 = line[mark], save1 = line[mark2];
+    line[mark] = '\0';
+    ezos_console_write(line);                /* 前半段：默认色 */
+    line[mark] = save0;
+    line[mark2] = '\0';
+    terminal_setcolor((uint8_t)(fails ? 0x0C : 0x0A));
+    ezos_console_write(line + mark);         /* 判定词：红/绿 */
+    terminal_setcolor(0x07);
+    line[mark2] = save1;
+    ezos_console_write(line + mark2);        /* 余下：默认色 */
+}
+
+/* 上屏版（shell 的 selftest 用） */
+static void st_report(const char *prefix, const char *name, int fails,
+                      uint32_t t0, const char *detail) {
+    st_report_ex(prefix, name, fails, t0, detail, 1);
+}
+
+/* ==================================================================
+ * 1b. 硬件/软件扩展自检探针（真机点亮配套）
+ *
+ * 约定：每个探针返回失败计数（0 = 通过）；detail 非空时填一行人话
+ * 指标（boot 静默路径传 NULL）。探针一律只读或自恢复，绝不破坏
+ * 系统状态；不可信输入（端口返回值）全部有上界/超时。
+ * ================================================================== */
+
+/* serial：COM1 环回自检已在 serial_init 做过，这里断言其结果 */
+static int st2_serial(char *detail, uint32_t ds) {
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, serial_ready() ? "COM1 115200 loopback ok"
+                                               : "COM1 absent");
+        detail[p] = '\0';
+    }
+    return 0;   /* 无串口不判失败：仅降级诊断能力 */
+}
+
+/* PIT channel 0 原始计数（不经过任何中断，纯硬件读数） */
+static uint16_t st2_pit_raw(void) {
+    outb(0x43, 0x00);            /* latch channel 0 */
+    uint8_t lo = inb(0x40);
+    uint8_t hi = inb(0x40);
+    return (uint16_t)(lo | ((uint16_t)hi << 8));
+}
+
+/* pit：PIT 硬件必须真的在走。
+ *
+ * 以前是"忙等 2000 万次循环看 g_pit_ticks 动没动"。这个写法有两个致命问题：
+ *   1) 2000 万次循环**不对应任何真实时间**——CPU 快慢差一个数量级，注释里
+ *      写的 "~200ms" 是拍脑袋；
+ *   2) 它把"IRQ0 驱动的软件 tick"当成了 PIT 本身的证据。只要 IRQ0 还没挂上
+ *      或者当时 IF 被屏蔽（驱动临界区里跑自检就会这样），PIT 明明是好的也
+ *      会 FAIL。实测：没有第二块盘的 QEMU 里这一项稳定 FAIL。
+ * 假 FAIL 比假 PASS 危险得多——开机一红，用户第一反应是"内核坏了"。
+ *
+ * 分两层：
+ *   1) 硬件层：直接读 PIT 计数器，两次读数必须不同。这一层失败才是真故障。
+ *   2) 中断层：等 g_pit_ticks 变化，但上界用**PIT 计数换算出的真实时间**
+ *      （约 50ms），不再用循环次数；没等到只写进 detail，不判失败。 */
+static int st2_pit(char *detail, uint32_t ds) {
+    /* --- 1) 硬件层：计数器必须自己往前走 --- */
+    uint16_t c0 = st2_pit_raw();
+    int moved = 0;
+    for (uint32_t tries = 0; tries < 2000 && !moved; tries++) {
+        for (volatile uint32_t i = 0; i < 500u; i++) { }
+        if (st2_pit_raw() != c0) moved = 1;
+    }
+    if (!moved) {
+        if (detail && ds) {
+            uint32_t p = 0;
+            st_puts(detail, &p, ds, "PIT counter frozen at ");
+            st_putd(detail, &p, ds, c0);
+            detail[p] = '\0';
+        }
+        return 1;
+    }
+
+    /* --- 2) 中断层：等到软件 tick 前进，上界约 50ms（用 PIT 计数计时）--- */
+    uint32_t t0 = g_pit_ticks;
+    uint32_t waited = 0;                 /* 累计的 PIT 递减量，1 单位 ≈ 0.838us */
+    uint16_t prev = st2_pit_raw();
+    while (g_pit_ticks == t0 && waited < 60000u) {
+        uint16_t now = st2_pit_raw();
+        waited += (now <= prev) ? (uint32_t)(prev - now)
+                                : (uint32_t)(prev + (1193u - now));   /* 回绕 */
+        prev = now;
+    }
+    int ticked = (g_pit_ticks != t0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        if (ticked) {
+            st_puts(detail, &p, ds, "counter running, tick +");
+            st_putd(detail, &p, ds, g_pit_ticks - t0);
+            st_puts(detail, &p, ds, " ms");
+        } else {
+            st_puts(detail, &p, ds, "counter running, IRQ0 tick not observed");
+        }
+        detail[p] = '\0';
+    }
+    return 0;   /* IRQ0 未挂/被屏蔽是环境差异，不是 PIT 故障 */
+}
+
+/* CMOS 只读（NMI 位保护）。shell.c 里的 cmos_read 是 static，这里自持一份 */
+static uint8_t cmos_read_reg(uint8_t reg) {
+    outb(0x70, (uint8_t)(0x80 | reg));
+    return inb(0x71);
+}
+
+/* rtc：CMOS 时钟 BCD/二进制自洽（秒/分/时/日/月全部在合法范围） */
+static int st2_rtc(char *detail, uint32_t ds) {
+    uint8_t srb = cmos_read_reg(0x0B);
+    int bcd = (srb & 0x04) == 0;
+    uint8_t sec = cmos_read_reg(0x00), min = cmos_read_reg(0x02);
+    uint8_t hour = cmos_read_reg(0x04), day = cmos_read_reg(0x07);
+    uint8_t mon = cmos_read_reg(0x08);
+    if (bcd) {   /* BCD -> 二进制 */
+        sec = (uint8_t)((sec & 0x0F) + (sec >> 4) * 10);
+        min = (uint8_t)((min & 0x0F) + (min >> 4) * 10);
+        hour = (uint8_t)((hour & 0x0F) + (hour >> 4) * 10);
+        day = (uint8_t)((day & 0x0F) + (day >> 4) * 10);
+        mon = (uint8_t)((mon & 0x0F) + (mon >> 4) * 10);
+    }
+    int ok = (sec < 60 && min < 60 && hour < 24 && day >= 1 && day <= 31 &&
+              mon >= 1 && mon <= 12);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "clock sane (24h)" : "clock garbage");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* ata：每个在位盘读 LBA0，主引导扇区必须以 0x55AA 结尾 */
+static int st2_ata(char *detail, uint32_t ds) {
+    int present = 0, bad = 0;
+    uint8_t buf[512];
+    for (uint8_t d = 0; d < 2; d++) {
+        if (!ata_drive_present(d)) continue;
+        present++;
+        if (ata_read_sector(d, 0, buf) != 0) { bad++; continue; }
+        if (buf[510] != 0x55 || buf[511] != 0xAA) bad++;
+    }
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)present);
+        st_puts(detail, &p, ds, " drive(s), MBR sig ");
+        st_puts(detail, &p, ds, bad ? "BAD" : "ok");
+        detail[p] = '\0';
+    }
+    /* 一块 ATA 盘都没有**不算失败**：从 U 盘（USB-MSC，drive 12..15）或
+     * NVMe 启动时压根不走 ATA，这是正常的启动形态，不是存储子系统坏了。
+     * 实测：USB 启动的 E2E 里这一项稳定 FAIL，跟 exec/fd 一起凑成"开机自检
+     * 红 3 项"，看着像内核崩了——其实只是这台机器没挂 ATA 盘。 */
+    if (present == 0) {
+        if (detail && ds) {
+            uint32_t p = 0;
+            st_puts(detail, &p, ds, "no ATA drive (storage may be USB/NVMe)");
+            detail[p] = '\0';
+        }
+        return 0;
+    }
+    return bad;
+}
+
+/* pci：配置空间枚举至少要找到 1 个设备（QEMU 有桥+RTL8139 等） */
+static int st2_pci(char *detail, uint32_t ds) {
+    int cnt = pci_device_count();
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(cnt < 0 ? 0 : cnt));
+        st_puts(detail, &p, ds, " device(s) enumerated");
+        detail[p] = '\0';
+    }
+    return (cnt >= 1) ? 0 : 1;
+}
+
+/* nic：在位则验证 MAC 非全 0/全 FF；不在位不算失败（真机可能没有） */
+static int st2_nic(char *detail, uint32_t ds) {
+    if (!netdev_present()) {
+        if (detail && ds) {
+            st_puts(detail, &ds, 0, "absent, skipped");
+            detail[ds] = '\0';
+        }
+        return 0;
+    }
+    const uint8_t *mac = netdev_mac();
+    int zero = 1, ff = 1;
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0x00) zero = 0;
+        if (mac[i] != 0xFF) ff = 0;
+    }
+    int ok = !(zero || ff);
+    if (detail && ds) {
+        uint32_t p = 0;
+        netdev_mac_str(detail + 16);
+        st_puts(detail, &p, ds, "mac ");
+        st_puts(detail, &p, ds, detail + 16);
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* acpi：断言子系统处于"明确定义的状态"之一：
+ *   FADT 解析成功（表在 identity 映射内）或 legacy 回退（无 RSDP/
+ *   表在映射外——QEMU 128MB 把表放 RAM 顶部 0x7FE22E0，内核只映射
+ *   32MB，读不到是已知限制而非故障）。两者都算 PASS，detail 如实
+ *   报告；只有 status 为空（init 没跑）才 FAIL。 */
+static int st2_acpi(char *detail, uint32_t ds) {
+    const char *s = acpi_status_line();
+    int ok = (s && s[0] != 0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, s ? s : "no status");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* kbd：8042 控制器自检（POST 同款）：命令 0xAA 必须回 0x55。
+ * 全程关中断：结果置 OBF 会触发 IRQ1，键盘 ISR 会把 0x55 当扫描码
+ * 读走（实测 58ms 超时 FAIL 的根因）。结束后重新使能键盘/辅助端口。 */
+static int st2_kbd(char *detail, uint32_t ds) {
+    if (inb(0x64) == 0xff) {
+        if (detail && ds) {
+            uint32_t p = 0;
+            st_puts(detail, &p, ds, "8042 absent (skipped)");
+            detail[p] = '\0';
+        }
+        return 0;
+    }
+    int ok = 0;
+    asm volatile("cli");
+    for (uint32_t i = 0; i < 200000u; i++)
+        if ((inb(0x64) & 0x02) == 0) { ok = 1; break; }   /* 等 IBF 清空 */
+    if (ok) {
+        outb(0x64, 0xAA);                        /* controller self-test */
+        ok = 0;
+        for (uint32_t i = 0; i < 200000u; i++) {
+            if ((inb(0x64) & 0x01) != 0) {       /* OBF：结果可读 */
+                uint8_t r = inb(0x60);
+                ok = (r == 0x55);
+                break;
+            }
+        }
+        outb(0x64, 0xAE);                        /* 重新使能键盘端口 */
+        outb(0x64, 0xA8);                        /* 重新使能辅助端口 */
+    }
+    asm volatile("sti");
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "controller 0x55 ok" : "no response");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* vga：文本内存非显示页（page 1 @0xB8000+4KB）写读回环 */
+static int st2_vga(char *detail, uint32_t ds) {
+    volatile uint16_t *page1 = (volatile uint16_t *)(0xB8000 + 4096);
+    int ok = 1;
+    for (int i = 0; i < 256; i++) page1[i] = (uint16_t)(0x5700u | (uint8_t)i);
+    for (int i = 0; i < 256; i++) {
+        if (page1[i] != (uint16_t)(0x5700u | (uint8_t)i)) { ok = 0; break; }
+    }
+    for (int i = 0; i < 256; i++) page1[i] = 0x0720u;   /* 清回空格 */
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "page1 512B pattern ok" : "pattern mismatch");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* tsc：i686 必有 TSC；两次读数必须不同（时间在流动） */
+static int st2_tsc(char *detail, uint32_t ds) {
+    uint32_t a, d1, d2, a2;
+    asm volatile("rdtsc" : "=a"(a), "=d"(d1));
+    for (volatile uint32_t i = 0; i < 10000u; i++) { /* 少量延迟 */ }
+    asm volatile("rdtsc" : "=a"(a2), "=d"(d2));
+    (void)a; (void)d1;
+    uint64_t t1 = ((uint64_t)d1 << 32) | a;
+    uint64_t t2 = ((uint64_t)d2 << 32) | a2;
+    int ok = t2 > t1;
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "monotonic" : "static!");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* div64：64 位除法软模拟（无 libgcc）已知答案。
+ * div64.c 暴露 libgcc 兼容接口；types.h 没有 u64 别名，用 uint64_t。 */
+static int st2_div64(char *detail, uint32_t ds) {
+    extern uint64_t __udivdi3(uint64_t, uint64_t);
+    extern uint64_t __umoddi3(uint64_t, uint64_t);
+    static const struct { uint64_t a, b, q, r; } v[] = {
+        { 0xFFFFFFFFFFFFFFFFull, 3, 0x5555555555555555ull, 0 },
+        { 0xFFFFFFFFFFFFFFFFull, 0x10000, 0x0000FFFFFFFFFFFFull, 0xFFFF },
+        { 1000000007ull, 13, 76923077ull, 6 },
+        { 0x8000000000000000ull, 2, 0x4000000000000000ull, 0 },
+        { 42, 100, 0, 42 },
+    };
+    int bad = 0;
+    uint32_t badcase = 0xFFFFFFFFu;
+    uint64_t got = 0, want = 0;
+    for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        if (__udivdi3(v[i].a, v[i].b) != v[i].q) {
+            bad++; badcase = i; got = __udivdi3(v[i].a, v[i].b); want = v[i].q;
+        }
+        if (__umoddi3(v[i].a, v[i].b) != v[i].r) {
+            bad++; badcase = i; got = __umoddi3(v[i].a, v[i].b); want = v[i].r;
+        }
+    }
+    if (detail && ds) {
+        static const char hx[] = "0123456789ABCDEF";
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(sizeof(v) / sizeof(v[0])));
+        st_puts(detail, &p, ds, " vectors");
+        if (bad) {
+            st_puts(detail, &p, ds, ", case ");
+            st_putd(detail, &p, ds, badcase);
+            st_puts(detail, &p, ds, " got=0x");
+            for (int s = 60; s >= 0; s -= 4) detail[p++] = hx[(got >> s) & 0xF];
+            st_puts(detail, &p, ds, " want=0x");
+            for (int s = 60; s >= 0; s -= 4) detail[p++] = hx[(want >> s) & 0xF];
+        } else {
+            st_puts(detail, &p, ds, ", ok");
+        }
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+/* pipe：fd_pipe -> write -> read 数据一致 -> close（引用归零） */
+static int st2_pipe(char *detail, uint32_t ds) {
+    fd_table_t t;
+    fd_table_init(&t);
+    int fds[2];
+    static const uint8_t msg[] = "EZOS pipe selftest 0123456789";
+    uint8_t buf[64];
+    int bad = 0;
+    if (fd_pipe(&t, fds) != 0) return 1;
+    if (fd_write(&t, fds[1], msg, sizeof(msg) - 1) != (int)(sizeof(msg) - 1)) bad++;
+    if (fd_read(&t, fds[0], buf, sizeof(buf)) != (int)(sizeof(msg) - 1)) bad++;
+    for (uint32_t i = 0; i < sizeof(msg) - 1; i++)
+        if (buf[i] != msg[i]) { bad++; break; }
+    if (fd_close(&t, fds[0]) != 0) bad++;
+    if (fd_close(&t, fds[1]) != 0) bad++;
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(sizeof(msg) - 1));
+        st_puts(detail, &p, ds, "B roundtrip");
+        st_puts(detail, &p, ds, bad ? " BAD" : " ok");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+/* string：shell_extra 自有串/格式化助手已知答案 */
+static int st2_string(char *detail, uint32_t ds) {
+    int bad = 0;
+    if (x_strcasecmp("ABC", "abc") != 0) bad++;
+    if (x_strcasecmp("", "") != 0) bad++;
+    if (x_strcasecmp("abc", "abd") == 0) bad++;
+    if (x_strcasecmp("a", "") == 0) bad++;
+    if (x_strcasecmp("HELLO.ELF", "hello.elf") != 0) bad++;
+    char b[16];
+    uint32_t p = 0;
+    st_putd(b, &p, sizeof(b), 12345);
+    b[p] = '\0';
+    if (b[0] != '1' || b[4] != '5' || p != 5) bad++;
+    if (detail && ds) {
+        uint32_t p2 = 0;
+        st_putd(detail, &p2, ds, 6u * 2u);
+        st_puts(detail, &p2, ds, " asserts");
+        st_puts(detail, &p2, ds, bad ? ", BAD" : ", ok");
+        detail[p2] = '\0';
+    }
+    return bad;
+}
+
+/* mouse：PS/2 与 USB HID 包解析（纯函数，喂合成包）+ 注入路径方向校验。
+ * 真机上的触摸板/滚轮在这里守：QEMU 没有触摸板、QMP 也不发滚轮事件，
+ * 不合成输入的话这两条分支在提交前永远没人跑过。 */
+static int st2_mouse(char *detail, uint32_t ds) {
+    int bad = mouse_selftest(0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, "ps2+usb decode, proto=");
+        st_putd(detail, &p, ds, (uint32_t)mouse_protocol());
+        st_puts(detail, &p, ds, "B");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+/* digest：MD5 / CRC 的**标准测试向量**（RFC 1321、zlib、Castagnoli、Modbus）。
+ * 校验和算错时，症状是"对拍时才发现某个盘读不出来"，很难往回找；
+ * 有向量守着，编译后第一次跑就知道对不对。 */
+static int st2_digest(char *detail, uint32_t ds) {
+    int bad = sysinfo_selftest();
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, "md5/crc vectors, ");
+        st_putd(detail, &p, ds, (uint32_t)bad);
+        st_puts(detail, &p, ds, bad ? " bad" : " ok");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+typedef int (*st2_probe_t)(char *detail, uint32_t dsize);
+static const struct {
+    const char *name;      /* 与既有条目同宽：8 字符名 + 描述 */
+    st2_probe_t fn;
+} ST2_PROBES[] = {
+    { "serial   COM1 diagnostic",   st2_serial },
+    { "pit      system timer tick", st2_pit },
+    { "rtc      CMOS wall clock",   st2_rtc },
+    { "ata      block device MBR",  st2_ata },
+    { "pci      bus enumeration",   st2_pci },
+    { "nic      rtl8139 MAC",       st2_nic },
+    { "acpi     FADT/_S5 tables",   st2_acpi },
+    { "kbd      8042 controller",   st2_kbd },
+    { "vga      text mem page1",    st2_vga },
+    { "tsc      cycle counter",     st2_tsc },
+    { "div64    64-bit division",   st2_div64 },
+    { "pipe     kernel pipe pair",  st2_pipe },
+    { "string   str/fmt helpers",   st2_string },
+    { "mouse    ps2/usb packet",    st2_mouse },
+    { "digest   md5/crc vectors",   st2_digest },
+};
+#define ST2_COUNT (sizeof(ST2_PROBES) / sizeof(ST2_PROBES[0]))
+
+/* mouseproto：查看 / 切换 PS/2 包长协议。
+ * 默认 3 字节（标准 PS/2）。真机上确认指点设备支持 IntelliMouse 滚轮后
+ * 用 `mouseproto 4` 切到 4 字节——QEMU 与部分固件对魔法序列应答不一致，
+ * 默认切成 4 会让包流永久错位，所以绝不在 init 里自动切。 */
+/* ---- 日用校验命令（纯 API 在 kernel/sysinfo.c） ---- */
+void cmd_md5(const char *args) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    if (a.argc < 1) {
+        ezos_console_write("Usage: md5 <file>\n");
+        return;
+    }
+    char hex[40];
+    uint32_t sz = 0;
+    if (sysinfo_md5(a.argv[0], hex, &sz) != 0) {
+        ezos_console_write("md5: cannot read file\n");
+        return;
+    }
+    ezos_console_write(hex);
+    ezos_console_write("  ");
+    char num[16], out[16];
+    uint32_t v = sz;
+    int m = 0;
+    if (v == 0) num[m++] = '0';
+    while (v) { num[m++] = (char)('0' + v % 10); v /= 10; }
+    int k = 0;
+    while (m) out[k++] = num[--m];
+    out[k] = 0;
+    ezos_console_write(out);
+    ezos_console_write("  ");
+    ezos_console_write(a.argv[0]);
+    ezos_console_write("\n");
+}
+
+/* 算法选择：命令表里 crc16/crc32/crc32c 指向同一个实现，靠薄包装把
+ * "我到底是谁"传进去——cmd_crc 收不到自己被注册成哪个名字。 */
+static void crc_common(const char *args, int which) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    if (a.argc < 1) {
+        ezos_console_write(which == 1 ? "Usage: crc16 <file>\n"
+                           : (which == 2 ? "Usage: crc32c <file>\n"
+                                         : "Usage: crc32 <file>\n"));
+        return;
+    }
+    char hex[20];
+    if (sysinfo_crc(a.argv[0], which, hex) != 0) {
+        ezos_console_write("crc: cannot read file\n");
+        return;
+    }
+    ezos_console_write(hex);
+    ezos_console_write("  ");
+    ezos_console_write(a.argv[0]);
+    ezos_console_write("\n");
+}
+
+void cmd_crc(const char *args)   { crc_common(args, 0); }
+void cmd_crc16(const char *args) { crc_common(args, 1); }
+void cmd_crc32c(const char *args) { crc_common(args, 2); }
+
+void cmd_mouseproto(const char *args) {
+    if (args && args[0]) {
+        if (args[0] == '4') mouse_set_protocol(1);
+        else if (args[0] == '3') mouse_set_protocol(0);
+        else { ezos_console_write("usage: mouseproto 3|4\n"); return; }
+    }
+    char line[128];
+    uint32_t p = 0;
+    st_puts(line, &p, sizeof(line), "mouse: proto=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_protocol());
+    st_puts(line, &p, sizeof(line), "B present=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_present());
+    st_puts(line, &p, sizeof(line), " usb=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_usb_present());
+    st_puts(line, &p, sizeof(line), " pkts=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_packet_count());
+    st_puts(line, &p, sizeof(line), " x=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_x());
+    st_puts(line, &p, sizeof(line), " y=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_y());
+    st_puts(line, &p, sizeof(line), " btn=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_buttons());
+    st_puts(line, &p, sizeof(line), "\n");
+    line[p] = '\0';
+    ezos_console_write(line);
+}
+
+void cmd_selftest(const char *args) {
+    (void)args;
+    ezos_console_write("Cerulia full self-test:\n");
+
+    struct { const char *name; int run; uint32_t ms; const char *detail; } r[24];
+    /* detail 要活到最后的汇总循环，不能指向块内局部数组 */
+    static char det[24][80];
+    int n = 0, failed = 0;
+
+    /* kmalloc：分配/写入/回读/释放后 used 必须归零（验证合并） */
+    {
+        uint32_t t0 = g_pit_ticks;
+        uint32_t dpos = 0;
+        uint32_t u0 = kmalloc_used();
+        void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
+        int ok = (p1 != 0 && p2 != 0 && p3 != 0);
+        uint32_t peak = 0;
+        if (ok) {
+            for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+            for (int i = 0; i < 1000; i++)
+                if (((uint8_t *)p1)[i] != (uint8_t)i) { ok = 0; break; }
+            peak = kmalloc_used();
+            kfree(p3); kfree(p2); kfree(p1);
+            if (kmalloc_used() != u0) ok = 0;            /* 合并后必须回到基线 */
+        }
+        st_puts(det[n], &dpos, sizeof(det[n]), "heap ");
+        st_putd(det[n], &dpos, sizeof(det[n]), kmalloc_total() / 1024);
+        st_puts(det[n], &dpos, sizeof(det[n]), "KB, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), peak);
+        st_puts(det[n], &dpos, sizeof(det[n]), "B -> ");
+        st_putd(det[n], &dpos, sizeof(det[n]), kmalloc_used());
+        st_puts(det[n], &dpos, sizeof(det[n]), "B");
+        det[n][dpos] = '\0';
+        r[n].name = "kmalloc  kernel heap";
+        r[n].run = ok ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* paging：官方自检（无输出参数时静默跑断言） */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int rc = paging_selftest(0);
+        st_puts(det[n], &dpos, sizeof(det[n]), "");
+        st_putd(det[n], &dpos, sizeof(det[n]), paging_mapped_pages());
+        st_puts(det[n], &dpos, sizeof(det[n]), " pages, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), paging_used_tables());
+        st_puts(det[n], &dpos, sizeof(det[n]), " tables");
+        det[n][dpos] = '\0';
+        r[n].name = "paging   identity + map/unmap";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* pmm：物理页帧分配器 */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int rc = pmm_selftest(pg_puts);
+        st_puts(det[n], &dpos, sizeof(det[n]), "");
+        st_putd(det[n], &dpos, sizeof(det[n]), pmm_free_count());
+        st_puts(det[n], &dpos, sizeof(det[n]), "/");
+        st_putd(det[n], &dpos, sizeof(det[n]), pmm_total_pages());
+        st_puts(det[n], &dpos, sizeof(det[n]), " pages free");
+        det[n][dpos] = '\0';
+        r[n].name = "pmm      page frame allocator";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* lock：分配器临界区保护（irqflags 原语 + IRQ 上下文嵌套 + 压力不变量）。
+     * 细项结果由 lock_selftest 自己逐行 klog（LOCKTEST: ...），这里汇总。 */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int bad = lock_selftest();
+        st_puts(det[n], &dpos, sizeof(det[n]), "6 cases, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)bad);
+        st_puts(det[n], &dpos, sizeof(det[n]), " bad");
+        det[n][dpos] = '\0';
+        r[n].name = "lock     alloc critical sec";
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* elf：装载器（校验/装载/W^X/卸载） */
+    {
+        uint32_t t0 = g_pit_ticks;
+        int rc = elf_selftest(pg_puts);
+        r[n].name = "elf      ELF32 loader";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "validate + load + W^X + unload";
+        n++;
+    }
+
+    /* fpu：x87 探测 + 算术 */
+    {
+        uint32_t t0 = g_pit_ticks;
+        int rc = fpu_selftest(pg_puts);
+        r[n].name = "fpu      x87 arithmetic";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "x87 detect + arithmetic";
+        n++;
+    }
+
+    /* calc：表达式引擎（静默：一组已知答案的算式） */
+    {
+        uint32_t t0 = g_pit_ticks;
+        static const struct { const char *e; double want; } t[] = {
+            { "1.5*2+1",        4 },
+            { "10/4",           2.5 },
+            { "sqrt(2)*sqrt(2)",2 },
+            { "2^10",           1024 },
+            { "sin(0)",         0 },
+            { "1+2*3",          7 },
+            { "(1+2)*3",        9 },
+            { "-4+10",          6 },
+        };
+        int bad = 0;
+        for (uint32_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(t[i].e, &v, &err) != 0) { bad++; continue; }
+            /* 显示 6 位小数内相等即可（1/3 类循环小数不算失败） */
+            double d = v - t[i].want;
+            if (d < 0) d = -d;
+            if (d > 5e-7) bad++;
+        }
+        /* 错误路径：这些表达式必须被拒绝 */
+        static const char *badexpr[] = { "1+", "sin", "1/0", "0/0", "abc", "1 2" };
+        for (uint32_t i = 0; i < sizeof(badexpr) / sizeof(badexpr[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(badexpr[i], &v, &err) == 0) bad++;      /* 不该成功 */
+        }
+        {
+            uint32_t dpos = 0;
+            st_puts(det[n], &dpos, sizeof(det[n]), "");
+            st_putd(det[n], &dpos, sizeof(det[n]),
+                    (uint32_t)(sizeof(t) / sizeof(t[0])) +
+                    (uint32_t)(sizeof(badexpr) / sizeof(badexpr[0])));
+            st_puts(det[n], &dpos, sizeof(det[n]),
+                    " cases (eval + reject), ");
+            st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)bad);
+            st_puts(det[n], &dpos, sizeof(det[n]), " bad");
+            det[n][dpos] = '\0';
+        }
+        r[n].name = "calc     expression engine";
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* exec：真跑盘上的 HELLO.ELF，退出码 42 = 全链路健康
+     * （FS->ELF->ring3->syscall->exit->页回收） */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        const char *why = 0;
+        int rc = exec_file("/bin/hello.elf", 0, &why);
+        int bad = (rc == 42) ? 0 : 1;
+        st_puts(det[n], &dpos, sizeof(det[n]), "HELLO.ELF exit=");
+        st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)rc);
+        if (bad && why) {
+            st_puts(det[n], &dpos, sizeof(det[n]), ", why=");
+            st_puts(det[n], &dpos, sizeof(det[n]), why);
+        }
+        det[n][dpos] = '\0';
+        r[n].name = "exec     ring3 ELF run";
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* fd：open/read/lseek/write/close 全语义（真实文件系统走一遍） */
+    {
+        uint32_t t0 = g_pit_ticks;
+        /* 没有挂载文件系统时不判失败（同上） */
+        int rc = fs_ready() ? fd_selftest(pg_puts) : 0;
+        r[n].name = "fd       file descriptors";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "open/read/lseek/write/close";
+        n++;
+    }
+
+    /* 扩展探针（硬件/软件覆盖，表驱动）：8 个核心项之外的第二梯队 */
+    for (uint32_t i = 0; i < ST2_COUNT && n < 24; i++) {
+        uint32_t t0 = g_pit_ticks;
+        r[n].name = ST2_PROBES[i].name;
+        r[n].run = ST2_PROBES[i].fn(det[n], sizeof(det[n]));
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
+    /* 汇总：每项一行（含指标与耗时），末尾给总耗时 */
+    ezos_console_write("----------\n");
+    for (int i = 0; i < n; i++) {
+        /* st_report 内部用 g_pit_ticks - t0 算耗时，这里反推一个等价的 t0 传进去 */
+        st_report("  ", r[i].name, r[i].run, g_pit_ticks - r[i].ms, r[i].detail);
+        if (r[i].run != 0) failed++;
+    }
+    ezos_console_write("----------\n");
+    {
+        char sum[96];
+        uint32_t sp = 0;
+        uint32_t total = 0;
+        for (int i = 0; i < n; i++) total += r[i].ms;
+        st_puts(sum, &sp, sizeof(sum), "");
+        st_putd(sum, &sp, sizeof(sum), (uint32_t)n);
+        st_puts(sum, &sp, sizeof(sum), " tests, ");
+        st_putd(sum, &sp, sizeof(sum), (uint32_t)failed);
+        st_puts(sum, &sp, sizeof(sum), " failed, ");
+        st_putd(sum, &sp, sizeof(sum), total);
+        st_puts(sum, &sp, sizeof(sum), " ms -> ");
+        st_puts(sum, &sp, sizeof(sum),
+                failed == 0 ? "ALL PASS" : "SYSTEM UNSTABLE");
+        sum[sp] = '\0';
+        dmesg_record(sum);                   /* 下面还要上屏，别再写串口 */
+        dmesg_record("\n");
+        /* 末行整体着色：全绿过 / 有红未过（文本不变，dmesg 已先记纯文本） */
+        terminal_setcolor((uint8_t)(failed == 0 ? 0x0A : 0x0C));
+        ezos_console_write("  ");
+        ezos_console_write(sum);
+        ezos_console_write("\n");
+        terminal_setcolor(0x07);
+    }
+
+}
+
+/* boot_selftest：开机自检（kernel_main 调用）。
+ * 与 cmd_selftest 同一套判定逻辑，但全程静默，只返回失败子系统数。
+ * 0 = 全部通过。 */
+int boot_selftest(void) {
+    struct { int run; uint32_t ms; } r[24];
+    int n = 0;
+
+    /* 每一项都记耗时：开机自检以前只留一行"all passed"，出了问题是哪一个
+     * 失败、哪一项慢，事后完全无从查起。现在逐项进 dmesg。 */
+#define ST_RUN(expr) do { \
+        uint32_t st_t0 = g_pit_ticks; \
+        r[n].run = (expr); \
+        r[n].ms = g_pit_ticks - st_t0; \
+        n++; \
+    } while (0)
+
+    {   /* kmalloc */
+        uint32_t t0 = g_pit_ticks;
+        uint32_t u0 = kmalloc_used();
+        void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
+        int ok = (p1 != 0 && p2 != 0 && p3 != 0);
+        if (ok) {
+            for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+            for (int i = 0; i < 1000; i++)
+                if (((uint8_t *)p1)[i] != (uint8_t)i) { ok = 0; break; }
+            kfree(p3); kfree(p2); kfree(p1);
+            if (kmalloc_used() != u0) ok = 0;
+        }
+        r[n].run = ok ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
+    }
+    ST_RUN(paging_selftest(0));                 /* NULL = 静默 */
+    ST_RUN(pmm_selftest(0));
+    ST_RUN(lock_selftest());                    /* 分配器临界区保护 */
+    ST_RUN(elf_selftest(0));
+    ST_RUN(fpu_selftest(0));
+    {   /* calc：已知答案 + 必须拒绝的畸形 */
+        uint32_t t0 = g_pit_ticks;
+        static const struct { const char *e; double want; } t[] = {
+            { "1.5*2+1", 4 }, { "10/4", 2.5 }, { "sqrt(2)*sqrt(2)", 2 },
+            { "2^10", 1024 }, { "sin(0)", 0 }, { "1+2*3", 7 },
+        };
+        int bad = 0;
+        for (uint32_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(t[i].e, &v, &err) != 0) { bad++; continue; }
+            double d = v - t[i].want;
+            if (d < 0) d = -d;
+            if (d > 5e-7) bad++;
+        }
+        static const char *badexpr[] = { "1+", "sin", "1/0", "abc" };
+        for (uint32_t i = 0; i < sizeof(badexpr) / sizeof(badexpr[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(badexpr[i], &v, &err) == 0) bad++;
+        }
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
+    }
+    {   /* Execute only the kernel-bundled test during startup. A mutable
+         * data disk is not part of the Secure Boot chain. */
+        uint32_t t0 = g_pit_ticks;
+        const char *why = 0;
+        r[n].run = (exec_file("/bin/hello.elf", 0, &why) == 42) ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
+    }
+    /* fd：需要真实文件系统。没挂载（空机 / 还没 format 的新盘）不是内核的
+     * 错，降级跳过——否则真机一开机就红一片，看着像内核坏了。
+     * 注意：**n 必须照常递增**，st_names[] 是按调用顺序对齐的，少加一项会让
+     * 后面所有子系统的名字整体错位。 */
+    {
+        uint32_t t0 = g_pit_ticks;
+        r[n].run = fs_ready() ? fd_selftest(0) : 0;   /* 静默；无 FS 降级 */
+        r[n].ms = g_pit_ticks - t0;
+        n++;
+    }
+    for (uint32_t i = 0; i < ST2_COUNT && n < 24; i++)
+        ST_RUN(ST2_PROBES[i].fn(0, 0)); /* 静默：detail 不填 */
+
+    /* 逐项进 dmesg（顺序与上面 n 的递增顺序一致） */
+    static const char *const st_names[24] = {
+        "kmalloc  kernel heap",
+        "paging   identity + map/unmap",
+        "pmm      page frame allocator",
+        "lock     allocator irq-safe",
+        "elf      ELF32 loader",
+        "fpu      x87 arithmetic",
+        "calc     expression engine",
+        "exec     ring3 ELF run",
+        "fd       file descriptors",
+        "serial   COM1 diagnostic",
+        "pit      system timer tick",
+        "rtc      CMOS wall clock",
+        "ata      block device MBR",
+        "pci      bus enumeration",
+        "nic      rtl8139 MAC",
+        "acpi     FADT/_S5 tables",
+        "kbd      8042 controller",
+        "vga      text mem page1",
+        "tsc      cycle counter",
+        "div64    64-bit division",
+        "pipe     kernel pipe pair",
+        "string   str/fmt helpers",
+        "mouse    ps2/usb packet",
+        "digest   md5/crc vectors",
+    };
+    int failed = 0;
+    for (int i = 0; i < n; i++) {
+        const char *nm = (i < 24) ? st_names[i] : "subsystem";
+        /* 静默：只进 dmesg，不上屏。
+         *
+         * 以前这里调的是上屏版 st_report，结果开机瞬间往屏幕上刷 24 行自检、
+         * 把内核横幅整个顶掉——而这个函数的契约白纸黑字写着"全程静默，
+         * 只返回失败子系统数"。想逐项看，shell 里有 'selftest'。 */
+        st_report_ex("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0, 0);
+        if (r[i].run != 0) failed++;
+    }
+    /* 有失败项才上屏：全过就只留 kernel.c 那一行汇总，开机屏幕是干净的；
+     * 但真出问题时绝不能只报"有 N 个子系统失败"——必须指名是哪几项，
+     * 否则开机现场一闪而过，事后无从查起。 */
+    if (failed) {
+        for (int i = 0; i < n; i++) {
+            if (r[i].run == 0) continue;
+            const char *nm = (i < 24) ? st_names[i] : "subsystem";
+            st_report_ex("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0, 1);
+        }
+    }
+#undef ST_RUN
+    return failed;
+}
+
+
+/* ktask：起两个计数内核线程，验证抢占式调度真的在工作（步骤 6a） */
+static volatile uint32_t kt_a, kt_b;
+static volatile int kt_a_quit, kt_b_quit;
+
+static void kt_worker(void *arg) {
+    volatile uint32_t *ctr = (arg == 0) ? &kt_a : &kt_b;
+    volatile int *quit = (arg == 0) ? &kt_a_quit : &kt_b_quit;
+    while (!*quit) (*ctr)++;
+}
+
+void cmd_ktask(const char *args) {
+    (void)args;
+    kt_a = kt_b = 0;
+    kt_a_quit = kt_b_quit = 0;
+
+    int p1 = task_create("kt_a", kt_worker, 0);
+    int p2 = task_create("kt_b", kt_worker, (void *)1);
+    if (p1 < 0 || p2 < 0) {
+        ezos_console_write("ktask: task_create failed\n");
+        return;
+    }
+    ezos_console_write("ktask: started 2 kernel threads, running 2s...\n");
+
+    /* 忙等约 2 秒（用 PIT tick，1000Hz） */
+    uint32_t start = g_pit_ticks;
+    while (g_pit_ticks - start < 2000u) task_yield();
+
+    kt_a_quit = 1;
+    kt_b_quit = 1;
+    /* 再让一轮，确保两个线程都退出 */
+    start = g_pit_ticks;
+    while (g_pit_ticks - start < 200u) task_yield();
+
+    ezos_console_write("  thread a iterations: ");
+    ezos_console_print_dec(kt_a);
+    ezos_console_write("\n  thread b iterations: ");
+    ezos_console_print_dec(kt_b);
+    ezos_console_write("\n  scheduler switches: ");
+    ezos_console_print_dec(schedule_count());
+    ezos_console_write("\n");
+
+    uint32_t sw = schedule_count();
+    int ok = (kt_a > 0) && (kt_b > 0) && (sw > 2);
+    ezos_console_write("  result: ");
+    ezos_console_write(ok ? "PASS\n" : "FAIL\n");
+}
+
+/* ps：列出任务表 */
+void cmd_ps(const char *args) {
+    (void)args;
+    static const char *st[] = { "unused", "ready", "running", "blocked", "zombie" };
+    uint32_t n = 0;
+    const task_t *tab = task_table(&n);
+    ezos_console_write("  PID  STATE    SWITCH  NAME\n");
+    for (uint32_t i = 0; i < n; i++) {
+        if (tab[i].state == TASK_UNUSED) continue;
+        ezos_console_write("  ");
+        ezos_console_print_dec(tab[i].pid);
+        ezos_console_write("   ");
+        ezos_console_write(st[(uint32_t)tab[i].state]);
+        ezos_console_write("   ");
+        ezos_console_print_dec(tab[i].switches);
+        ezos_console_write("     ");
+        ezos_console_write(tab[i].name[0] ? tab[i].name : "(unnamed)");
+        ezos_console_write("\n");
+    }
+    ezos_console_write("  scheduler switches: ");
+    ezos_console_print_dec(schedule_count());
+    ezos_console_write("\n");
+}
+
+/* pmmtest：物理页帧分配器自检（步骤 5a） */
+void cmd_pmmtest(const char *args) {
+    (void)args;
+    int fail = pmm_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    }
+}
+
+void cmd_pagetest(const char *args) {
+    (void)args;
+    if (!paging_enabled()) {
+        ezos_console_write("paging: CR0.PG=0 (paging not enabled)\n");
+        return;
+    }
+    int fail = paging_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    }
+}
+
+/* rstest - 多语言对拍：exFAT 卷校验和与文件名 hash 各有 C / Rust / Zig 三份
+ * 实现，对同一份输入必须算出同一个数。
+ *
+ * 这是"增量引入非 C 语言"的安全网：算法写歪、链接到错误版本、符号没接上，
+ * 都会在这里变红，而不是等到 Windows 判卷损坏才发现。第一版就真抓到一次——
+ * Rust/Zig 侧把 hash 的字符转小写（`c | 0x20`）而不是规范要求的大写。 */
+void cmd_rstest(const char *args) {
+    (void)args;
+    ezos_console_write("rust/zig cross-check:\n");
+
+    /* 校验和对拍：混入 0/0xFF/中间值，别只用规整数据（全 0 时任何错误算法
+     * 都给出 0，对拍就成了摆设）。 */
+    static const uint8_t probe[37] = {
+        0x00, 0xFF, 0x5A, 0xA5, 0x01, 0x80, 'E', 'X', 'F', 'A', 'T', ' ',
+        0x7F, 0x33, 0xC3, 0x11, 0x22, 0x44, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        0xDD, 0xEE, 0x0D, 0x0A, 0x20, 0x2E, 0x2F, 0x5C, 0x3A, 0x39, 0x41,
+        0x61, 0x7A, 0x4E
+    };
+    uint32_t cc = exfat_checksum_c(probe, (int)sizeof(probe));
+    uint32_t rc = exfat_checksum_rs(probe, (uint32_t)sizeof(probe));
+    uint32_t zc = exfat_checksum_zig(probe, (uint32_t)sizeof(probe));
+
+    ezos_console_write("  checksum  C=0x");
+    ezos_console_print_hex32(cc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(rc);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(zc);
+    int ok_sum = (cc == rc) && (cc == zc);
+    ezos_console_write(ok_sum ? " [OK]\n" : " [FAIL]\n");
+
+    /* 16 位目录项集校验和：单独对拍。32 位版截断不得出这个数（宽度不同就是
+     * 不同算法），历史上恰恰是这里出过事——盘上 SetChecksum 全错而内核毫无
+     * 察觉，宿主机独立实现一比就红。输入用上面同一段 probe，跳过 2-3 生效。 */
+    uint16_t sc = exfat_set_checksum_c(probe, (int)sizeof(probe));
+    uint16_t sr = exfat_set_checksum_rs(probe, (uint32_t)sizeof(probe));
+    uint16_t sz = exfat_set_checksum_zig(probe, (uint32_t)sizeof(probe));
+    ezos_console_write("  setcksum  C=0x");
+    ezos_console_print_hex32(sc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(sr);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(sz);
+    int ok_set = (sc == sr) && (sc == sz) && (sc != 0);
+    ezos_console_write(ok_set ? " [OK]\n" : " [FAIL]\n");
+
+    /* 文件名 hash 对拍：大小写混排，专抓"转大写写成转小写"那类漂移。
+     * C 版以前是 exfat.c 里的 static，进不了对拍——现在三份都在场。 */
+    static const uint16_t nm[10] = { 'R', 'e', 'A', 'd', 'M', 'e', '.',
+                                     'T', 'x', 'T' };
+    uint16_t ch = exfat_name_hash_c(nm, 10);
+    uint16_t rh = exfat_name_hash_rs(nm, 10);
+    uint16_t zh = exfat_name_hash_zig(nm, 10);
+    ezos_console_write("  namehash  C=0x");
+    ezos_console_print_hex32(ch);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(rh);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(zh);
+    int ok_hash = (ch == rh) && (ch == zh) && (ch != 0);   /* 全 0 说明根本没算 */
+    ezos_console_write(ok_hash ? " [OK]\n" : " [FAIL]\n");
+
+    /* =================================================================
+     * 第二组：文件名编解码（UTF-16LE <-> UTF-8）
+     *
+     * 三份实现在两个方向上必须逐字节一致，尤其是**失败路径**：
+     * 落单代理项要变 U+FFFD、缓冲不够要返回负数而不是半截名字。
+     * 只测成功路径的话，"装不下时静默截断"这种最坏的 bug 会溜过去，
+     * 而半截名字会匹配到错误的文件——比显示乱码严重得多。
+     * ================================================================= */
+
+    /* 探针要混：纯 ASCII / BMP 中文(3 字节 UTF-8) / 代理对(4 字节,
+     * 桌面 emoji) / 落单代理。少任何一个都会漏掉一类 bug。
+     *
+     * **落单代理必须放在串尾**（或者后面跟的不是低代理）：高代理 0xD83D
+     * 后面紧跟 0xDC00 是一个**合法**代理对 U+1F400，会被正常合并，不是
+     * 落单项。想测 U+FFFD 就得让高代理后面没有低代理——我第一版把两个落单
+     * 代理并排放，结果三份实现都算对了，是断言自己错了。 */
+    static const uint16_t u16probe[] = {
+        'R', 'e', 'a', 'd',                     /* ASCII */
+        0x4E2D, 0x6587,                         /* 中文 BMP */
+        0xD83D, 0xDE00,                         /* 合法代理对 U+1F600 */
+        0xDC00,                                 /* 落单低代理 -> U+FFFD */
+        '.', 'T', 'X', 'T',
+        0xD83D                                  /* 串尾落单高代理 -> U+FFFD */
+    };
+    const uint32_t u16n = (uint32_t)(sizeof(u16probe) / sizeof(u16probe[0]));
+
+    /* 缓冲给足（最长 4 字节 UTF-8 + NUL），另外单独做一次"故意不够"的测试 */
+    char d8c[80];
+    uint8_t d8r[80], d8z[80];
+    int32_t n8c = utf16_to_utf8_c(u16probe, u16n, d8c, sizeof(d8c));
+    int32_t n8r = utf16_to_utf8_rs(u16probe, u16n, d8r, sizeof(d8r));
+    int32_t n8z = utf16_to_utf8_zig(u16probe, u16n, d8z, sizeof(d8z));
+    int ok_u16 = (n8c == n8r) && (n8c == n8z) && (n8c > 0);
+    if (ok_u16) {
+        /* 长度一致还不够，字节也要逐个一致 */
+        for (uint32_t i = 0; i < (uint32_t)n8c; i++) {
+            if ((uint8_t)d8c[i] != d8r[i] || (uint8_t)d8c[i] != d8z[i]) {
+                ok_u16 = 0;
+                break;
+            }
+        }
+    }
+    /* 三份都必须补上 NUL，且都补在同一个位置 */
+    if (ok_u16 && (d8c[n8c] != 0 || d8r[n8r] != 0 || d8z[n8z] != 0)) ok_u16 = 0;
+    /* 落单代理必须变成 U+FFFD（EF BF BD），不能被吞掉也不能原样吐出 */
+    int seen_fffd = 0;
+    for (uint32_t i = 0; i + 2 < (uint32_t)n8c; i++)
+        if ((uint8_t)d8c[i] == 0xEF && (uint8_t)d8c[i+1] == 0xBF &&
+            (uint8_t)d8c[i+2] == 0xBD) { seen_fffd = 1; break; }
+    if (!seen_fffd) ok_u16 = 0;
+    ezos_console_write("  u16->u8   len C=");
+    ezos_console_print_dec((uint32_t)n8c);
+    ezos_console_write(" rust=");
+    ezos_console_print_dec((uint32_t)n8r);
+    ezos_console_write(" zig=");
+    ezos_console_print_dec((uint32_t)n8z);
+    ezos_console_write(ok_u16 ? " [OK]\n" : " [FAIL]\n");
+
+    /* 缓冲不足：三份都必须返回负数（fail closed），绝不能返回半截长度。
+     * 这一条是本组测试存在的最主要理由。 */
+    char tiny_c[8];
+    uint8_t tiny_r[8], tiny_z[8];
+    int32_t tc = utf16_to_utf8_c(u16probe, u16n, tiny_c, sizeof(tiny_c));
+    int32_t tr = utf16_to_utf8_rs(u16probe, u16n, tiny_r, sizeof(tiny_r));
+    int32_t tz = utf16_to_utf8_zig(u16probe, u16n, tiny_z, sizeof(tiny_z));
+    int ok_tiny = (tc < 0) && (tr < 0) && (tz < 0) && (tc == tr) && (tr == tz);
+    ezos_console_write("  u16->u8 tiny ");
+    ezos_console_print_hex32((uint32_t)tc);
+    ezos_console_write("/");
+    ezos_console_print_hex32((uint32_t)tr);
+    ezos_console_write("/");
+    ezos_console_print_hex32((uint32_t)tz);
+    ezos_console_write(ok_tiny ? " [OK]\n" : " [FAIL]\n");
+
+    /* 反方向：UTF-8 -> UTF-16LE。用刚才编出来的字节，顺带验证往返一致。
+     * 往返比"两边各自对一批固定输入"更强：任一边对代理对 / BMP / ASCII
+     * 的边界算错，round-trip 就对不上。 */
+    uint16_t w16c[80], w16r[80], w16z[80];
+    int32_t wn_c = 0, wn_r = 0, wn_z = 0;
+    int ok_rt = 0;
+    if (n8c > 0) {
+        wn_c = utf8_to_utf16_c(d8c, w16c, 80);
+        wn_r = utf8_to_utf16_rs((const uint8_t *)(const void *)d8c, w16r, 80);
+        wn_z = utf8_to_utf16_zig((const uint8_t *)(const void *)d8c, w16z, 80);
+        ok_rt = (wn_c == wn_r) && (wn_c == wn_z) && (wn_c > 0);
+        if (ok_rt) {
+            for (uint32_t i = 0; i < (uint32_t)wn_c; i++) {
+                if (w16c[i] != w16r[i] || w16c[i] != w16z[i]) {
+                    ok_rt = 0;
+                    break;
+                }
+            }
+        }
+        /* 往返一致性：探针前 4 个 ASCII 必须原样还原。后半含两个落单
+         * 代理，按 Unicode 规范 round-trip 时它们变 U+FFFD、长度变 1，
+         * 与"原样还原"不同——属预期，所以只钉住前 4 个 ASCII。它们足以
+         * 抓住"代理对被拆散""BMP 被截断""落单代理被吞"这几类漂移。 */
+        if (ok_rt && (wn_c < 4 || w16c[0] != 'R' || w16c[1] != 'e' ||
+                      w16c[2] != 'a' || w16c[3] != 'd'))
+            ok_rt = 0;
+    }
+    ezos_console_write("  u8->u16   n   C=");
+    ezos_console_print_dec((uint32_t)wn_c);
+    ezos_console_write(" rust=");
+    ezos_console_print_dec((uint32_t)wn_r);
+    ezos_console_write(" zig=");
+    ezos_console_print_dec((uint32_t)wn_z);
+    ezos_console_write(ok_rt ? " [OK]\n" : " [FAIL]\n");
+
+    /* =================================================================
+     * Levenshtein：shell 的 "did you mean"。对拍重点是**边界语义**——
+     * 超长串返回 limit+1（早退哨兵）而不是真距离，调用方靠它拒绝。
+     * ================================================================= */
+    static const char *lev_a[] = { "lst", "shel", "desk", "xyzzy", "" };
+    static const char *lev_b[] = { "ls", "shell", "desktop", "ls", "ls" };
+    int ok_lev = 1;
+    for (uint32_t i = 0; i < 5; i++) {
+        uint32_t lc = levenshtein_c(lev_a[i], lev_b[i], 24);
+        uint32_t lr = levenshtein_rs((const uint8_t *)(const void *)lev_a[i],
+                                     (const uint8_t *)(const void *)lev_b[i], 24);
+        uint32_t lz = levenshtein_zig((const uint8_t *)(const void *)lev_a[i],
+                                      (const uint8_t *)(const void *)lev_b[i], 24);
+        if (lc != lr || lc != lz) ok_lev = 0;
+    }
+    /* 超长串哨兵：limit=4 时长度 7 的串必须返回 5（= limit+1） */
+    if (levenshtein_c("abcdefg", "x", 4) != 5 ||
+        levenshtein_rs((const uint8_t *)(const void *)"abcdefg",
+                       (const uint8_t *)(const void *)"x", 4) != 5 ||
+        levenshtein_zig((const uint8_t *)(const void *)"abcdefg",
+                        (const uint8_t *)(const void *)"x", 4) != 5)
+        ok_lev = 0;
+    /* 距离真值抽查：不能"三份都返回同一个错数"就算过 */
+    if (levenshtein_c("lst", "ls", 24) != 1) ok_lev = 0;
+    if (levenshtein_c("kitten", "sitting", 24) != 3) ok_lev = 0;
+    ezos_console_write("  levenshtein    ");
+    ezos_console_write(ok_lev ? "[OK]\n" : "[FAIL]\n");
+
+    /* =================================================================
+     * RFC 1071 Internet 校验和：net.c 生产路径已迁到 Rust，这里三路对拍。
+     * 探针沿用上面那段（含奇数长度 37，钉住"末字节补到高字节位"）。
+     * ================================================================= */
+    uint32_t kr  = cksum_raw_c(probe, (uint32_t)sizeof(probe));
+    uint32_t krr = cksum_raw_rs(probe, (uint32_t)sizeof(probe));
+    uint32_t krz = cksum_raw_zig(probe, (uint32_t)sizeof(probe));
+    uint16_t kc  = cksum_c(probe, (uint32_t)sizeof(probe));
+    uint16_t kcr = cksum_rs(probe, (uint32_t)sizeof(probe));
+    uint16_t kcz = cksum_zig(probe, (uint32_t)sizeof(probe));
+    int ok_ck = (kr == krr) && (kr == krz) && (kc == kcr) && (kc == kcz) &&
+                ((uint16_t)(~kr) == kc);
+    ezos_console_write("  cksum     C=0x");
+    ezos_console_print_hex32(kc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(kcr);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(kcz);
+    ezos_console_write(ok_ck ? " [OK]\n" : " [FAIL]\n");
+
+    int all_ok = ok_sum && ok_set && ok_hash && ok_u16 && ok_tiny &&
+                 ok_rt && ok_lev && ok_ck;
+    ezos_console_write("  result: ");
+    ezos_console_write(all_ok ? "PASS" : "FAIL");
+    ezos_console_write("\n");
+}
+
+void cmd_kmtest(const char *args) {
+    (void)args;
+    ezos_console_write("kmalloc self-test:\n");
+    uint32_t t0 = kmalloc_total(), u0 = kmalloc_used(), f0 = kmalloc_largest_free();
+    ezos_console_write("  before: total ");
+    ezos_console_print_dec(t0 / 1024);
+    ezos_console_write("KB used ");
+    ezos_console_print_dec(u0);
+    ezos_console_write("B largest ");
+    ezos_console_print_dec(f0 / 1024);
+    ezos_console_write("KB\n");
+
+    void *p1 = kmalloc(1000);
+    void *p2 = kmalloc(4000);
+    void *p3 = kmalloc(200);
+    if (!p1 || !p2 || !p3) {
+        ezos_console_write("  FAIL: alloc returned NULL\n");
+        return;
+    }
+    /* 填充并校验 */
+    for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+    for (int i = 0; i < 1000; i++)
+        if (((uint8_t *)p1)[i] != (uint8_t)i) {
+            ezos_console_write("  FAIL: data corrupted at ");
+            ezos_console_print_dec(i);
+            ezos_console_write("\n");
+            return;
+        }
+    ezos_console_write("  alloc 1000+4000+200B ... write/readback OK\n");
+
+    uint32_t u1 = kmalloc_used();
+    kfree(p2);
+    kfree(p1);
+    kfree(p3);
+    uint32_t u2 = kmalloc_used();
+    ezos_console_write("  used ");
+    ezos_console_print_dec(u1);
+    ezos_console_write("B -> ");
+    ezos_console_print_dec(u2);
+    ezos_console_write("B after free (merge ");
+    ezos_console_write(u2 == u0 ? "OK" : "FAIL");
+    ezos_console_write(")\n");
+
+    /* 越界写检测：尾部 canary 紧贴用户区，写穿 1 字节就该被 audit 抓到。
+     * 只靠头魔数的话，越界会一路踩进下一个块，要等受害者被 kfree 才暴露。 */
+    int guard_ok = 0;
+    void *p4 = kmalloc(64);
+    if (p4) {
+        uint32_t bad_before = kmalloc_audit();
+        ((uint8_t *)p4)[64] = 0x00;             /* 越界 1 字节 */
+        uint32_t bad_after = kmalloc_audit();
+        int caught = (bad_before == 0 && bad_after >= 1);
+        ezos_console_write("  tail canary detects 1-byte overflow: ");
+        ezos_console_write(caught ? "yes [OK]\n" : "NO [FAIL]\n");
+        /* 现场复原后再释放：真实代码里 canary 坏了应该是去修 bug，
+         * 这里只是不想让自检自己把自己停机。 */
+        kmalloc_repair_tail(p4);
+        int healed = (kmalloc_audit() == 0);
+        ezos_console_write("  audit clean after repair: ");
+        ezos_console_write(healed ? "yes [OK]\n" : "NO [FAIL]\n");
+        kfree(p4);
+        guard_ok = caught && healed;
+    } else {
+        ezos_console_write("  FAIL: guard alloc returned NULL\n");
+    }
+
+    uint32_t f1 = kmalloc_largest_free();
+    ezos_console_write("  largest free after: ");
+    ezos_console_print_dec(f1 / 1024);
+    ezos_console_write("KB (before ");
+    ezos_console_print_dec(f0 / 1024);
+    ezos_console_write("KB)\n");
+    ezos_console_write("  result: ");
+    ezos_console_write((u2 == u0) && guard_ok ? "PASS" : "FAIL");
+    ezos_console_write("\n");
+}
+
+void cmd_sleep(const char *args) {
+    int ms = x_atoi(args);
+    if (ms <= 0) {
+        ezos_console_write("Usage: sleep <milliseconds>\n");
+        return;
+    }
+    if (ms > 60000) ms = 60000;
+    /* 走调度器的定时睡眠：1000Hz PIT 到期由 task_timer_tick 置 READY。
+     * 以前是 RDTSC 忙等并按"TSC ≈ 1GHz"折算——频率随机器/KVM/省电变化，
+     * 这个常数一错就是好几倍误差；而且忙等把 CPU 占死，别的任务一口都
+     * 吃不到。现在真睡眠，shell 顺便让出 CPU。
+     * 必须循环到 deadline：task_sleep 是"睡到唤醒/超时/假唤醒就返回"
+     * 的原语（任何中断——哪怕一个无关的 IRQ——都能让它提前回来），
+     * 契约要求调用方自查条件后重睡；单次调用会把 sleep 5000 睡成 1ms。 */
+    static wait_queue_t wq_sleep;      /* 无人 wake，纯靠超时唤醒 */
+    uint32_t deadline = g_pit_ticks + (uint32_t)ms;
+    while ((int32_t)(g_pit_ticks - deadline) < 0)
+        task_sleep(&wq_sleep, deadline - g_pit_ticks);
+    ezos_console_write("Done (");
+    ezos_console_print_dec(ms);
+    ezos_console_write(" ms).\n");
+}
+
+/* mem: 查看指定物理地址内存。mem <hexaddr> [len]（默认 128 字节） */
+/*
+ * 内核要直接解引用"用户给的地址"之前，必须先确认整段区间都已映射。
+ *
+ * 否则 `mem 0xFFFFFFFF` 这种输入会在 **ring0** 触发缺页 —— 崩的不是用户进程，
+ * 是整个内核：实测得到 #PF (CR2=0xFFFFFFFF)、context=shell、System halted。
+ * 一个 shell 命令就能让机器停机，这在任何场景下都不可接受。
+ *
+ * 逐页用 paging_query 检查；另外拒绝 addr+len 在 32 位绕回的区间
+ * （那会让"末地址"反而小于起始地址，循环边界失效）。
+ */
+int mem_range_mapped(uint32_t addr, uint32_t len) {
+    if (len == 0) return 1;
+    uint32_t last = addr + len - 1u;
+    if (last < addr) return 0;                  /* 绕回 */
+    uint32_t page = addr & 0xFFFFF000u;
+    uint32_t last_page = last & 0xFFFFF000u;
+    for (;;) {
+        uint32_t phys = 0, flags = 0;
+        if (paging_query(page, &phys, &flags) != 0) return 0;
+        if (page == last_page) return 1;
+        page += 0x1000u;
+        if (page == 0) return 0;                /* 走到地址空间顶端 */
+    }
+}
+
+void cmd_mem(const char *args) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    if (a.argc < 1) {
+        ezos_console_write("Usage: mem <hexaddr> [len]\n");
+        return;
+    }
+    uint32_t addr = x_htoi(a.argv[0]);
+    int len = 128;
+    if (a.argc >= 2) {
+        len = x_atoi(a.argv[1]);
+        if (len <= 0) len = 128;
+        if (len > 512) len = 512;
+    }
+
+    if (!mem_range_mapped(addr, (uint32_t)len)) {
+        ezos_console_write("error: that address range is not mapped "
+                           "(dumping it would fault the kernel)\n");
+        return;
+    }
+
+    ezos_console_write("Memory dump at 0x");
+    ezos_console_print_hex32(addr);
+    ezos_console_write(" (");
+    ezos_console_print_dec(len);
+    ezos_console_write(" bytes):\n");
+    for (int i = 0; i < len; i += 16) {
+        ezos_console_print_hex32(addr + i);
+        ezos_console_write("  ");
+        for (int j = 0; j < 16; j++) {
+            if (i + j < len) {
+                ezos_console_print_hex_byte(*(volatile uint8_t *)(addr + i + j));
+                ezos_console_putchar(' ');
+            } else {
+                ezos_console_write("   ");
+            }
+        }
+        ezos_console_write(" ");
+        for (int j = 0; j < 16 && i + j < len; j++) {
+            char c = (char)*(volatile uint8_t *)(addr + i + j);
+            ezos_console_putchar((c >= 32 && c <= 126) ? c : '.');
+        }
+        ezos_console_write("\n");
+    }
+}
+
+/* ==================================================================
+ * 6. 单命令详细帮助表
+ * ================================================================== */
+
+const char *shell_extra_help(const char *cmd) {
+    if (x_strcasecmp(cmd, "ver") == 0) {
+        return "ver - show kernel version\n  usage: ver";
+    }
+    if (x_strcasecmp(cmd, "sysinfo") == 0) {
+        return "sysinfo - show system summary\n  usage: sysinfo\n  shows CPU vendor, memory, time and date.";
+    }
+    if (x_strcasecmp(cmd, "type") == 0 || x_strcasecmp(cmd, "which") == 0) {
+        return "type|which <command> - show command type\n  usage: type <command>\n  reports builtin / alias / external file / not found.";
+    }
+    if (x_strcasecmp(cmd, "alias") == 0) {
+        return "alias - list or define command aliases\n  usage: alias            (list all)\n         alias name=cmd   (define)\n         alias name       (query)";
+    }
+    if (x_strcasecmp(cmd, "unalias") == 0) {
+        return "unalias <name> - remove a command alias\n  usage: unalias <name>";
+    }
+    if (x_strcasecmp(cmd, "sleep") == 0) {
+        return "sleep <ms> - sleep for <ms> milliseconds (yields CPU)\n  usage: sleep <milliseconds>";
+    }
+    if (x_strcasecmp(cmd, "mem") == 0) {
+        return "mem <hexaddr> [len] - dump physical memory\n  usage: mem 0xB8000\n         mem 0x100000 64";
+    }
+    if (x_strcasecmp(cmd, "dmesg") == 0) {
+        return "dmesg [n] - show kernel ring log (all or last n lines)\n  usage: dmesg\n         dmesg 10";
+    }
+    if (x_strcasecmp(cmd, "kmtest") == 0) {
+        return "kmtest - kernel heap allocator self-test (alloc/free/merge/guard)";
+    }
+    if (x_strcasecmp(cmd, "pagetest") == 0) {
+        return "pagetest - paging self-test (identity consistency + map/rw/unmap)";
+    }
+    if (x_strcasecmp(cmd, "utest") == 0) {
+        return "utest - ring3 user-mode + int 0x80 syscall self-test\n"
+               "  usage: utest\n"
+               "  runs a builtin machine-code program in ring 3 (2 writes + exit),\n"
+               "  and checks the user-pointer safety boundary on both sides.";
+    }
+    if (x_strcasecmp(cmd, "pmmtest") == 0) {
+        return "pmmtest - physical page frame allocator self-test\n"
+               "  usage: pmmtest\n"
+               "  checks alloc/free accounting, double-free rejection and\n"
+               "  out-of-range rejection.";
+    }
+    if (x_strcasecmp(cmd, "elftest") == 0) {
+        return "elftest - ELF32 loader self-test\n"
+               "  usage: elftest\n"
+               "  validates a well-formed ELF is accepted and 6 malformed ones\n"
+               "  are rejected, then loads, reads back, checks W^X and unloads.";
+    }
+    if (x_strcasecmp(cmd, "exec") == 0) {
+        return "exec <file> [args] - load and run an ELF32 user program in ring 3\n"
+               "  usage: exec HELLO.ELF\n"
+               "         exec HELLO.ELF arg1 arg2\n"
+               "  reads the file from the mounted filesystem, loads it at\n"
+               "  0x00400000, passes argc/argv on the user stack, and runs it\n"
+               "  until SYS_EXIT. Pages are fully reclaimed afterwards.\n"
+               "  A malformed ELF is rejected before a single page is mapped.";
+    }
+    if (x_strcasecmp(cmd, "calc") == 0) {
+        return "calc <expr> - floating point calculator\n"
+               "  usage: calc 1.5*2+1\n"
+               "         calc sqrt(2)\n"
+               "         calc sin(pi/6)\n"
+               "  operators: + - * / % ^ ( )\n"
+               "  functions: sqrt sin cos tan exp ln log abs floor ceil round\n"
+               "  constants: pi e";
+    }
+    if (x_strcasecmp(cmd, "selftest") == 0) {
+        return "selftest - run all subsystem self-tests at once\n"
+               "  usage: selftest\n"
+               "  covers: kmalloc, paging, pmm, elf loader, fpu, calc, exec\n"
+               "  a summary line reports PASS/FAIL per subsystem and overall.";
+    }
+    if (x_strcasecmp(cmd, "df") == 0) {
+        return "df - show exFAT disk space usage\n  usage: df\n  shows total, used and free space of the current exFAT drive.";
+    }
+    if (x_strcasecmp(cmd, "du") == 0) {
+        return "du [name] - show disk usage of current dir or file\n  usage: du\n         du subdir\n         du file.txt\n  without argument, reports usage of the current directory.";
+    }
+    if (x_strcasecmp(cmd, "ls") == 0) {
+        return "ls [path] - list files and directories\n  usage: ls\n         ls subdir\n  lists the current/root directory or the given path on the exFAT drive.";
+    }
+    if (x_strcasecmp(cmd, "cd") == 0) {
+        return "cd <dir> - change current directory\n  usage: cd subdir\n         cd ..\n         cd /";
+    }
+    if (x_strcasecmp(cmd, "pwd") == 0) {
+        return "pwd - print working directory\n  usage: pwd";
+    }
+    if (x_strcasecmp(cmd, "cat") == 0) {
+        return "cat <file> - print file content\n  usage: cat readme.txt";
+    }
+    if (x_strcasecmp(cmd, "clear") == 0 || x_strcasecmp(cmd, "cls") == 0) {
+        return "clear|cls - clear the terminal screen\n  usage: clear";
+    }
+    if (x_strcasecmp(cmd, "echo") == 0) {
+        return "echo [-n] <text> - print text\n  usage: echo hello\n         echo -n no-newline";
+    }
+    if (x_strcasecmp(cmd, "time") == 0) {
+        return "time - show current time\n  usage: time";
+    }
+    if (x_strcasecmp(cmd, "date") == 0) {
+        return "date - show current date\n  usage: date";
+    }
+    if (x_strcasecmp(cmd, "gui") == 0) {
+        return "gui - launch the graphical desktop\n  usage: gui\n  starts the window manager; use 'Back to Terminal' in the start menu to return to shell.";
+    }
+    if (x_strcasecmp(cmd, "version") == 0) {
+        return "version - show kernel version\n  usage: version";
+    }
+    if (x_strcasecmp(cmd, "uname") == 0) {
+        return "uname - print system information\n  usage: uname";
+    }
+    if (x_strcasecmp(cmd, "meminfo") == 0) {
+        return "meminfo - show memory info\n  usage: meminfo";
+    }
+    if (x_strcasecmp(cmd, "cpuid") == 0) {
+        return "cpuid - show CPU vendor string\n  usage: cpuid";
+    }
+    if (x_strcasecmp(cmd, "readdisk") == 0) {
+        return "readdisk [drive] <lba> - read and hexdump a disk sector\n  usage: readdisk 100\n         readdisk 1 100";
+    }
+    if (x_strcasecmp(cmd, "hexdump") == 0) {
+        return "hexdump <hexaddr> - dump memory at address\n  usage: hexdump 0xB8000";
+    }
+    if (x_strcasecmp(cmd, "beep") == 0) {
+        return "beep - make a beep sound\n  usage: beep";
+    }
+    if (x_strcasecmp(cmd, "about") == 0) {
+        return "about - about this OS\n  usage: about";
+    }
+    if (x_strcasecmp(cmd, "history") == 0) {
+        return "history - show command history\n  usage: history";
+    }
+    if (x_strcasecmp(cmd, "setcolor") == 0) {
+        return "setcolor <fg> [bg] - set text color (0-15)\n  usage: setcolor 2\n         setcolor 7 1";
+    }
+    if (x_strcasecmp(cmd, "setdrive") == 0) {
+        return "setdrive <0|1> - set exFAT drive\n  usage: setdrive 1";
+    }
+    if (x_strcasecmp(cmd, "write") == 0) {
+        return "write <file> <content> - create a file with content\n  usage: write hello.txt Hello world";
+    }
+    if (x_strcasecmp(cmd, "rm") == 0) {
+        return "rm <file> - delete a file\n  usage: rm temp.txt";
+    }
+    if (x_strcasecmp(cmd, "format") == 0) {
+        return "format - format slave disk as exFAT\n  usage: format\n  WARNING: erases all data on the slave disk.";
+    }
+    if (x_strcasecmp(cmd, "grep") == 0) {
+        return "grep <pattern> <file> - print lines containing pattern\n  usage: grep error log.txt";
+    }
+    if (x_strcasecmp(cmd, "wc") == 0) {
+        return "wc <file> - count lines, words and characters\n  usage: wc note.txt";
+    }
+    if (x_strcasecmp(cmd, "head") == 0) {
+        return "head <file> [n] - show first n lines (default 10)\n  usage: head log.txt\n         head log.txt 20";
+    }
+    if (x_strcasecmp(cmd, "tail") == 0) {
+        return "tail <file> [n] - show last n lines (default 10)\n  usage: tail log.txt\n         tail log.txt 20";
+    }
+    if (x_strcasecmp(cmd, "touch") == 0) {
+        return "touch <file> - create an empty file\n  usage: touch new.txt";
+    }
+    if (x_strcasecmp(cmd, "cp") == 0) {
+        return "cp <src> <dst> - copy a file\n  usage: cp a.txt b.txt";
+    }
+    if (x_strcasecmp(cmd, "mv") == 0) {
+        return "mv <src> <dst> - move or rename a file\n  usage: mv a.txt sub/b.txt";
+    }
+    if (x_strcasecmp(cmd, "mkdir") == 0) {
+        return "mkdir <dir> - create a directory\n  usage: mkdir docs";
+    }
+    if (x_strcasecmp(cmd, "vi") == 0) {
+        return "vi <file> - edit a text file\n  usage: vi note.txt";
+    }
+    if (x_strcasecmp(cmd, "calc") == 0) {
+        return "calc <expr> - evaluate an expression (e.g. calc 1+2*3)\n  usage: calc (4+5)*6";
+    }
+    if (x_strcasecmp(cmd, "hex") == 0) {
+        return "hex <num> - convert decimal <-> hex (0x.. for hex input)\n  usage: hex 255\n         hex 0xFF";
+    }
+    if (x_strcasecmp(cmd, "rand") == 0) {
+        return "rand [max] - generate a random number (default 0-99)\n  usage: rand\n         rand 1000";
+    }
+    if (x_strcasecmp(cmd, "guess") == 0) {
+        return "guess - guess-the-number game\n  usage: guess";
+    }
+    if (x_strcasecmp(cmd, "tictactoe") == 0) {
+        return "tictactoe - play tic-tac-toe vs AI\n  usage: tictactoe";
+    }
+    if (x_strcasecmp(cmd, "snake") == 0) {
+        return "snake - play snake game (arrows, P pause, Esc quit)\n  usage: snake";
+    }
+    /* 下面这批以前没有 help 条目：`help <cmd>` 静默什么都不打印，等于
+     * 命令存在但查不到用法。补齐后新增命令必须同时在这里登记——
+     * tests/test_help.py 会拿命令表和这里的键做差集守护。 */
+    if (x_strcasecmp(cmd, "fsck") == 0) {
+        return "fsck - check the mounted volume for inconsistencies\n"
+               "  usage: fsck";
+    }
+    if (x_strcasecmp(cmd, "crc16") == 0) {
+        return "crc16 <file> - CRC-16 of a file\n  usage: crc16 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "crc32") == 0) {
+        return "crc32 <file> - CRC-32 of a file\n  usage: crc32 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "crc32c") == 0) {
+        return "crc32c <file> - CRC-32C (Castagnoli) of a file\n  usage: crc32c README.TXT";
+    }
+    if (x_strcasecmp(cmd, "md5") == 0) {
+        return "md5 <file> - MD5 digest of a file\n  usage: md5 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "rmdir") == 0) {
+        return "rmdir <dir> - remove an empty directory\n  usage: rmdir docs";
+    }
+    if (x_strcasecmp(cmd, "desktop") == 0) {
+        return "desktop - enter the graphical desktop (the only way in)\n  usage: desktop";
+    }
+    if (x_strcasecmp(cmd, "vbetest") == 0) {
+        return "vbetest [force] - set the boot-probed VBE mode via real-mode INT 10h\n"
+               "  thunk (VMware/real-HW path), read back and verify, then restore text\n"
+               "  usage: vbetest        (probe only)\n"
+               "         vbetest force  (also pin gfx_skip_dispi=1 for the next desktop)";
+    }
+    if (x_strcasecmp(cmd, "exit") == 0) {
+        return "exit - this shell is the system console and cannot be left\n"
+               "  usage: exit        (prints a hint; use 'desktop' or 'shutdown')";
+    }
+    if (x_strcasecmp(cmd, "games") == 0) {
+        return "games - open the game menu\n  usage: games";
+    }
+    if (x_strcasecmp(cmd, "icalc") == 0) {
+        return "icalc - interactive calculator (blank line quits)\n  usage: icalc";
+    }
+    if (x_strcasecmp(cmd, "theme") == 0) {
+        return "theme [n] - list or switch the GUI theme\n  usage: theme\n         theme 1";
+    }
+    if (x_strcasecmp(cmd, "stack") == 0) {
+        return "stack - main stack high-water mark and budget\n  usage: stack";
+    }
+    if (x_strcasecmp(cmd, "jobs") == 0) {
+        return "jobs - list background jobs\n  usage: jobs";
+    }
+    if (x_strcasecmp(cmd, "ktask") == 0) {
+        return "ktask - spawn two kernel tasks and check they really interleave\n  usage: ktask";
+    }
+    if (x_strcasecmp(cmd, "ps") == 0) {
+        return "ps - list tasks (PID / state / switches / name)\n  usage: ps";
+    }
+    if (x_strcasecmp(cmd, "oomtest") == 0) {
+        return "oomtest - exercise the heap allocator under memory pressure\n"
+               "  usage: oomtest";
+    }
+    if (x_strcasecmp(cmd, "systest") == 0) {
+        return "systest - feed malicious arguments to the syscall entry "
+               "(kernel pages / unmapped / length wraparound)\n"
+               "  usage: systest";
+    }
+    if (x_strcasecmp(cmd, "stackchk") == 0) {
+        return "stackchk - task kernel stack guards (peak usage / canary / guard)\n"
+               "  usage: stackchk            - per-task peak usage and guard state\n"
+               "         stackchk selftest   - prove the guards actually detect damage\n"
+               "         stackchk burn       - TEST ONLY: damage one slot's guard so the\n"
+               "                               IRQ0 patrol must report it (ruins that slot)";
+    }
+    if (x_strcasecmp(cmd, "rstest") == 0) {
+        return "rstest - cross-check the C / Rust / Zig checksum implementations\n  usage: rstest";
+    }
+    if (x_strcasecmp(cmd, "uptime") == 0) {
+        return "uptime - time since boot (PIT ticks)\n  usage: uptime";
+    }
+    if (x_strcasecmp(cmd, "pci") == 0) {
+        return "pci [-v] - list PCI devices (-v adds BAR/IRQ detail)\n  usage: pci\n         pci -v";
+    }
+    if (x_strcasecmp(cmd, "crash") == 0) {
+        return "crash [pf|ud] - deliberately fault, to exercise the panic screen\n"
+               "  usage: crash pf\n         crash ud";
+    }
+    if (x_strcasecmp(cmd, "mouseproto") == 0) {
+        return "mouseproto 3|4 - PS/2 packet size (3 = no wheel, 4 = IntelliMouse)\n"
+               "  usage: mouseproto 4";
+    }
+    if (x_strcasecmp(cmd, "nic") == 0) {
+        return "nic ip <a.b.c.d> - set the static IP address\n  usage: nic ip 10.0.2.15";
+    }
+    if (x_strcasecmp(cmd, "dhcp") == 0) {
+        return "dhcp - acquire a lease via DHCP\n  usage: dhcp";
+    }
+    if (x_strcasecmp(cmd, "ntp") == 0) {
+        return "ntp <a.b.c.d | hostname> - query time via SNTP (UDP 123)\n  usage: ntp 10.0.2.2";
+    }
+    if (x_strcasecmp(cmd, "dns") == 0) {
+        return "dns [a.b.c.d | flush] - show / set / flush the DNS server\n"
+               "  usage: dns\n         dns 8.8.8.8\n         dns flush";
+    }
+    if (x_strcasecmp(cmd, "lookup") == 0) {
+        return "lookup <hostname> - resolve a name to an IPv4 address\n  usage: lookup example.com";
+    }
+    if (x_strcasecmp(cmd, "ping") == 0) {
+        return "ping <a.b.c.d | hostname> - send ICMP echo requests\n  usage: ping 10.0.2.2";
+    }
+    if (x_strcasecmp(cmd, "httpd") == 0) {
+        return "httpd - serve one HTTP request on port 80 (30s timeout)\n  usage: httpd";
+    }
+    if (x_strcasecmp(cmd, "fetch") == 0 || x_strcasecmp(cmd, "wget") == 0) {
+        return "fetch|wget <url> [file] - HTTP GET and print or save\n"
+               "  usage: fetch http://example.com/\n"
+               "         fetch http://example.com/ page.html\n"
+               "  HTTPS is NOT supported and is never silently downgraded.\n"
+               "  HTML bodies are not dumped to the screen; save them first.";
+    }
+    if (x_strcasecmp(cmd, "htmltest") == 0) {
+        return "htmltest <file> - parse a local HTML file and dump the layout\n"
+               "  usage: htmltest PAGE.HTML\n"
+               "  Prints title / node count / line count and every laid-out\n"
+               "  line (y, indent, style, href, text) to the serial console.\n"
+               "  Runs the same parser and layout as the browser window, so\n"
+               "  E2E can assert on layout instead of squinting at pixels.";
+    }
+    if (x_strcasecmp(cmd, "cjk") == 0) {
+        return "cjk - GB2312 Chinese glyph demo in graphics mode\n"
+               "  usage: cjk\n"
+               "  Enters the framebuffer and draws Chinese text at fixed\n"
+               "  positions (64,64 / 64,96 / 64,128), then waits for any key\n"
+               "  and returns to text mode. The font is a 16x16 GB2312\n"
+               "  bitmap compiled into the kernel - no disk needed.";
+    }
+    if (x_strcasecmp(cmd, "help") == 0) {
+        return "help [cmd] - show this help or detailed help for a command\n  usage: help\n         help df";
+    }
+    if (x_strcasecmp(cmd, "reboot") == 0) {
+        return "reboot - reboot the system\n  usage: reboot";
+    }
+    if (x_strcasecmp(cmd, "shutdown") == 0) {
+        return "shutdown - shutdown the system (QEMU exits)\n  usage: shutdown";
+    }
+    if (x_strcasecmp(cmd, "login") == 0 || x_strcasecmp(cmd, "su") == 0) {
+        return "login|su <user> - switch users (authenticate if the target has a password)\n  usage: su user";
+    }
+    if (x_strcasecmp(cmd, "whoami") == 0) {
+        return "whoami - print the current user name\n  usage: whoami";
+    }
+    if (x_strcasecmp(cmd, "useradd") == 0) {
+        return "useradd <name> - create a local account (admin only)\n  usage: useradd bob";
+    }
+    if (x_strcasecmp(cmd, "users") == 0) {
+        return "users - list local accounts and administrator flags";
+    }
+    if (x_strcasecmp(cmd, "admin") == 0) {
+        return "admin <user> <on|off> - grant or revoke administrator privileges";
+    }
+    if (x_strcasecmp(cmd, "setupusers") == 0) {
+        return "setupusers - local accounts are enabled by default; use passwd to set a password";
+    }
+    if (x_strcasecmp(cmd, "passwd") == 0) {
+        return "passwd - change your local account password";
+    }
+    if (x_strcasecmp(cmd, "logout") == 0) {
+        return "logout - end the console session and return to sign-in";
+    }
+    if (x_strcasecmp(cmd, "chmod") == 0) {
+        return "chmod <octal> <file> - change permission bits (ext4 only)\n  usage: chmod 600 a.txt";
+    }
+    if (x_strcasecmp(cmd, "chown") == 0) {
+        return "chown <user> <file> - change file owner (admin only, ext4 only)\n  usage: chown user a.txt";
+    }
+    if (x_strcasecmp(cmd, "trash") == 0) {
+        return "trash - list the recycle bin (/$RECYCLE.BIN)\n  usage: trash";
+    }
+    if (x_strcasecmp(cmd, "restore") == 0) {
+        return "restore <slot> - restore a trashed file to its original path\n  usage: restore 1";
+    }
+    if (x_strcasecmp(cmd, "purge") == 0) {
+        return "purge - empty the recycle bin\n  usage: purge";
+    }
+    if (x_strcasecmp(cmd, "reg") == 0) {
+        return "reg get|set|del|list - registry-style kv config (/registry.db)\n"
+               "  usage: reg get host.name\n         reg set host.name ezos\n"
+               "         reg del host.name\n         reg list";
+    }
+    return NULL;
+}
+
+/* pci：列出 PCI 总线上的设备（步骤 7 网络的前置设施）
+ * 没有参数时简洁列表；`pci -v` 额外打印 BAR 与中断信息。 */
+void cmd_pci(const char *args) {
+    int verbose = 0;
+    if (args) {
+        while (*args == ' ') args++;
+        if (args[0] == '-' && (args[1] == 'v' || args[1] == 'V')) verbose = 1;
+    }
+
+    int n = pci_device_count();
+    if (n == 0) {
+        ezos_console_write("  no PCI devices found\n");
+        return;
+    }
+
+    ezos_console_write("  BUS:DEV.FNC  VENDOR:DEVICE  CLASS\n");
+    for (int i = 0; i < n; i++) {
+        const pci_device_t *d = pci_get_device(i);
+
+        ezos_console_write("  ");
+        ezos_console_print_dec(d->bus);
+        ezos_console_write(":");
+        ezos_console_print_dec(d->dev);
+        ezos_console_write(".");
+        ezos_console_print_dec(d->func);
+        ezos_console_write("      ");
+
+        ezos_console_print_hex32(((uint32_t)d->vendor_id << 16) | d->device_id);
+        ezos_console_write("  ");
+        ezos_console_write(pci_class_name(d->class_code, d->subclass));
+        ezos_console_write("\n");
+
+        if (verbose) {
+            ezos_console_write("      ");
+            ezos_console_write(pci_vendor_name(d->vendor_id));
+            ezos_console_write(" ");
+            ezos_console_write(pci_device_name(d->vendor_id, d->device_id));
+            ezos_console_write("\n      IRQ line ");
+            ezos_console_print_dec(d->intr_line);
+            ezos_console_write(" pin ");
+            ezos_console_print_dec(d->intr_pin);
+            ezos_console_write("\n");
+            for (int b = 0; b < 6; b++) {
+                if (d->bar[b] == 0) continue;
+                ezos_console_write("      BAR");
+                ezos_console_print_dec(b);
+                ezos_console_write(" 0x");
+                ezos_console_print_hex32(d->bar[b]);
+                ezos_console_write(d->bar[b] & 0x1u ? "  (IO)" : "  (MMIO)");
+                ezos_console_write("\n");
+            }
+        }
+    }
+    ezos_console_write("  ");
+    ezos_console_print_dec((uint32_t)n);
+    ezos_console_write(" device(s)\n");
+
+    const pci_device_t *net = pci_find_by_class(PCI_CLASS_NETWORK);
+    ezos_console_write("  network controller: ");
+    if (net) {
+        ezos_console_write(pci_device_name(net->vendor_id, net->device_id));
+        ezos_console_write("\n");
+    } else {
+        ezos_console_write("none\n");
+    }
+}
+
+/*
+ * nic - 查看 RTL8139 网卡状态（步骤 7.2 诊断命令）。
+ *   nic             打印 IO base / IRQ / MAC / IP / 收发统计 / 首包诊断值
+ *   nic ip a.b.c.d  设置本机 IP（默认 10.0.2.15 = QEMU user-net guest 地址）
+ */
+void cmd_nic(const char *args) {
+    if (!netdev_present()) {
+        ezos_console_write("NIC: not present\n");
+        return;
+    }
+
+    /* 可选子命令：nic ip a.b.c.d */
+    while (*args == ' ') args++;
+    if (args[0] == 'i' && args[1] == 'p' && args[2] == ' ') {
+        const char *s = args + 3;
+        uint32_t v[4];
+        int n = 0;
+        while (*s == ' ') s++;
+        for (n = 0; n < 4; n++) {
+            if (*s < '0' || *s > '9') break;
+            uint32_t x = 0;
+            while (*s >= '0' && *s <= '9') {
+                x = x * 10 + (uint32_t)(*s - '0');
+                s++;
+                if (x > 255) break;
+            }
+            if (x > 255) break;
+            v[n] = x;
+            if (n < 3) {
+                if (*s != '.') break;
+                s++;
+            }
+        }
+        if (n == 4 && *s == '\0') {
+            netdev_set_ip((uint8_t)v[0], (uint8_t)v[1],
+                           (uint8_t)v[2], (uint8_t)v[3]);
+            ezos_console_write("IP set\n");
+            return;
+        }
+        ezos_console_write("usage: nic ip a.b.c.d\n");
+        return;
+    }
+
+    char ms[18], ips[16];
+    netdev_mac_str(ms);
+    netdev_ip_str(ips);
+    ezos_console_write(netdev_name());
+    ezos_console_write(": base 0x");
+    ezos_console_print_hex32(netdev_base());
+    ezos_console_write(" IRQ ");
+    ezos_console_print_dec(netdev_irq());
+    ezos_console_write("\nMAC: ");
+    ezos_console_write(ms);
+    ezos_console_write("\nIP: ");
+    ezos_console_write(ips);
+    ezos_console_write("\nRX: ");
+    ezos_console_print_dec(netdev_rx_packets());
+    ezos_console_write(" pkts ");
+    ezos_console_print_dec(netdev_rx_errors());
+    ezos_console_write(" errs\nTX: ");
+    ezos_console_print_dec(netdev_tx_packets());
+    ezos_console_write(" pkts ");
+    ezos_console_print_dec(netdev_tx_busy());
+    ezos_console_write(" busy\nARP: ");
+    ezos_console_print_dec(net_arp_replied());
+    ezos_console_write(" replied\nICMP: ");
+    ezos_console_print_dec(net_icmp_replied());
+    ezos_console_write(" replied\nIP drop: ");
+    ezos_console_print_dec(net_ip_drops());
+    ezos_console_write(" (bad csum / fragment)\nIRQ: ");
+    ezos_console_print_dec(netdev_irq_count());
+    ezos_console_write("\nUDP: ");
+    ezos_console_print_dec(net_udp_rx());
+    ezos_console_write(" in ");
+    ezos_console_print_dec(net_udp_tx());
+    ezos_console_write(" out\nTCP: ");
+    ezos_console_print_dec(net_tcp_rx());
+    ezos_console_write(" in ");
+    ezos_console_print_dec(net_tcp_tx());
+    ezos_console_write(" out\nARPcache: ");
+    ezos_console_print_dec(net_arp_entries());
+    ezos_console_write(" entries, sockets: ");
+    ezos_console_print_dec(net_sock_count());
+    ezos_console_write("\nPING: ");
+    ezos_console_print_dec(net_ping_reqs());
+    ezos_console_write(" req, ");
+    ezos_console_print_dec(net_ping_matched());
+    ezos_console_write(" matched");
+    ezos_console_write("\nDBG: st=0x");
+    uint32_t ds = 0, dl = 0, dc = 0;
+    netdev_rx_debug(&ds, &dl, &dc);
+    ezos_console_print_hex32(ds);
+    ezos_console_write(" len=");
+    ezos_console_print_dec(dl);
+    ezos_console_write(" capr=0x");
+    ezos_console_print_hex32(dc);
+    ezos_console_write("\n");
+
+    if (net_dhcp_valid()) {
+        uint32_t ip = 0, mask = 0, gw = 0, dns = 0, lease = 0;
+        net_dhcp_lease(&ip, &mask, &gw, &dns, &lease);
+        ezos_console_write("DHCP: ip ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write(" mask ");
+        ezos_console_write(ips_of(mask));
+        ezos_console_write("\nDHCP: router ");
+        ezos_console_write(ips_of(gw));
+        ezos_console_write(" dns ");
+        ezos_console_write(ips_of(dns));
+        ezos_console_write(" lease ");
+        ezos_console_print_dec(lease);
+        ezos_console_write("s\n");
+    }
+}
+
+/* ---- ping <a.b.c.d>：发 4 个 ICMP echo request，打印往返时延 ---- */
+static wait_queue_t g_ping_gap_wq = {-1};   /* 两次 ping 之间的间歇睡这 */
+
+void cmd_ping(const char *args) {
+    uint32_t be = 0;
+    const char *p = args;
+    while (*p == ' ') p++;
+    if (*p == '\0') {
+        ezos_console_write("Usage: ping <a.b.c.d | hostname>\n");
+        return;
+    }
+    /* 先当点分十进制；不是就当域名——网络工具接域名是刚需（ping 一个
+     * 名字比查完再 ping 一次省事），解析失败就报解析失败，不再退回 usage。 */
+    if (!parse_ipv4(p, &be)) {
+        ezos_console_write("PING: resolving ");
+        ezos_console_write(p);
+        ezos_console_write("\n");
+        int rc = net_dns_resolve(p, &be, 2500);
+        if (rc != 0) {
+            if (rc == 1)       ezos_console_write("PING: dns timeout (no answer)\n");
+            else if (rc == -2) ezos_console_write("PING: dns: no A record\n");
+            else if (rc == -3) ezos_console_write("PING: no dns server (dhcp / dns a.b.c.d)\n");
+            else               ezos_console_write("PING: cannot resolve (bad name)\n");
+            return;
+        }
+        ezos_console_write("PING: ");
+        ezos_console_write(p);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(be));
+        ezos_console_write("\n");
+    }
+
+    for (int i = 1; i <= 4; i++) {
+        uint32_t rtt = 0;
+        int rc = net_ping(be, 2000, &rtt);
+        if (rc == 0) {
+            ezos_console_write("reply from ");
+            ezos_console_write(ips_of(be));
+            ezos_console_write(": seq=");
+            ezos_console_print_dec((uint32_t)i);
+            ezos_console_write(" time=");
+            ezos_console_print_dec(rtt);
+            ezos_console_write(" ms\n");
+        } else if (rc == 1) {
+            ezos_console_write("request timeout (seq=");
+            ezos_console_print_dec((uint32_t)i);
+            ezos_console_write(")\n");
+        } else {
+            ezos_console_write("send failed (no route / arp)\n");
+        }
+        if (i < 4) task_sleep(&g_ping_gap_wq, 500);
+    }
+}
+
+/* "a.b.c.d"（大端打包 → 文本；ips 缓冲至少 16 字节） */
+static const char *ips_of(uint32_t be) {
+    static char buf[16];
+    uint8_t o[4] = { (uint8_t)(be >> 24), (uint8_t)(be >> 16),
+                     (uint8_t)(be >> 8), (uint8_t)be };
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t v = o[i];
+        if (v >= 100) buf[n++] = (char)('0' + v / 100);
+        if (v >= 10)  buf[n++] = (char)('0' + (v / 10) % 10);
+        buf[n++] = (char)('0' + v % 10);
+        if (i < 3) buf[n++] = '.';
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+/* ---- lookup <host>：DNS A 记录查询；dns [a.b.c.d]：查看/设置服务器 ----
+ * 输出统一 "DNS: " 前缀（E2E 按前缀取行）。服务器默认来自 DHCP option 6，
+ * 没跑过 dhcp 时用 `dns a.b.c.d` 手动指定。 */
+void cmd_lookup(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("Usage: lookup <hostname>\n");
+        return;
+    }
+    uint32_t ip = 0;
+    if (net_dns_cache_lookup(args, &ip)) {      /* 命中：一个包都没发 */
+        ezos_console_write("DNS: ");
+        ezos_console_write(args);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write(" (cached)\n");
+        return;
+    }
+    int rc = net_dns_resolve(args, &ip, 2500);
+    if (rc == 0) {
+        ezos_console_write("DNS: ");
+        ezos_console_write(args);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write("\n");
+        return;
+    }
+    if (rc == 1)       ezos_console_write("DNS: timeout (no answer)\n");
+    else if (rc == -2) ezos_console_write("DNS: no A record\n");
+    else if (rc == -3) ezos_console_write("DNS: no server (dhcp / dns a.b.c.d)\n");
+    else               ezos_console_write("DNS: failed (bad name / tx error)\n");
+}
+
+void cmd_dns(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        uint32_t n = net_dns_server_count();
+        if (n == 0) ezos_console_write("DNS: no server\n");
+        else {
+            for (uint32_t i = 0; i < n; i++) {   /* option 6 可能给多个 */
+                ezos_console_write("DNS: server ");
+                ezos_console_write(ips_of(net_dns_server_at(i)));
+                ezos_console_write("\n");
+            }
+        }
+        ezos_console_write("DNS: cache ");
+        ezos_console_print_dec(net_dns_cache_entries());
+        ezos_console_write(" entries, ");
+        ezos_console_print_dec(net_dns_cache_hits());
+        ezos_console_write(" hits\n");
+        return;
+    }
+    if (args[0] == 'f' && args[1] == 'l' && args[2] == 'u' &&
+        args[3] == 's' && args[4] == 'h') {
+        net_dns_cache_clear();
+        ezos_console_write("DNS: cache flushed\n");
+        return;
+    }
+    uint32_t be = 0;
+    if (!parse_ipv4(args, &be)) {
+        ezos_console_write("Usage: dns [a.b.c.d | flush]\n");
+        return;
+    }
+    net_dns_set_server(be);
+    ezos_console_write("DNS: server set\n");
+}
+
+static int parse_ipv4(const char *s, uint32_t *be) {
+    uint32_t v[4];
+    const char *p = s;
+    for (int f = 0; f < 4; f++) {
+        uint32_t x = 0;
+        int d = 0;
+        while (*p >= '0' && *p <= '9') {
+            x = x * 10 + (uint32_t)(*p - '0');
+            p++;
+            d++;
+            if (x > 255) return 0;
+        }
+        if (d == 0) return 0;
+        v[f] = x;
+        if (f < 3) {
+            if (*p != '.') return 0;
+            p++;
+        }
+    }
+    if (*p != '\0') return 0;
+    *be = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+    return 1;
+}
+
+/* ---- httpd：监听 80，服务一个 GET（固定 200 页面）后返回 ---- */
+void cmd_httpd(const char *args) {
+    (void)args;
+    ezos_console_write("httpd: listening on 0.0.0.0:80 (one request, 30s)...\n");
+    int rc = net_httpd_once();
+    if (rc == 0) {
+        ezos_console_write("httpd: served 200, done\n");
+    } else if (rc == 1) {
+        ezos_console_write("httpd: nobody connected within 30s\n");
+    } else {
+        ezos_console_write("httpd: failed (port busy / out of memory)\n");
+    }
+}
+
+/* ---- dhcp：向局域网要一个地址（DISCOVER/OFFER/REQUEST/ACK） ----
+ * 输出行统一 "DHCP: " 前缀（E2E 与 dmesg 都按这个前缀取行）。
+ * 阻塞最长 ~3*2500ms（DISCOVER）+ 3*2500ms（REQUEST）；shell 无 Ctrl-C，
+ * 故不提供常驻重试，超时就是超时。 */
+void cmd_dhcp(const char *args) {
+    (void)args;
+    if (!netdev_present()) {
+        ezos_console_write("DHCP: no NIC\n");
+        return;
+    }
+    ezos_console_write("DHCP: discovering...\n");
+    int rc = net_dhcp(2500);
+    if (rc != 0) {
+        if (rc == 1)      ezos_console_write("DHCP: no response (timeout)\n");
+        else if (rc == 2) ezos_console_write("DHCP: NAK / bad offer\n");
+        else              ezos_console_write("DHCP: failed (no nic / tx error)\n");
+        return;
+    }
+    uint32_t ip = 0, mask = 0, gw = 0, dns = 0, lease = 0;
+    net_dhcp_lease(&ip, &mask, &gw, &dns, &lease);
+    ezos_console_write("DHCP: got ");
+    ezos_console_write(ips_of(ip));
+    ezos_console_write("\nDHCP: mask ");
+    ezos_console_write(ips_of(mask));
+    ezos_console_write("\nDHCP: router ");
+    ezos_console_write(ips_of(gw));
+    ezos_console_write("\nDHCP: dns ");
+    ezos_console_write(ips_of(dns));
+    ezos_console_write("\nDHCP: lease ");
+    ezos_console_print_dec(lease);
+    ezos_console_write("s\n");
+}
+
+
+/* ===================== ntp：SNTP 校时 =====================
+ * 用法：ntp <a.b.c.d | hostname>
+ * 向 NTP 服务器（UDP 123）发一次 SNTP v4 客户端查询，打印服务器
+ * transmit timestamp 换算出的 Unix 秒与 UTC 日期时间。 */
+
+/* Unix 秒 -> UTC 日历（Howard Hinnant civil_from_days 算法） */
+static void ntp_utc(uint32_t sec, int *Y, int *M, int *D,
+                    int *h, int *m, int *s) {
+    *h = (int)((sec / 3600u) % 24u);
+    *m = (int)((sec / 60u) % 60u);
+    *s = (int)(sec % 60u);
+    uint32_t z   = sec / 86400u + 719468u;
+    uint32_t era = z / 146097u;
+    uint32_t doe = z - era * 146097u;
+    uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    uint32_t y   = yoe + era * 400u;
+    uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    uint32_t mp  = (5u * doy + 2u) / 153u;
+    uint32_t d   = doy - (153u * mp + 2u) / 5u + 1u;
+    uint32_t mth = mp + (mp < 10u ? 3u : 0u) - (mp >= 10u ? 9u : 0u);
+    *Y = (int)(y + (mth <= 2u ? 1u : 0u));
+    *M = (int)mth;
+    *D = (int)d;
+}
+
+void cmd_ntp(const char *args) {
+    if (!netdev_present()) {
+        ezos_console_write("NTP: no NIC\n");
+        return;
+    }
+    const char *p = args;
+    while (*p == ' ') p++;
+    if (*p == '\0') {
+        ezos_console_write("Usage: ntp <a.b.c.d | hostname>\n");
+        return;
+    }
+    uint32_t be = 0;
+    if (!parse_ipv4(p, &be)) {
+        ezos_console_write("NTP: resolving ");
+        ezos_console_write(p);
+        ezos_console_write("\n");
+        int rc = net_dns_resolve(p, &be, 2500);
+        if (rc != 0) {
+            if (rc == 1)  ezos_console_write("NTP: dns timeout\n");
+            else          ezos_console_write("NTP: cannot resolve\n");
+            return;
+        }
+    }
+    uint32_t sec = 0;
+    int rc = net_ntp(be, &sec, 2500);
+    if (rc == 1)      { ezos_console_write("NTP: timeout (no answer)\n"); return; }
+    if (rc == -2)     { ezos_console_write("NTP: bad response\n"); return; }
+    if (rc != 0)      { ezos_console_write("NTP: send failed\n"); return; }
+    int Y, M, D, h, m, s;
+    ntp_utc(sec, &Y, &M, &D, &h, &m, &s);
+    ezos_console_write("NTP: unix ");
+    ezos_console_print_dec(sec);
+    ezos_console_write(" utc ");
+    ezos_console_print_dec((uint32_t)Y);
+    ezos_console_write("-");
+    if (M < 10) ezos_console_write("0");
+    ezos_console_print_dec((uint32_t)M);
+    ezos_console_write("-");
+    if (D < 10) ezos_console_write("0");
+    ezos_console_print_dec((uint32_t)D);
+    ezos_console_write(" ");
+    if (h < 10) ezos_console_write("0");
+    ezos_console_print_dec((uint32_t)h);
+    ezos_console_write(":");
+    if (m < 10) ezos_console_write("0");
+    ezos_console_print_dec((uint32_t)m);
+    ezos_console_write(":");
+    if (s < 10) ezos_console_write("0");
+    ezos_console_print_dec((uint32_t)s);
+    ezos_console_write("\n");
+}
+
+
+/* ===================== fetch：HTTP 客户端 =====================
+ * 用法：
+ *   fetch <url>            抓取并打印到屏幕（截断时会提示）
+ *   fetch <url> <file>     抓取并存成文件
+ * 只有明文 http://。没有 TLS 就明说，不做"去掉 s 降级"那种假成功。 */
+
+#define FETCH_BUF_SZ  32768u      /* 抓取缓冲：≥4KB，按纪律必须 static */
+static uint8_t g_fetch_buf[FETCH_BUF_SZ] __attribute__((section(".bss")));
+
+/* 把 fetch 的错误码翻成人话 */
+static const char *fetch_err(int rc) {
+    switch (rc) {
+    case -1: return "bad url (syntax / too long)";
+    case -2: return "dns failed (no A record / no server)";
+    case -3: return "connect failed (no route / refused / timeout)";
+    case -4: return "send failed";
+    case -5: return "bad or truncated response";
+    case -6: return "malformed status line / headers";
+    case -7: return "https needs TLS, not implemented";
+    case -8: return "too many redirects";
+    default:  return "unknown error";
+    }
+}
+
+/* 判断 Content-Type 是不是 HTML（决定要不要直接刷屏）。
+ * 必须比全 "text/html"，不能只看前 5 个字符 —— 那样 "text/plain"
+ * 会被当成 HTML，文本文件一律不显示。 */
+static int h_ct_is_html(const char *ct) {
+    while (*ct == ' ') ct++;
+    static const char *pfx = "text/html";
+    for (uint32_t i = 0; i < 9; i++) {
+        char c = ct[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != pfx[i]) return 0;
+    }
+    /* "text/htmlxxx" 不算 HTML：后继必须是 '/'（charset）或结束 */
+    char nx = ct[9];
+    if (nx && nx != '/' && nx != ';' && nx != ' ') return 0;
+    return 1;
+}
+
+void cmd_fetch(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("usage: fetch <url> [file]\n");
+        ezos_console_write("  fetch http://example.com/          print to screen\n");
+        ezos_console_write("  fetch http://example.com/ page.html save to file\n");
+        return;
+    }
+
+    /* 切出 url 与可选文件名（就地切分，args 由 shell 传入可写） */
+    char url[256];
+    uint32_t un = 0;
+    const char *file = 0;
+    while (args[un] && args[un] != ' ') { if (un + 1 >= sizeof(url)) {
+            ezos_console_write("fetch: url too long\n"); return; }
+        url[un] = args[un]; un++; }
+    url[un] = '\0';
+    const char *rest = args + un;
+    while (*rest == ' ') rest++;
+    if (*rest) {
+        static char fn[128];
+        uint32_t i = 0;
+        while (rest[i] && rest[i] != ' ' && i + 1 < sizeof(fn)) { fn[i] = rest[i]; i++; }
+        fn[i] = '\0';
+        file = fn;
+    }
+
+    ezos_console_write("fetch: ");
+    ezos_console_write(url);
+    ezos_console_write("\n");
+
+    http_result_t r;
+    int rc = http_fetch(url, g_fetch_buf, FETCH_BUF_SZ, 5000, &r);
+    if (rc != 0) {
+        ezos_console_write("fetch: ");
+        ezos_console_write(fetch_err(rc));
+        ezos_console_write("\n");
+        return;
+    }
+
+    ezos_console_write("HTTP ");
+    ezos_console_print_dec((uint32_t)r.status);
+    if (r.content_length) {
+        ezos_console_write(", content-length ");
+        ezos_console_print_dec(r.content_length);
+    }
+    if (r.chunked) ezos_console_write(", chunked");
+    if (r.redirects) {
+        ezos_console_write(", redirects ");
+        ezos_console_print_dec(r.redirects);
+    }
+    if (r.content_type[0]) {
+        ezos_console_write(", type ");
+        ezos_console_write(r.content_type);
+    }
+    ezos_console_write("\n");
+
+    if (file) {
+        if (fs_create_file(file, g_fetch_buf, r.body_len) == 0) {
+            ezos_console_write("saved ");
+            ezos_console_write(file);
+            ezos_console_write(" (");
+            ezos_console_print_dec(r.body_len);
+            ezos_console_write(" bytes)\n");
+        } else {
+            ezos_console_write("fetch: write failed: ");
+            ezos_console_write(file);
+            ezos_console_write("\n");
+        }
+        if (r.truncated)
+            ezos_console_write("note: response larger than buffer, saved truncated\n");
+        return;
+    }
+
+    /* 打到屏幕。HTML/JS 源码直接刷屏没意义，提示存文件。 */
+    if (h_ct_is_html(r.content_type)) {
+        ezos_console_print_dec(r.body_len);
+        ezos_console_write(" bytes of HTML. save it: fetch <url> <file>\n");
+        return;
+    }
+    ezos_console_write("--- ");
+    ezos_console_print_dec(r.body_len);
+    ezos_console_write(" bytes ---\n");
+    for (uint32_t i = 0; i < r.body_len; i++) ezos_console_putchar((char)g_fetch_buf[i]);
+    if (r.body_len == 0 || g_fetch_buf[r.body_len - 1] != '\n') ezos_console_write("\n");
+    if (r.truncated)
+        ezos_console_write("(truncated: response exceeds 32K buffer)\n");
+}
+
+/* ===================== htmltest：HTML 解析/排版自检 =====================
+ *
+ * 为什么要有这个命令：浏览器的解析与排版链路（Rust html.rs + webview.c）
+ * 平时只能靠肉眼看窗口 —— 而"页面有字但断行错了""实体没展开""标题没抓到"
+ * 这几类错在屏幕上**看着都像正常的网页**，人眼分辨不出来。要把它们变成
+ * 能断言的东西，就得把内部结果打到串口上。
+ *
+ * 走本地文件而不是 URL：E2E 里网络一挂，"解析没跑起来"和"网不通"会长得
+ * 一模一样。解析是纯计算，不该依赖网络。
+ */
+/* 判断 args 的**第一个词**（到空格为止）是否等于 word。
+ *
+ * 不能直接 x_strcasecmp(args, word)：那是全串比较，"sample 1" 跟
+ * "sample" 永远不等，于是所有子命令都会掉进"当成文件名"的分支 ——
+ * 症状是 `htmltest sample 1` 回一句 "cannot read sample"，看着像文件
+ * 不存在，实际是分词根本没做。子命令带参数时必须先切词。 */
+static int arg_is(const char *args, const char *word)
+{
+    while (*args == ' ') args++;
+    int i = 0;
+    while (word[i] && args[i] && x_tolower(args[i]) == x_tolower(word[i])) i++;
+    if (word[i]) return 0;
+    return args[i] == '\0' || args[i] == ' ';
+}
+
+/* stackchk：任务内核栈的守卫状态与水位（见 kernel/stackchk.h）
+ *
+ * 为什么要有这条命令：静态栈预算（tools/check_stack.py）只看编译期估算值，
+ * 抓不到运行期真实深度，更抓不到写穿。真出事时症状是"某个看起来完全无关
+ * 的静态数据坏了" —— cmd_ls 的 entries[64] 曾把 fs.c 的 ro_cwd 写坏，表现
+ * 是提示符变成 `[A.TXT]`，看着像文件系统坏了。这里把"每个任务用了多少、
+ * 有没有写穿"直接摆出来，让这类问题在第一现场就能定位。
+ *
+ * PEAK 是**历史**峰值（0xA5 填充被写过多少），不是当前用量 —— 用来看
+ * "离 16KB 还有多远"，而不是看此刻栈有多深。
+ */
+/* systest：系统调用的恶意参数（安全边界 fuzz）
+ *
+ * 为什么要这条：user_range_ok 是"用户态能不能借系统调用读写内核内存"的
+ * 唯一闸门，而它的漏判在测试机上永远看不出来 —— 要等有人真的传一个内核
+ * 地址进来。这里把常见的恶意形态**在内核态直接喂给 syscall_handler**
+ * （不用真的起一个用户程序去传，省掉整条 ELF 装载链路），断言一律被拒。
+ *
+ * 判据是每个用例都必须返回负值（-1）。返回 0 或正数意味着内核**接受**了
+ * 恶意参数，那是漏洞不是小毛病。系统还得活着（命令能跑完、后续有提示符）。
+ */
+void cmd_systest(const char *args) {
+    (void)args;
+    /* 三类地址（与 cmd_utest 的约定一致）：
+     *   KERNEL_PAGE  已映射但无 PTE_US —— 内核数据，绝不能让用户碰到
+     *   UNMAPPED     完全没映射 —— 内核解引用就是 #PF
+     *   USER_PAGE    合法用户页（只在"长度恶意"用例里当基址用） */
+    const uint32_t KERNEL_PAGE = 0x00100000u;
+    const uint32_t UNMAPPED    = 0x05000000u;
+    const uint32_t USER_PAGE    = 0x00400000u;
+    int fail = 0;
+
+    struct { const char *name; uint32_t num, a1, a2, a3; } cases[] = {
+        { "write buf=kernel page",   SYS_WRITE,    1u, KERNEL_PAGE, 8u },
+        { "write buf=unmapped",      SYS_WRITE,    1u, UNMAPPED,    8u },
+        { "read buf=kernel page",    SYS_READ,     0u, KERNEL_PAGE, 8u },
+        { "read buf=unmapped",       SYS_READ,     0u, UNMAPPED,    8u },
+        /* 长度恶意：0xFFFFFFFF 会让 va+len 环绕，必须在算术之前被拒 */
+        { "write len=0xFFFFFFFF",    SYS_WRITE,    1u, USER_PAGE,   0xFFFFFFFFu },
+        { "read len=0xFFFFFFFF",     SYS_READ,     0u, USER_PAGE,   0xFFFFFFFFu },
+        { "open name=kernel page",   SYS_OPEN,     KERNEL_PAGE, 0u, 0u },
+        { "open name=unmapped",      SYS_OPEN,     UNMAPPED,    0u, 0u },
+        { "pipe fds=kernel page",    SYS_PIPE,     KERNEL_PAGE, 0u, 0u },
+        { "waitpid status=kernel",   SYS_WAITPID,  -1, KERNEL_PAGE, 0u },
+        { "sockcall args=kernel",    SYS_SOCKCALL, 0u, KERNEL_PAGE, 0u },
+        { "unknown syscall number",  9999u,        0u, 0u, 0u },
+    };
+    const uint32_t n = sizeof(cases) / sizeof(cases[0]);
+
+    ezos_console_write("systest: malicious syscall arguments "
+                       "(all must be rejected)\n");
+    for (uint32_t i = 0; i < n; i++) {
+        int rc = syscall_handler(cases[i].num, cases[i].a1,
+                                 cases[i].a2, cases[i].a3);
+        int ok = (rc < 0);
+        if (!ok) fail++;
+        ezos_console_write("SYSTEST: ");
+        ezos_console_write(cases[i].name);
+        ezos_console_write(": ");
+        ezos_console_write(ok ? "PASS" : "FAIL");
+        ezos_console_write("\n");
+    }
+    /* 边界：fd 号越界也不能当成有效 fd */
+    int rc_bad = syscall_handler(SYS_CLOSE, 9999u, 0u, 0u);
+    if (rc_bad >= 0) fail++;
+    ezos_console_write("SYSTEST: close fd=9999: ");
+    ezos_console_write(rc_bad < 0 ? "PASS" : "FAIL");
+    ezos_console_write("\n");
+
+    ezos_console_write("SYSTEST: result: ");
+    ezos_console_write(fail == 0 ? "PASS\n" : "FAIL\n");
+}
+
+/* oomtest：主动把堆耗尽，验分配器在压力下的契约仍然成立。
+ * 详细用例在 kernel/oomtest.c，这里只负责接线。 */
+void cmd_oomtest(const char *args) {
+    (void)args;
+    oom_selftest(ezos_console_write);
+}
+
+void cmd_stackchk(const char *args) {
+    while (*args == ' ') args++;
+    if (arg_is(args, "selftest")) {
+        stackchk_selftest(ezos_console_write);
+        return;
+    }
+    if (arg_is(args, "burn")) {
+        /* 故意破坏一个槽位的 guard，用来验证 IRQ0 巡检真的在跑。
+         *
+         * 只有破坏真实任务栈才能证明"巡检会报警"—— 在 scratch 上验的只是
+         * stackchk_broken_layer 这个函数，验不到"有没有人周期性去调它"。
+         * 代价：这个槽位的守卫此后就是坏的，所以 burn 只能放在最后跑，
+         * 也**绝不**在正常操作里用。
+         */
+        uint32_t n = 0;
+        const task_t *tab = task_table(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (tab[i].kstack == 0) continue;
+            volatile uint8_t *gp = (volatile uint8_t *)(unsigned long)
+                (tab[i].kstack - KS_GUARD + 4u);
+            *gp = 0x00u;
+            ezos_console_write("STACKCHK: burn armed on slot=");
+            ezos_console_print_dec(i);
+            ezos_console_write(" (IRQ0 patrol should report it within 1s)\n");
+            return;
+        }
+        ezos_console_write("STACKCHK: burn: no guarded slot "
+                           "(run ktask first)\n");
+        return;
+    }
+    if (args[0] != '\0') {
+        ezos_console_write("usage: stackchk [selftest|burn]\n");
+        return;
+    }
+    uint32_t n = 0;
+    const task_t *tab = task_table(&n);
+    static const char *st[] = { "unused", "ready", "running",
+                                "blocked", "zombie" };
+    uint32_t checked = 0;
+    uint32_t bad = 0;
+
+    ezos_console_write("  SLOT  PID   PEAK / LIMIT   GUARD  STATE    NAME\n");
+    for (uint32_t i = 0; i < n; i++) {
+        /* 只跳过从未装载过栈的槽位（kstack==0，含 0 号任务：它跑在启动栈
+         * 上，不在栈池里，没有守卫）。
+         * **已退出的槽位照样显示**：任务退出不清 kstack，栈里的 0xA5 痕迹
+         * 还在，于是能看到"这个槽位上跑过的任务最多用了多少"—— 这正是
+         * 定位"某个任务偶发写穿"最想知道的数。 */
+        if (tab[i].kstack == 0) continue;
+        checked++;
+        int layer = stackchk_broken_layer(tab[i].kstack, TASK_KSIZE);
+        uint32_t peak = stackchk_peak(tab[i].kstack, TASK_KSIZE);
+        if (layer != -1) {
+            bad++;
+            ezos_console_write("STACKCHK: CORRUPTION slot=");
+            ezos_console_print_dec(i);
+            ezos_console_write(" layer=");
+            ezos_console_write(layer == 1 ? "guard" : "canary");
+            ezos_console_write("\n");
+        }
+        ezos_console_write("  ");
+        ezos_console_print_dec(i);
+        ezos_console_write("     ");
+        ezos_console_print_dec(tab[i].pid);
+        ezos_console_write("    ");
+        ezos_console_print_dec(peak);
+        ezos_console_write(" / ");
+        ezos_console_print_dec((uint32_t)(TASK_KSIZE - KS_CANARY));
+        ezos_console_write("   ");
+        ezos_console_write(layer == -1 ? "OK  " : "BAD ");
+        ezos_console_write("   ");
+        ezos_console_write(st[(uint32_t)tab[i].state]);
+        ezos_console_write("   ");
+        ezos_console_write(tab[i].name[0] ? tab[i].name : "(unnamed)");
+        ezos_console_write("\n");
+    }
+    ezos_console_write("STACKCHK: ");
+    ezos_console_print_dec(checked);
+    ezos_console_write(" slot(s) checked, ");
+    if (bad == 0) ezos_console_write("all guards intact\n");
+    else {
+        ezos_console_print_dec(bad);
+        ezos_console_write(" CORRUPTED (stack overflow - see slot(s) above)\n");
+    }
+}
+
+void cmd_htmltest(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("usage: htmltest <file>|sample <n>\n");
+        ezos_console_write("  htmltest PAGE.HTL      parse a local file\n");
+        ezos_console_write("  htmltest sample <n>    parse a builtin sample (1..6)\n");
+        return;
+    }
+
+    /* 内建样本存在的理由：QMP sendkey 打不出 '<' '>' '\\' 这类字符
+     *（未映射的键名会被静默丢弃），靠 write 命令把 HTML 送进 guest
+     * 根本不成立 —— 等了一串 '>' 一个没进去，却会显示成"解析器不认标签"。
+     * 样本写在核心里，才能在没有网络、没有特殊键的情况下钉住解析语义。 */
+    if (arg_is(args, "sample")) {
+        const char *p = args + 6;
+        while (*p == ' ') p++;
+        if (*p < '0' || *p > '9') {
+            ezos_console_write("htmltest: sample needs a number (1..6)\n");
+            return;
+        }
+        int n = 0;
+        while (*p >= '0' && *p <= '9') {
+            /* 钳制：位数再多也不要溢出成负数，那样 html_sample(负数)
+             * 会掉进 "n < 1" 之外的路径 someday。 */
+            if (n > 1000) { n = 1001; break; }
+            n = n * 10 + (*p - '0');
+            p++;
+        }
+        const char *s = html_sample(n);
+        if (!s) {
+            ezos_console_write("htmltest: no such sample (1..");
+            ezos_console_print_dec((uint32_t)html_sample_count());
+            ezos_console_write(")\n");
+            return;
+        }
+        int rc = wv_parse_mem(s, wv_strlen(s), "sample");
+        if (rc != 0) {
+            ezos_console_write("htmltest: parse failed rc=");
+            ezos_console_print_dec((uint32_t)rc);
+            ezos_console_write("\n");
+            return;
+        }
+        wv_dump("sample");
+        return;
+    }
+
+    /* 文件名分支：args 前面可能还有空格（arg_is 内部跳过了，这里要
+     * 自己再跳一次），否则 " htmltestA.HTML" 会把路径首字节读成空格。 */
+    while (*args == ' ') args++;
+    char path[128];
+    uint32_t n = 0;
+    while (args[n] && args[n] != ' ' && n + 1 < sizeof(path)) {
+        path[n] = args[n]; n++;
+    }
+    path[n] = '\0';
+
+    int got = fs_read_file(path, g_fetch_buf, FETCH_BUF_SZ);
+    if (got <= 0) {
+        ezos_console_write("htmltest: cannot read ");
+        ezos_console_write(path);
+        ezos_console_write("\n");
+        return;
+    }
+
+    /* 复用抓取缓冲：≥4KB 的缓冲按纪律必须 static，这里不另开一块，
+     * 两个 32KB 的 .bss 纯为了一个自检命令不值。 */
+    int rc = wv_parse_mem(g_fetch_buf, (uint32_t)got, path);
+    if (rc != 0) {
+        ezos_console_write("htmltest: parse failed rc=");
+        ezos_console_print_dec((uint32_t)rc);
+        ezos_console_write("\n");
+        return;
+    }
+    wv_dump(path);
+}
+
+/* cjk: 图形模式中文渲染演示 + 字库自检。
+ *
+ * 为什么常驻一个命令而不是只活在测试里：中文渲染是日用刚需（浏览器正文、
+ * 窗口标题、菜单全是中文），这个命令既是演示也是最小可断言面——E2E 按
+ * 固定坐标的 16x16 区域直接比点阵，不需要 OCR 认汉字。
+ * 进入 framebuffer 画三行字，等一个键后回文本模式。
+ */
+void cmd_cjk(const char *args) {
+    (void)args;
+    gfx_init();
+    gfx_clear(0x00);
+    /* 固定坐标：tests/test_cjk.py 直接按点阵比对这些区域 */
+    gfx_draw_text_utf8(64, 64,  "中文渲染", 8, 0x0A, 0x00);
+    gfx_draw_text_utf8(64, 96,  "蔚蓝系统", 8, 0x0F, 0x00);
+    gfx_draw_text_utf8(64, 128, "GB2312 16x16", 12, 0x0B, 0x00);
+    /* 等任意键退出 */
+    while (keyboard_getchar() == 0) {
+    }
+    gfx_restore_text();
+    terminal_initialize();
+    terminal_writestring("cjk: demo done\n");
+}

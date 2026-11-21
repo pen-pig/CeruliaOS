@@ -1,0 +1,5125 @@
+/*
+ * gfxwin.c - Cerulia 窗口框架（v0.7 Win10 桌面版）
+ * 移植自 RetrOS-32 (joexbayer/RetrOS-32, MIT) + sinwindows v2 功能结构参考
+ * 底层：gfx.h（VBE 16bpp LFB / VGA mode 0x13 320x200x256）
+ *
+ * v0.7 主要改动（Win10 桌面完善轮）：
+ *  1. 闪烁修复：按需重绘（鼠标移动/状态变化才整屏重绘），静止画面不重绘，
+ *     光标为 16x16 Win10 白色箭头；彻底消除持续闪烁
+ *  2. 鼠标指针：16x16 位图箭头（黑描边白填充），随鼠标移动实时更新
+ *  3. 16bpp RGB565 真彩绘制：标题栏 #0078D7 渐变、按钮 hover 高亮、
+ *     任务栏深色半透明（alpha 混合）、窗口阴影、选中态高亮，8bpp 回退近似索引色
+ *  4. 应用窗口：文件管理器(exFAT)/记事本/系统信息/时钟/设置/关于
+ *  5. 布局全部基于 GFX_W/GFX_H 自适应（gw_scale_x/y），禁用写死 640x480
+ *  6. 开机过渡动画：Logo 渐显 + 进度条 + 步骤文字
+ *  7. 开始菜单/任务栏完善：应用列表、设置/电源按钮、任务按钮指示条、时钟
+ */
+
+#include "gfx.h"
+#include "port.h"
+#include "webview.h"
+#include "keyboard.h"
+
+#define TERM_ROWS 24
+#define TERM_COLS 80
+
+/* 输入行上限。以前是"一行放得下"（term_cols-3 ≈ 77），超出的按键**直接丢
+ * 弃**——在 GUI 终端里敲 `write BIG <长内容>` 这种命令，敲到行尾之后字符就
+ * 不再出现，看着像"明明超长了却不换行"。
+ * 现在按终端该有的行为来：输入可以折行，折到屏底就整体上滚。term_buf 是
+ * 线性 24x80，绘制按 term_cols 切行，所以连续写字符天然就是折行的。 */
+#define TERM_INPUT_MAX 512
+
+extern void system_shutdown(void);
+extern void system_reboot(void);
+#include "shell.h"
+#include "gfxwin.h"
+#include "mouse.h"
+#include "keyboard.h"
+#include "fs.h"
+#include "games.h"
+#include "isr.h"
+#include "irqflags.h"
+#include "rtc.h"
+#include "serial.h"
+#include "tty.h"
+#include "user.h"
+
+/* 前置声明：定义顺序在调用之后（gw_spawn_app / gw_demo 使用） */
+void gw_redraw_region(int x, int y, int w, int h);
+static void gw_draw_window_body(gw_window_t *w, int with_content);
+static void term_print(const char *s);
+static void term_draw(gw_window_t *w);
+static void term_key(gw_window_t *w, int key);
+static void term_newline(void);
+static void term_prompt(void);
+static int term_nrows;
+static int gw_launch_game(int idx);
+static gw_window_t *gw_spawn_app(int idx);
+
+/* ---- 应用清单（提前定义：桌面图标 / Dock / 开始菜单共用） ---- */
+#define GW_APP_FILES    0
+#define GW_APP_NOTEPAD  1
+#define GW_APP_SYSINFO  2
+#define GW_APP_CLOCK    3
+#define GW_APP_SETTINGS 4
+#define GW_APP_ABOUT    5
+#define GW_APP_TERMINAL 6
+#define GW_APP_PAINT    7
+#define GW_APP_BROWSER  8
+#define GW_APP_COUNT    9
+
+static const char *gw_app_names[GW_APP_COUNT] = {
+    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About Cerulia", "Terminal", "Paint",
+    "Browser"
+};
+static int gw_app_allowed(int idx)
+{
+    if (idx < 0 || idx >= GW_APP_COUNT) return 0;
+    return !user_confined() || idx == GW_APP_FILES || idx == GW_APP_NOTEPAD ||
+           idx == GW_APP_CLOCK || idx == GW_APP_ABOUT || idx == GW_APP_TERMINAL;
+}
+
+enum { GW_SESSION_NONE, GW_SESSION_LOCK, GW_SESSION_SWITCH, GW_SESSION_SIGNIN, GW_SESSION_BUSY };
+static int gw_session_request;
+
+static void gw_game_yield(void);
+
+/* ==================================================================
+ * 基础工具
+ * ================================================================== */
+
+static int gw_strlen(const char *s)
+{
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static uint8_t gw_cmos_read(uint8_t reg)
+{
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static int gw_bcd(uint8_t v)
+{
+    return (v & 0x0F) + ((v >> 4) * 10);
+}
+
+/* ---------- 三角函数表（定点 x128，60 项，每 6 度） ---------- */
+static const int gw_sin128[60] = {
+    0, 13, 27, 40, 52, 64, 75, 86, 95, 104,
+    111, 117, 122, 125, 127, 128, 127, 125, 122, 117,
+    111, 104, 95, 86, 75, 64, 52, 40, 27, 13,
+    0, -13, -27, -40, -52, -64, -75, -86, -95, -104,
+    -111, -117, -122, -125, -127, -128, -127, -125, -122, -117,
+    -111, -104, -95, -86, -75, -64, -52, -40, -27, -13,
+};
+static const int gw_cos128[60] = {
+    128, 127, 125, 122, 117, 111, 104, 95, 86, 75,
+    64, 52, 40, 27, 13, 0, -13, -27, -40, -52,
+    -64, -75, -86, -95, -104, -111, -117, -122, -125, -127,
+    -128, -127, -125, -122, -117, -111, -104, -95, -86, -75,
+    -64, -52, -40, -27, -13, 0, 13, 27, 40, 52,
+    64, 75, 86, 95, 104, 111, 117, 122, 125, 127,
+};
+
+/* ==================================================================
+ * 16bpp RGB565 真彩绘制（直接写 gfx_fb；8bpp 回退近似索引色）
+ * ================================================================== */
+
+#define CLR_BLUE        0x0078D7u  /* Win10 强调蓝 */
+#define CLR_BLUE_DARK   0x005A9Eu
+#define CLR_BLUE_LIGHT  0x3C9BE8u
+#define CLR_BLUE_SEL    0xE5F1FBu  /* 列表选中背景 */
+#define CLR_WHITE       0xFFFFFFu
+#define CLR_BLACK       0x000000u
+#define CLR_GRAY_TEXT   0x999999u
+#define CLR_WIN_BG      0xF3F3F3u  /* 窗口内容底 */
+#define CLR_WIN_BG2     0xFFFFFFu
+#define CLR_BORDER      0xE1E1E1u
+#define CLR_TASKBAR     0x171717u
+#define CLR_TASKBAR_HL  0x3C3C3Cu
+#define CLR_TASKBAR_AC  0x0078D7u
+#define CLR_EDIT_BG     0xFFFFFFu
+#define CLR_ROW_HOVER   0xD9E6F2u
+
+static uint16_t gw_rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+/* U3: 32bpp direct color. gfx_fmt 1=BGRA (QEMU GOP fmt=1: byte order
+ * B,G,R,X - the low 24 bits of a 0x00RRGGBB rgb are already in BGR order);
+ * 0=RGBA needs a channel swap. */
+static uint32_t gw_rgb2pix32(uint32_t rgb)
+{
+    if (gfx_fmt == 1)
+        return (rgb & 0x00FFFFFFu) | 0xFF000000u;
+    return ((rgb & 0xFFu) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) | 0xFF000000u;
+}
+static uint32_t gw_pix2rgb32(uint32_t pix)
+{
+    if (gfx_fmt == 1)
+        return pix & 0x00FFFFFFu;
+    return ((pix & 0xFFu) << 16) | (pix & 0xFF00u) | ((pix >> 16) & 0xFFu);
+}
+
+/* 8bpp 回退：rgb -> 最接近的可用索引色（0x00-0x0F + 0xF0-0xF9） */
+static uint8_t gw_idx_near(uint32_t rgb)
+{
+    static const uint8_t tbl[26][3] = {
+        {0,0,0},{0,0,170},{0,170,0},{0,170,170},{170,0,0},{170,0,170},
+        {170,170,0},{192,192,192},{128,128,128},{0,0,255},{0,255,0},
+        {0,255,255},{255,0,0},{255,0,255},{255,255,0},{255,255,255},
+        {0,120,215},{0,90,158},{60,155,232},{243,243,243},{225,225,225},
+        {205,205,205},{153,153,153},{232,17,35},{32,32,32},{64,64,64}
+    };
+    int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
+    int best = 0, bd = 0x7FFFFFFF;
+    for (int i = 0; i < 26; i++) {
+        int dr = r - tbl[i][0], dg = g - tbl[i][1], db = b - tbl[i][2];
+        int d = dr * dr + dg * dg + db * db;
+        if (d < bd) { bd = d; best = (i < 16) ? i : (0xF0 + i - 16); }
+    }
+    return (uint8_t)best;
+}
+
+static void gw_px(int x, int y, uint32_t rgb)
+{
+    if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) return;
+    if (gfx_bpp == 2)
+        ((uint16_t*)gfx_fb)[y * GFX_W + x] = gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+    else if (gfx_bpp == 4)
+        ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gw_rgb2pix32(rgb);
+    else
+        gfx_putpixel(x, y, gw_idx_near(rgb));
+}
+
+static void gw_fill(int x, int y, int w, int h, uint32_t rgb)
+{
+    if (w <= 0 || h <= 0) return;
+    if (gfx_bpp == 4) {
+        uint32_t c = gw_rgb2pix32(rgb);
+        for (int j = 0; j < h; j++) {
+            int yy = y + j;
+            if (yy < 0 || yy >= GFX_H) continue;
+            uint32_t *row = &((uint32_t*)gfx_fb)[(uint32_t)yy * gfx_stride];
+            for (int i = 0; i < w; i++) {
+                int xx = x + i;
+                if (xx < 0 || xx >= GFX_W) continue;
+                row[xx] = c;
+            }
+        }
+        return;
+    }
+    if (gfx_bpp == 2) {
+        uint16_t c = gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+        for (int j = 0; j < h; j++) {
+            int yy = y + j;
+            if (yy < 0 || yy >= GFX_H) continue;
+            uint16_t *row = &((uint16_t*)gfx_fb)[yy * GFX_W];
+            for (int i = 0; i < w; i++) {
+                int xx = x + i;
+                if (xx < 0 || xx >= GFX_W) continue;
+                row[xx] = c;
+            }
+        }
+    } else {
+        uint8_t ci = gw_idx_near(rgb);
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
+                gfx_putpixel(x + i, y + j, ci);
+    }
+}
+
+/* 垂直渐变填充 */
+static void gw_fill_vgrad(int x, int y, int w, int h, uint32_t top, uint32_t bot)
+{
+    if (h <= 0) return;
+    if (w <= 0) return;
+    if (h == 1) { gw_fill(x, y, w, 1, top); return; }   /* h==1 时 h-1 为 0，避免除零 */
+    int tr = (int)((top >> 16) & 0xFF), tg = (int)((top >> 8) & 0xFF), tb = (int)(top & 0xFF);
+    int br = (int)((bot >> 16) & 0xFF), bg = (int)((bot >> 8) & 0xFF), bb = (int)(bot & 0xFF);
+    for (int j = 0; j < h; j++) {
+        int a = j * 255 / (h - 1), ia = 255 - a;
+        uint32_t c = (uint32_t)(((tr * ia + br * a) / 255) << 16)
+                   | (uint32_t)(((tg * ia + bg * a) / 255) << 8)
+                   | (uint32_t)(((tb * ia + bb * a) / 255));
+        gw_fill(x, y + j, w, 1, c);
+    }
+}
+
+/* 半透明填充（alpha 混合，仅 16bpp；8bpp 回退纯色） */
+static void gw_fill_rgba(int x, int y, int w, int h, uint32_t rgb, int alpha)
+{
+    if (w <= 0 || h <= 0) return;
+    if (gfx_bpp != 2 && gfx_bpp != 4) { gw_fill(x, y, w, h, rgb); return; }
+    if (gfx_bpp == 4) {
+        int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
+        for (int j = 0; j < h; j++) {
+            int yy = y + j;
+            if (yy < 0 || yy >= GFX_H) continue;
+            uint32_t *row = &((uint32_t*)gfx_fb)[(uint32_t)yy * gfx_stride];
+            for (int i = 0; i < w; i++) {
+                int xx = x + i;
+                if (xx < 0 || xx >= GFX_W) continue;
+                uint32_t base = gw_pix2rgb32(row[xx]);
+                int br = (int)((base >> 16) & 0xFF);
+                int bgc = (int)((base >> 8) & 0xFF);
+                int bb = (int)(base & 0xFF);
+                int nr = (r * alpha + br * (255 - alpha)) / 255;
+                int ng = (g * alpha + bgc * (255 - alpha)) / 255;
+                int nb = (b * alpha + bb * (255 - alpha)) / 255;
+                row[xx] = gw_rgb2pix32(((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb);
+            }
+        }
+        return;
+    }
+    int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
+    for (int j = 0; j < h; j++) {
+        int yy = y + j;
+        if (yy < 0 || yy >= GFX_H) continue;
+        uint16_t *row = &((uint16_t*)gfx_fb)[yy * GFX_W];
+        for (int i = 0; i < w; i++) {
+            int xx = x + i;
+            if (xx < 0 || xx >= GFX_W) continue;
+            uint16_t base = row[xx];
+            int br5 = (base >> 11) & 0x1F, bg6 = (base >> 5) & 0x3F, bb5 = base & 0x1F;
+            int nr5 = ((r >> 3) * alpha + br5 * (255 - alpha)) / 255;
+            int ng6 = ((g >> 2) * alpha + bg6 * (255 - alpha)) / 255;
+            int nb5 = ((b >> 3) * alpha + bb5 * (255 - alpha)) / 255;
+            row[xx] = (uint16_t)((nr5 << 11) | (ng6 << 5) | nb5);
+        }
+    }
+}
+
+static void gw_frame(int x, int y, int w, int h, uint32_t rgb)
+{
+    gw_fill(x, y, w, 1, rgb);
+    gw_fill(x, y + h - 1, w, 1, rgb);
+    gw_fill(x, y, 1, h, rgb);
+    gw_fill(x + w - 1, y, 1, h, rgb);
+}
+
+static void gw_draw_line(int x0, int y0, int x1, int y1, uint32_t c)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        gw_px(x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx)  { err += dx; y0 += sy; }
+    }
+}
+
+static void gw_draw_circle(int cx, int cy, int r, uint32_t c)
+{
+    int x = 0, y = r, d = 1 - r;
+    while (x <= y) {
+        gw_px(cx + x, cy + y, c); gw_px(cx - x, cy + y, c);
+        gw_px(cx + x, cy - y, c); gw_px(cx - x, cy - y, c);
+        gw_px(cx + y, cy + x, c); gw_px(cx - y, cy + x, c);
+        gw_px(cx + y, cy - x, c); gw_px(cx - y, cy - x, c);
+        if (d < 0) d += 2 * x + 3;
+        else { d += 2 * (x - y) + 5; y--; }
+        x++;
+    }
+}
+
+/* ==================================================================
+ * 主题（8bpp 回退索引色 + 16bpp 真彩强调色）
+ * ================================================================== */
+struct gw_theme {
+    uint8_t desktop;
+    uint8_t window_bg;
+    uint8_t border;
+    uint8_t border_light;
+    uint8_t border_dark;
+    uint8_t header;
+    uint8_t header_text;
+    uint8_t text;
+    const char *name;
+    uint32_t accent;   /* 16bpp 标题栏色 */
+    uint32_t bg_rgb;   /* 16bpp 内容底 */
+    uint8_t style;     /* 0=Win10 风格（底部任务栏） 1=GNOME 风格（顶部栏） */
+};
+
+void gw_win10_palette(void)
+{
+    static const uint8_t pal[10][3] = {
+        { 0x00, 0x1E, 0x35 }, /* F0 #0078D7 */
+        { 0x00, 0x16, 0x27 }, /* F1 #005A9E */
+        { 0x0F, 0x26, 0x3A }, /* F2 #3C9BE8 */
+        { 0x3C, 0x3C, 0x3C }, /* F3 #F3F3F3 */
+        { 0x38, 0x38, 0x38 }, /* F4 #E1E1E1 */
+        { 0x33, 0x33, 0x33 }, /* F5 #CDCDCD */
+        { 0x26, 0x26, 0x26 }, /* F6 #999999 */
+        { 0x3A, 0x04, 0x08 }, /* F7 #E81123 */
+        { 0x08, 0x08, 0x08 }, /* F8 #202020 */
+        { 0x10, 0x10, 0x10 }, /* F9 #404040 */
+    };
+    outb(0x3C8, 0xF0);
+    for (int i = 0; i < 10; i++) {
+        outb(0x3C9, pal[i][0]);
+        outb(0x3C9, pal[i][1]);
+        outb(0x3C9, pal[i][2]);
+    }
+}
+
+#define GW_THEME_COUNT 7
+static struct gw_theme gw_themes[GW_THEME_COUNT] = {
+    { GW_C_BLUE_DARK, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      GW_C_BLUE, 0x0F, 0x00, "Win10 Blue", 0x0078D7u, 0xF3F3F3u, 0 },
+    { 0x00, 0x08, 0x00, 0x07, 0x08,
+      GW_C_BLUE, 0x0F, 0x0F, "Win10 Dark", 0x0078D7u, 0x1E1E1Eu, 0 },
+    { GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      GW_C_BLUE, 0x0F, 0x00, "Win10 Light", 0x0078D7u, 0xFFFFFFu, 0 },
+    { 0x08, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      0x08, 0x0F, 0x00, "Win10 Gray", 0x6E6E6Eu, 0xEFEFEFu, 0 },
+    { 0x00, 0x00, 0x0F, 0x0F, 0x0F,
+      0x0F, 0x00, 0x0F, "Win10 Contrast", 0x000000u, 0xFFFFFFu, 0 },
+    { 0x01, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      0x1F, 0x0F, 0x00, "Win10 Aqua", 0x00B7C3u, 0xF0FBFBu, 0 },
+    /* Ubuntu GNOME：顶部黑栏 + Activities + 居中时钟，Ubuntu 橙强调 */
+    { 0x00, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      0x08, 0x0F, 0x00, "Ubuntu GNOME", 0xE95420u, 0xF7F7F7u, 1 },
+};
+
+static struct gw_theme *gw_cur_theme = &gw_themes[0];
+static uint32_t gw_accent = 0x0078D7u;
+static uint32_t gw_bg_rgb = 0xF3F3F3u;
+/* 标题渐变暗档 / 顶部亮边 / ghost / 按钮按压态用的强调色派生色：
+ * 与 8bpp DAC 路径（gw_set_theme 的 F1/F2 槽位、gfx_theme_accent）同一
+ * 公式。此前 16bpp 这几处硬编码 CLR_BLUE_DARK/CLR_BLUE_LIGHT，切到
+ * Contrast（accent=0x000000）等主题标题栏仍是深蓝——"QEMU 绿、真机坏"
+ * 类缺陷：8bpp 早就推导，16bpp 没跟上。 */
+static uint32_t gw_accent_dark = CLR_BLUE_DARK;
+static uint32_t gw_accent_light = CLR_BLUE_LIGHT;
+static int gw_theme_sel = 0;     /* 持久化的主题选择（跨 GUI 会话保持） */
+static int gw_dirty;             /* 前置声明：gw_set_theme 里置脏，定义在桌面层 */
+static int gw_gui_active = 0;    /* gw_demo 主循环运行中标志 */
+
+static void gw_update_accent_shades(void)
+{
+    uint32_t a = gw_accent;
+    gw_accent_dark = (a * 3) / 4;                  /* 暗一档 */
+    gw_accent_light = a + (0xFFFFFFu - a) / 3;     /* 亮一档 */
+}
+
+void gw_set_theme(int index)
+{
+    if (index < 0) index = 0;
+    if (index >= GW_THEME_COUNT) index = GW_THEME_COUNT - 1;
+    gw_theme_sel = index;
+    gw_cur_theme = &gw_themes[index];
+    gw_accent = gw_cur_theme->accent;
+    gw_bg_rgb = gw_cur_theme->bg_rgb;
+    gw_update_accent_shades();
+    /* 调色板槽位 F0/F1/F2 跟随主题：8bpp 走 DAC，16/32bpp 走 LUT
+     * （此前这里只写 DAC，16bpp 的 gfx_palette16 永远是默认蓝） */
+    gfx_theme_accent(gw_accent);
+    /* GUI 运行中切主题（Settings 点击 / shell theme 命令）：请求整屏重绘 */
+    if (gw_gui_active) gw_dirty = 1;
+}
+int gw_theme_count(void) { return GW_THEME_COUNT; }
+const char *gw_theme_name(int index)
+{
+    if (index < 0 || index >= GW_THEME_COUNT) return NULL;
+    return gw_themes[index].name;
+}
+
+/* ==================================================================
+ * 鼠标指针（16x16 Win10 白色箭头，黑描边）
+ * '.'=透明 'B'=黑 'W'=白
+ * ================================================================== */
+static const char gw_cursor_map[16][17] = {
+    "B...............",
+    "BW..............",
+    "BWW.............",
+    "BWWW............",
+    "BWWWW...........",
+    "BWWWWW..........",
+    "BWWWWWW.........",
+    "BWWWWWWW........",
+    "BWWWWWWBW.......",
+    "BWWWWWBBW.......",
+    "BWWWWBBBW.......",
+    "BWWWBBB.W.......",
+    "BWWBBB..W.......",
+    "B.BBB...W.......",
+    ".BB.....W.......",
+    ".B......W.......",
+};
+
+static void gw_cursor_draw(int mx, int my)
+{
+    /* 精灵原点钳到屏内：鼠标逻辑坐标能到 (GFX_W-1, GFX_H-1)，不钳的话
+     * 箭头 15/16 列（或行）画在屏幕外——用户把鼠标甩到右/下边缘时看到
+     * "鼠标消失了"（只剩 1px 黑边）。钳精灵不钳热点：点击命中仍按逻辑
+     * 坐标 (mx,my)，gw_cursor_save_bg 用同一钳制，缓存与绘制不会错位。 */
+    if (mx > GFX_W - 16) mx = GFX_W - 16;
+    if (my > GFX_H - 16) my = GFX_H - 16;
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; i < 16; i++) {
+            char ch = gw_cursor_map[j][i];
+            if (ch == '.') continue;
+            int x = mx + i, y = my + j;
+            if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
+            gw_px(x, y, (ch == 'B') ? 0x000000u : 0xFFFFFFu);
+        }
+    }
+}
+
+/* 光标背景缓存（8bpp 与 16bpp 均生效）：移动光标前先擦除旧光标，避免残影；
+ * 使鼠标移动只需局部重绘 hover 区域，无需触发全屏重绘（闪烁根因之一） */
+static uint32_t gw_cursor_bg[256];   /* 16bpp 存 RGB565，8bpp 存索引色 */
+static int gw_cursor_bg_valid = 0;
+static int gw_cursor_bg_x = -1, gw_cursor_bg_y = -1;
+
+/* 光标"消失窗口"计量（探针判据，非功能代码）：
+ * gw_cur_erase_tick = 最近一次把光标从 LFB 擦掉的 tick；
+ * gw_cur_gap_max    = 擦除->重画 之间的最大间隔(ms)。
+ * 老实现在所有重绘**之前**擦光标，点一次鼠标的全屏重绘有多久、光标就
+ * 消失多久（实测 TCG 100-300ms）；修复后只剩微秒级的擦+存+画。
+ * 探针 probe_cursor.py 用 F12 转储里的 cgap= 字段断言这个值。 */
+static uint32_t gw_cur_erase_tick = 0;
+static uint32_t gw_cur_gap_max = 0;
+
+static void gw_cursor_save_bg(int mx, int my)
+{
+    /* 与 gw_cursor_draw 同一套钳制：缓存记录的是"精灵实际被画到的位置" */
+    if (mx > GFX_W - 16) mx = GFX_W - 16;
+    if (my > GFX_H - 16) my = GFX_H - 16;
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; i < 16; i++) {
+            int x = mx + i, y = my + j;
+            uint32_t v = 0;
+            if (x >= 0 && x < GFX_W && y >= 0 && y < GFX_H) {
+                if (gfx_bpp == 2)
+                    v = ((uint16_t*)gfx_fb)[y * GFX_W + x];
+                else if (gfx_bpp == 4)
+                    v = ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x];
+                else
+                    v = (uint32_t)gfx_fb[y * GFX_W + x];
+            }
+            gw_cursor_bg[j * 16 + i] = v;
+        }
+    }
+    gw_cursor_bg_x = mx;
+    gw_cursor_bg_y = my;
+    gw_cursor_bg_valid = 1;
+}
+
+static void gw_cursor_restore_bg(void)
+{
+    if (!gw_cursor_bg_valid) return;
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; i < 16; i++) {
+            int x = gw_cursor_bg_x + i, y = gw_cursor_bg_y + j;
+            if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
+            if (gfx_bpp == 2)
+                ((uint16_t*)gfx_fb)[y * GFX_W + x] = (uint16_t)gw_cursor_bg[j * 16 + i];
+            else if (gfx_bpp == 4)
+                ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gw_cursor_bg[j * 16 + i];
+            else
+                gfx_fb[y * GFX_W + x] = (uint8_t)gw_cursor_bg[j * 16 + i];
+        }
+    }
+    gw_cursor_bg_valid = 0;
+    gw_cur_erase_tick = g_pit_ticks;   /* 光标从 LFB 消失的起点（计量用） */
+}
+
+/* ==================================================================
+ * 帧内损伤矩形 + 延迟擦除（2026-10-25 用户报"有时候鼠标会消失"）
+ * ------------------------------------------------------------------
+ * 老实现把"擦除旧光标"放在主循环所有重绘**之前**：重绘多慢，光标就从
+ * 帧缓冲里消失多久。点一次鼠标就触发 gw_draw_all 全屏重绘（壁纸 100 万
+ * 像素 + 全部窗口 + 任务栏），TCG 下 100-300ms、真机 5-15ms——这段时间
+ * 光标不在画面上，正是用户看到的"鼠标有时候会消失"（开着 SysInfo 每秒
+ * 一次、Browser 小恐龙每 16ms 一帧、每次点击/按键都来一回）。
+ *
+ * 修法：擦除改到所有重绘**之后**、重画光标之前，光标消失窗口只剩
+ * "擦 256 像素 + 存 256 像素 + 画 256 像素"（微秒级）。但旧光标精灵
+ * 可能还留在 LFB 里（重绘没覆盖到它），直接按缓存恢复又会把"重绘刚
+ * 画上的新内容"盖成旧内容——所以用损伤矩形精确排除：
+ *   精灵像素落在损伤内 → 已被重绘覆盖且是新内容，不恢复；
+ *   落在损伤外        → 重绘没碰过，按缓存安全恢复。
+ * 每个直写 LFB 的重绘入口都要 gw_dmg_add 登记自己的矩形（清单见各
+ * 调用点）；漏登一处 = 该处的残影或stale 二选一，所以探针
+ * probe_cursor.py 对每条重绘路径都有断言。
+ * ================================================================== */
+#define GW_DMG_MAX 32
+static int gw_dmg_n = 0;
+static int gw_dmg_rect[GW_DMG_MAX][4];  /* x0,y0,x1,y1，半开区间 */
+
+static void gw_dmg_reset(void)
+{
+    gw_dmg_n = 0;
+}
+
+static void gw_dmg_add(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+    if (gw_dmg_n >= GW_DMG_MAX) {
+        /* 当前单帧路径上界低于 32；若以后新增绘制路径打爆表，宁可
+         * 保守地不恢复旧缓存（可能被下一次重绘清掉），也不能把新内容
+         * 覆盖成旧像素。 */
+        gw_dmg_rect[0][0] = 0; gw_dmg_rect[0][1] = 0;
+        gw_dmg_rect[0][2] = GFX_W; gw_dmg_rect[0][3] = GFX_H;
+        gw_dmg_n = 1;
+        return;
+    }
+    gw_dmg_rect[gw_dmg_n][0] = x;
+    gw_dmg_rect[gw_dmg_n][1] = y;
+    gw_dmg_rect[gw_dmg_n][2] = x + w;
+    gw_dmg_rect[gw_dmg_n][3] = y + h;
+    gw_dmg_n++;
+}
+
+/* 擦除旧光标精灵，但逐像素跳过本帧真正重绘过的矩形。
+ * 必须保留矩形列表而不是只存总外接框：Dino 每帧回传顶带和底带，
+ * 外接框会把中间未重绘的白区也算成损伤，光标移走后就在白区留残影。 */
+static void gw_cursor_restore_bg_excl(void)
+{
+    if (!gw_cursor_bg_valid) return;
+    for (int j = 0; j < 16; j++) {
+        for (int i = 0; i < 16; i++) {
+            int x = gw_cursor_bg_x + i, y = gw_cursor_bg_y + j;
+            int covered = 0;
+            if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
+            for (int k = 0; k < gw_dmg_n; k++) {
+                const int *r = gw_dmg_rect[k];
+                if (x >= r[0] && x < r[2] && y >= r[1] && y < r[3]) {
+                    covered = 1;
+                    break;
+                }
+            }
+            if (covered) continue;
+            if (gfx_bpp == 2)
+                ((uint16_t*)gfx_fb)[y * GFX_W + x] = (uint16_t)gw_cursor_bg[j * 16 + i];
+            else if (gfx_bpp == 4)
+                ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gw_cursor_bg[j * 16 + i];
+            else
+                gfx_fb[y * GFX_W + x] = (uint8_t)gw_cursor_bg[j * 16 + i];
+        }
+    }
+    gw_cursor_bg_valid = 0;
+    gw_cur_erase_tick = g_pit_ticks;
+}
+
+/* ==================================================================
+ * 游戏窗口双缓冲
+ * ------------------------------------------------------------------
+ * 游戏轮询循环调用 yield 的频率极高（每次无键可读都会 yield），旧实现
+ * 每次 yield 都直接在可见帧缓冲上"整窗清背景 -> 重绘"，无垂直同步时
+ * 扫描线恰好扫到清空阶段就看到整窗闪白，高速循环下表现为持续闪动看不清。
+ * 双缓冲：先把整窗画进离屏缓冲，再一次性顺序搬回 LFB（扫描线最多看到
+ * 一次完整新画面，不再出现清空阶段的空白）。
+ *
+ * 由链接器放进内核工作区，避免覆盖 SMM 固件在旧 16 MiB 地址上的 ACPI NVS。
+ * ================================================================== */
+#define GW_BB_BYTES  (3u * 1024u * 1024u)
+#define GW_BB_FPS_MS 16            /* 重绘节流：约 60FPS */
+
+static uint16_t g_gw_bb[GW_BB_BYTES / sizeof(uint16_t)]
+    __attribute__((section(".bss.buff"), aligned(64)));
+static uint8_t *g_gw_real_fb = NULL;
+static int g_gw_real_stride = 0;      /* U3: real LFB stride while offscreen (bb is packed) */
+static uint32_t gw_game_last_draw_ms = 0;
+
+/* 进入离屏绘制：成功返回 1 并把 gfx_fb 切到后备缓冲，调用方随后用常规
+ * gw_ 与 gfx_ 系列接口以屏幕坐标绘制，绘制函数本身无需任何改动。
+ * 失败（8bpp 回退或分辨率超限）返回 0，调用方走旧直绘路径。 */
+static int gw_bb_begin(void)
+{
+    if (gfx_bpp != 2 && gfx_bpp != 4) return 0;
+    if ((uint32_t)GFX_W * (uint32_t)GFX_H * (uint32_t)(gfx_bpp == 4 ? 4 : 2) > GW_BB_BYTES) return 0;
+    g_gw_real_fb = gfx_fb;
+    g_gw_real_stride = gfx_stride;
+    gfx_stride = GFX_W;               /* offscreen buffer is packed (stride == width) */
+    gfx_fb = (uint8_t*)g_gw_bb;
+    return 1;
+}
+
+/* 退出离屏绘制，把 (x,y,w,h) 区域从后备缓冲一次性搬回真实 LFB */
+static void gw_bb_end(int x, int y, int w, int h)
+{
+    gfx_fb = g_gw_real_fb;
+    gfx_stride = g_gw_real_stride;    /* U3: back to real LFB stride (GOP may exceed width) */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+    if (gfx_bpp == 4) {
+        uint32_t *dst = (uint32_t*)gfx_fb + (uint32_t)y * gfx_stride + x;
+        uint32_t *src = (uint32_t*)g_gw_bb + (uint32_t)y * GFX_W + x;
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
+                dst[(uint32_t)j * gfx_stride + i] = src[(uint32_t)j * GFX_W + i];
+        return;
+    }
+    uint16_t *dst = (uint16_t*)gfx_fb + (uint32_t)y * gfx_stride + x;
+    uint16_t *src = g_gw_bb + (uint32_t)y * GFX_W + x;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++)
+            dst[(uint32_t)j * gfx_stride + i] = src[(uint32_t)j * GFX_W + i];
+    }
+}
+
+/* 光标 16x16 是否完全落在窗口矩形内（决定画进离屏缓冲还是 blit 后直绘） */
+static int gw_cursor_in_win(gw_window_t *w, int mx, int my)
+{
+    return (mx >= w->x && my >= w->y &&
+            mx + 16 <= w->x + w->w && my + 16 <= w->y + w->h);
+}
+
+/* 旧光标（背景缓存位置）是否完全落在窗口内：
+ * 在窗口内则 blit 会覆盖其像素，无需手工擦除 */
+static int gw_cursor_old_in_win(gw_window_t *w)
+{
+    return (gw_cursor_bg_valid &&
+            gw_cursor_bg_x >= w->x && gw_cursor_bg_y >= w->y &&
+            gw_cursor_bg_x + 16 <= w->x + w->w &&
+            gw_cursor_bg_y + 16 <= w->y + w->h);
+}
+
+/* ==================================================================
+ * 窗口表
+ * ================================================================== */
+static gw_window_t gw_windows[GW_MAX_WINDOWS];
+static gw_window_t *gw_focused_wnd = NULL;
+
+void gw_init(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        gw_windows[i].used = 0;
+    gw_focused_wnd = NULL;
+    /* 恢复上次选择的主题（而非每次回桌面都重置为 Win10 Blue） */
+    gw_cur_theme = &gw_themes[gw_theme_sel];
+    gw_accent = gw_cur_theme->accent;
+    gw_bg_rgb = gw_cur_theme->bg_rgb;
+    gw_update_accent_shades();
+    gfx_theme_accent(gw_accent);
+}
+
+static void gw_bring_front(gw_window_t *w)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used)
+            gw_windows[i].focused = 0;
+    }
+    w->focused = 1;
+    gw_focused_wnd = w;
+    /* 焦点切换=任何输入框失焦（浏览器地址栏的 wv_bar_focus 是 webview 内部
+     * 状态，不清则切走再切回后打字仍进地址栏——点页面区/Alt+Tab/任务栏
+     * 恢复均应失焦）。browser_click 点地址栏发生在 released 的 click 回调，
+     * 晚于 pressed 的 bring_front，置 1 仍生效。 */
+    wv_bar_set_focus(0);
+    /* 防御性置脏：z 序切换（focused 后画）需要整屏重绘。当前所有调用方
+     * 都另有 dirty 触发——点击路径靠主循环按键沿（gw_run 的
+     * btn_pressed/btn_released 分支）、Alt+Tab/任务栏/gw_restore 显式置位
+     * ——故此句目前是冗余保险；新增调用方若忘记置脏，置顶将不重绘，
+     * 现象"点了下层窗口没反应"（变异测试证实：删掉它各断言仍全绿）。 */
+    gw_dirty = 1;
+}
+
+static int gw_taskbar_h(void)
+{
+    if (GFX_H >= 768) return 32;
+    if (GFX_H >= 400) return 28;
+    return 18;
+}
+
+/* ---- 主题布局几何：GNOME 主题任务栏在顶部，Win10 主题在底部 ---- */
+static int gw_theme_gnome(void) { return gw_cur_theme->style == 1; }
+
+/* 任务栏所在 y 起点（顶栏=0，底栏=GFX_H-th） */
+static int gw_taskbar_y(void)
+{
+    return gw_theme_gnome() ? 0 : GFX_H - gw_taskbar_h();
+}
+
+/* 鼠标是否在任务栏区域内 */
+static int gw_in_taskbar(int my)
+{
+    return gw_theme_gnome() ? (my < gw_taskbar_h())
+                            : (my >= GFX_H - gw_taskbar_h());
+}
+
+/* 桌面可用区（图标/窗口的活动范围） */
+static int gw_scale_x(int v);   /* 前置声明（定义在下方） */
+static int gw_desktop_top(void)    { return gw_theme_gnome() ? gw_taskbar_h() : 0; }
+static int gw_desktop_bottom(void) { return gw_theme_gnome() ? GFX_H : GFX_H - gw_taskbar_h(); }
+/* 桌面左右边界：GNOME 主题有左侧 Ubuntu Dock，窗口/图标不得进入 */
+static int gw_dock_w(void)         { return gw_theme_gnome() ? gw_scale_x(52) : 0; }
+static int gw_desktop_left(void)   { return gw_dock_w(); }
+static int gw_desktop_right(void)  { return GFX_W; }
+
+/* 任务栏上开始按钮右边界（其左为 Activities/start 按钮） */
+static int gw_tb_btn_x0(void) { return gw_theme_gnome() ? 92 : 48; }
+
+static int gw_scale_x(int v) { return GFX_W * v / 640; }
+static int gw_scale_y(int v) { return GFX_H * v / 480; }
+
+/* 开始菜单几何：Win10 从底栏上弹，GNOME 从顶栏下拉（绘制与命中检测共用） */
+static void gw_menu_rect(int *mx0, int *my0, int *mw, int *mh)
+{
+    int th = gw_taskbar_h();
+    *mw = gw_scale_x(300);
+    *mh = gw_desktop_bottom() - gw_desktop_top() - gw_scale_y(8);
+    *mx0 = gw_scale_x(6) + gw_desktop_left();   /* GNOME：避开左侧 Dock */
+    *my0 = gw_theme_gnome() ? th + 2 : GFX_H - th - *mh - 2;
+}
+
+/* 开始菜单行高：默认 34px，行数多（应用+返回/重启/关机）放不下时自动压缩，
+ * 保证最后一项（关机）在 640x480 也可点；绘制与点击命中共用同一结果 */
+static int gw_menu_title_h(void)
+{
+    int h = gw_scale_y(50);
+    return user_managed() && h < 30 ? 30 : h;
+}
+
+static int gw_menu_list_top(void)
+{
+    return user_managed() ? gw_menu_title_h() + gw_scale_y(4) : gw_scale_y(54);
+}
+
+static int gw_menu_row_h(void)
+{
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
+    int row_h = gw_scale_y(34);
+    int list_y = gw_menu_list_top();
+    int need = GW_APP_COUNT + 3;
+    int min_h = gw_scale_y(22);
+    while (row_h > min_h &&
+           list_y + need * row_h > mh - gw_scale_y(60))
+        row_h--;
+    return row_h;
+}
+
+gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
+{
+    if (w < gw_scale_x(120)) w = gw_scale_x(120);
+    if (h < gw_scale_y(90)) h = gw_scale_y(90);
+    int max_h = gw_desktop_bottom() - 4;
+    if (y + h > max_h) y = max_h - h;
+    if (y < gw_desktop_top()) y = gw_desktop_top();
+    if (x + w > gw_desktop_right() - 4) x = gw_desktop_right() - w - 4;
+    if (x < gw_desktop_left()) x = gw_desktop_left();
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used) continue;
+        gw_window_t *wnd = &gw_windows[i];
+        wnd->used = 1;
+        wnd->x = x; wnd->y = y; wnd->w = w; wnd->h = h;
+        wnd->inner_w = w - 2;
+        wnd->inner_h = h - GW_TITLE_H - 1;
+        wnd->focused = 1;
+        wnd->hidden = 0;
+        wnd->flags = flags;
+        wnd->moving = 0;
+        wnd->minimized = 0;
+        wnd->maximized = 0;
+        wnd->app = -1;
+        wnd->save_x = x; wnd->save_y = y; wnd->save_w = w; wnd->save_h = h;
+        wnd->draw = NULL; wnd->key = NULL; wnd->click = NULL; wnd->mousedown = NULL;
+        wnd->user = NULL;
+        int n = 0;
+        if (title) {
+            while (title[n] && n < GW_TITLE_MAX - 1) { wnd->title[n] = title[n]; n++; }
+        }
+        wnd->title[n] = 0;
+        gw_bring_front(wnd);
+        return wnd;
+    }
+    return NULL;
+}
+
+void gw_close(gw_window_t *w)
+{
+    if (!w) return;
+    w->used = 0;
+    w->hidden = 0;
+    if (gw_focused_wnd == w) gw_focused_wnd = NULL;
+    gw_dirty = 1;   /* 关窗后原被盖区域（桌面/其他窗口）需整屏重绘 */
+}
+
+void gw_minimize(gw_window_t *w)
+{
+    if (!w) return;
+    w->hidden = 1;
+    w->minimized = 1;
+    if (gw_focused_wnd == w) {
+        gw_focused_wnd = NULL;
+        w->focused = 0;
+    }
+    gw_dirty = 1;   /* 最小化后窗口区域露出桌面，同上 */
+}
+
+void gw_restore(gw_window_t *w)
+{
+    if (!w) return;
+    w->hidden = 0;
+    w->minimized = 0;
+    gw_bring_front(w);
+}
+
+/* 最大化/还原切换：双击标题栏触发。
+ * 最大化 = 铺满桌面可用区（顶栏/底栏/Dock 之间的区域），还原 = 恢复保存的几何 */
+void gw_toggle_max(gw_window_t *w)
+{
+    if (!w) return;
+    if (!w->maximized) {
+        w->save_x = w->x; w->save_y = w->y;
+        w->save_w = w->w; w->save_h = w->h;
+        w->x = gw_desktop_left();
+        w->y = gw_desktop_top();
+        w->w = gw_desktop_right() - gw_desktop_left();
+        w->h = gw_desktop_bottom() - gw_desktop_top();
+        w->maximized = 1;
+    } else {
+        w->x = w->save_x; w->y = w->save_y;
+        w->w = w->save_w; w->h = w->save_h;
+        w->maximized = 0;
+    }
+    w->inner_w = w->w - 2;
+    w->inner_h = w->h - GW_TITLE_H - 1;
+    gw_bring_front(w);
+    gw_dirty = 1;
+}
+
+gw_window_t *gw_focused(void) { return gw_focused_wnd; }
+
+int gw_ox(gw_window_t *w) { return w->x + 1; }
+int gw_oy(gw_window_t *w) { return w->y + GW_TITLE_H + 1; }
+
+/* ==================================================================
+ * 窗口绘制
+ * ================================================================== */
+
+static void gw_draw_ghost(gw_window_t *w)
+{
+    int x = w->ghost_x, y = w->ghost_y, ww = w->w, hh = w->h;
+    for (int i = 0; i < ww; i += 4) {
+        if (x + i >= 0 && x + i < GFX_W) {
+            if (y >= 0 && y < GFX_H) gw_px(x + i, y, gw_accent_light);
+            if (y + hh - 1 >= 0 && y + hh - 1 < GFX_H) gw_px(x + i, y + hh - 1, gw_accent_light);
+        }
+    }
+    for (int i = 0; i < hh; i += 4) {
+        if (y + i >= 0 && y + i < GFX_H) {
+            if (x >= 0 && x < GFX_W) gw_px(x, y + i, gw_accent_light);
+            if (x + ww - 1 >= 0 && x + ww - 1 < GFX_W) gw_px(x + ww - 1, y + i, gw_accent_light);
+        }
+    }
+}
+
+/* 判断鼠标是否在窗口标题栏按钮上（0=无 1=最小化 2=关闭） */
+static int gw_title_btn_hit(gw_window_t *w, int mx, int my)
+{
+    int bx = w->x + w->w - 12;
+    if (my < w->y || my >= w->y + GW_TITLE_H) return 0;
+    if (mx >= bx && mx < bx + 11) return 2;
+    if (!(w->flags & GW_F_NO_MIN)) {
+        if (mx >= bx - 13 && mx < bx - 2) return 1;
+    }
+    return 0;
+}
+
+/* ---- 补派发事件时刻 ------------------------------------------------
+ * 按键沿补派发（gw_run 的 mouse_btn_ev_pop 循环）时，双击/连点的 400ms
+ * 判定必须按事件**真实发生时刻**算，不能按派发时刻——重绘 200-400ms 的
+ * 帧里两者能差出整个判定窗口。0 = 不在补派发，用当前 g_pit_ticks。 */
+static uint32_t gw_ev_tick = 0;
+static uint32_t gw_now(void) { return gw_ev_tick ? gw_ev_tick : g_pit_ticks; }
+
+/* ---- 标题栏按钮（关/最小）连点保护 ----------------------------------
+ * 标题栏按钮被点 -> 窗口立刻隐藏/销毁 -> 同一屏幕坐标变成"桌面空白"
+ * -> 第二次按下走桌面分支 -> 触发"恢复 slot 最小的隐藏窗"：
+ *   * 连点最小化钮 = 最小化后立刻被恢复（等于没最小化，2026-10-24
+ *     probe_combo2 C9 实测：第二次点完内核转储 hid=0/foc=0）
+ *   * 双击关闭钮   = 顺带把别的隐藏窗拽出来
+ * 这里记下按钮被点时的坐标与时刻，400ms（同内核双击判定窗口）内同位置
+ * 的下一次按下直接消费掉，不做任何恢复。
+ * 注意：任务栏按钮的"点一下最小化、再点一下恢复"是**正常**语义，不受
+ * 本保护影响（任务栏按钮不隐藏自己）。 */
+static int      gw_tbtn_cx = -1, gw_tbtn_cy = -1;
+static uint32_t gw_tbtn_ctick = 0;
+
+static void gw_tbtn_arm(int mx, int my)
+{
+    gw_tbtn_cx = mx;
+    gw_tbtn_cy = my;
+    gw_tbtn_ctick = gw_now();
+}
+
+/* 返回 1 = 本次按下应被吞掉（是标题栏按钮的连点第二次） */
+static int gw_tbtn_consume(int mx, int my)
+{
+    if (gw_tbtn_cx < 0) return 0;
+    if (gw_now() - gw_tbtn_ctick >= 400) { gw_tbtn_cx = -1; return 0; }
+    if (mx < gw_tbtn_cx - 8 || mx > gw_tbtn_cx + 8) return 0;
+    if (my < gw_tbtn_cy - 8 || my > gw_tbtn_cy + 8) return 0;
+    gw_tbtn_cx = -1;      /* 只消费一次 */
+    return 1;
+}
+
+static void gw_draw_window(gw_window_t *w)
+{
+    int x = w->x, y = w->y, ww = w->w, hh = w->h;
+
+    /* 阴影（右下 3px 半透明黑）——需读 LFB 原像素做 alpha 混合，
+     * 双缓冲路径（离屏）不能画，单独拆出 */
+    gw_fill_rgba(x + 3, y + hh - 2, ww, 3, 0x000000u, 80);
+    gw_fill_rgba(x + ww - 2, y + 3, 3, hh - 3, 0x000000u, 80);
+
+    gw_draw_window_body(w, 1);
+}
+
+/* 窗口主体：边框/标题栏/内容（with_content=0 时只画窗框和底色，
+ * 供游戏双缓冲路径先铺窗框再覆盖游戏画面） */
+static void gw_draw_window_body(gw_window_t *w, int with_content)
+{
+    int x = w->x, y = w->y, ww = w->w, hh = w->h;
+    int mx = mouse_get_x(), my = mouse_get_y();
+
+    /* 边框 */
+    gw_frame(x, y, ww, hh, CLR_BORDER);
+
+    /* 标题栏：活动 #0078D7 渐变，非活动灰渐变 */
+    if (w->focused)
+        gw_fill_vgrad(x + 1, y + 1, ww - 2, GW_TITLE_H, gw_accent, gw_accent_dark);
+    else
+        gw_fill_vgrad(x + 1, y + 1, ww - 2, GW_TITLE_H, 0x6E6E6Eu, 0x5A5A5Au);
+
+    /* 聚焦窗口顶部 1px 亮边 */
+    if (w->focused)
+        gw_fill(x + 1, y, ww - 2, 1, gw_accent_light);
+
+    /* 标题文字 */
+    uint8_t tbg = (w->focused) ? GW_C_BLUE_DARK : 0x08;
+    gfx_draw_text(x + 4, y + 2, w->title, 0x0F, tbg);
+
+    /* 标题栏按钮：关闭（右1） / 最小化（右2） */
+    int bx = x + ww - 13;
+    if (mx >= bx && mx < bx + 12 && my >= y && my < y + GW_TITLE_H) {
+        gw_fill(bx, y + 1, 11, GW_TITLE_H - 2, 0xE81123u);   /* 关闭 hover 红 */
+        gfx_draw_text(bx + 2, y + 2, "x", 0x0F, GW_C_CLOSE_RED);
+    } else {
+        gfx_draw_text(bx + 2, y + 2, "x", 0x0F, tbg);
+    }
+    if (!(w->flags & GW_F_NO_MIN)) {
+        bx -= 14;
+        int hov = (mx >= bx && mx < bx + 12 && my >= y && my < y + GW_TITLE_H);
+        if (hov) gw_fill(bx, y + 1, 11, GW_TITLE_H - 2, 0x6EA7D9u);
+        gw_fill(bx + 3, y + GW_TITLE_H / 2 - 1, 5, 1, hov ? 0x000000u : 0xFFFFFFu);
+        gw_fill(bx + 2, y + GW_TITLE_H / 2, 7, 1, hov ? 0x000000u : 0xFFFFFFu);
+        gw_fill(bx + 1, y + GW_TITLE_H / 2 + 1, 9, 1, hov ? 0x000000u : 0xFFFFFFu);
+    }
+
+    /* 内容区背景 */
+    gw_fill(x + 1, y + GW_TITLE_H + 1, ww - 2, hh - GW_TITLE_H - 1, gw_bg_rgb);
+
+    if (with_content && w->draw && !w->hidden) {
+        /* 内容区统一裁剪：长文件名/深路径的绘制不再刷穿到别的窗口 */
+        gfx_set_clip(x + 1, y + GW_TITLE_H + 1, ww - 2, hh - GW_TITLE_H - 1);
+        w->draw(w);
+        gfx_set_clip(-1, -1, 0, 0);
+    }
+}
+
+/* ==================================================================
+ * 桌面层：墙纸 / 桌面图标 / 任务栏 / 开始菜单
+ * ================================================================== */
+
+static int gw_start_menu_active = 0;
+int gw_start_menu_open(void) { return gw_start_menu_active; }
+
+/* [DEBUG] 点击丢失定案计数器（探针按它判红）
+ *   ep= 补派发弹出的按键沿事件数（应与驱动变迁数 tr 对得上）
+ *   tg= 开始菜单翻转次数（桌面层开始按钮分支）
+ *   t2= 开始菜单翻转次数（窗口层任务栏分支）
+ *   dp= 帧级电平派发次数
+ * 对不上就说明"沿进来了但没落到翻转上"（去重/坐标/双触发问题）。 */
+static unsigned long gw_evt_popped = 0;
+static unsigned long gw_start_toggle = 0;
+static unsigned long gw_start_toggle2 = 0;
+static unsigned long gw_dispatch_cnt = 0;
+
+/* 每帧绘制标记（前置定义，供 gw_draw_taskbar/gw_dirty_from_mouse/gw_handle_mouse 等使用） */
+static int gw_dirty = 1;
+static int gw_taskbar_dirty = 0;   /* 任务栏局部重绘请求（时钟分钟变化/交互时用） */
+
+/* 桌面图标：5 个系统应用 + 7 个游戏 + 浏览器（追加末尾，既有索引不变） */
+#define GW_DESK_ICONS 13
+static const char *gw_desktop_icon_names[GW_DESK_ICONS] = {
+    "This PC", "Recycle Bin", "Notepad", "Terminal", "Paint",
+    "Guess", "TicTac", "Snake", "2048", "Mines", "RPS", "Memory", "Browser"
+};
+/* app>=0 启动应用；app==-1 启动 games 游戏（编号取 game 列） */
+static int gw_desktop_icon_app[GW_DESK_ICONS] = { 0, 0, 1, 6, 7, -1, -1, -1, -1, -1, -1, -1, 8 };
+static int gw_desktop_icon_game[GW_DESK_ICONS] = { 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 0 };
+static uint32_t gw_desktop_icon_col[GW_DESK_ICONS] = {
+    0x0078D7u, 0x8A9BA8u, 0xF5B800u, 0x00CC44u, 0xE95420u,
+    0xFF6A00u, 0x9C27B0u, 0x4CAF50u, 0xFF9800u, 0x607D8Bu, 0xE91E63u, 0x3F51B5u, 0x00A2E8u
+};
+
+/* 正方形图标框：box = 图标 + 名称区，4 列网格，随 GFX_W/GFX_H 缩放 */
+static int gw_desktop_icon_rect(int idx, int *ix, int *iy, int *iw, int *ih)
+{
+    int icon_sz = gw_scale_x(40);                        /* 320:20, 640:40 */
+    int box = icon_sz + 26;                              /* 正方形（图标 40 + 名称区 26） */
+    int gap = gw_scale_x(8);
+    int cols = 4;
+    int x0 = gw_scale_x(8) + gw_desktop_left();          /* GNOME：避开左侧 Dock */
+    int y0 = gw_desktop_top() + gw_scale_y(10);          /* GNOME 顶栏下移，避开顶部栏 */
+    int row = idx / cols, col = idx % cols;
+    *ix = x0 + col * (box + gap);
+    *iy = y0 + row * (box + gap);
+    *iw = box; *ih = box;
+    if (*iy + box > gw_desktop_bottom()) return 0;
+    return 1;
+}
+
+/* ---- Ubuntu Dock（GNOME 主题左侧竖排应用栏） ---- */
+static uint32_t gw_dock_col[GW_APP_COUNT] = {
+    0x0078D7u, 0xF5B800u, 0x607D8Bu, 0xE91E63u, 0x4CAF50u, 0x9C27B0u, 0x00CC44u, 0xFF6A00u,
+    0x00A2E8u
+};
+/* Dock 第 idx 个应用图标矩形（640x480 基准：52 宽栏内 36 图标，间距 48；
+ * 小分辨率自动压缩间距/图标，保证 8 个图标放得下） */
+static int gw_dock_icon_rect(int idx, int *ix, int *iy, int *isz)
+{
+    if (idx < 0 || idx >= GW_APP_COUNT) return 0;
+    int w = gw_dock_w();
+    int avail = gw_desktop_bottom() - gw_desktop_top() - gw_scale_y(12) - 4;
+    int sp = gw_scale_y(48);
+    if (sp < 20) sp = 20;
+    if (sp * GW_APP_COUNT > avail) sp = avail / GW_APP_COUNT;
+    int sz = gw_scale_x(36);
+    if (sz > sp - 6) sz = sp - 6;
+    if (sz < 8) sz = 8;
+    *isz = sz;
+    *ix = (w - sz) / 2;
+    *iy = gw_desktop_top() + gw_scale_y(12) + idx * sp + (sp - sz) / 4;
+    if (*iy + sz > gw_desktop_bottom() - 2) return 0;
+    return 1;
+}
+static int gw_dock_running(int app)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)app)
+            return 1;
+    return 0;
+}
+static void gw_draw_dock(void)
+{
+    int w = gw_dock_w();
+    if (w <= 0) return;
+    int mx = mouse_get_x(), my = mouse_get_y();
+    /* 栏体：深色半透明 + 右缘阴影线 */
+    gw_fill_rgba(0, gw_desktop_top(), w, GFX_H - gw_desktop_top(), 0x1D1D1Du, 235);
+    gw_fill(w - 1, gw_desktop_top(), 1, GFX_H - gw_desktop_top(), 0x0A0A0Au);
+    for (int i = 0; i < GW_APP_COUNT; i++) {
+        if (!gw_app_allowed(i)) continue;
+        int ix, iy, sz;
+        if (!gw_dock_icon_rect(i, &ix, &iy, &sz)) break;
+        int hov = (mx >= ix && mx < ix + sz && my >= iy && my < iy + sz);
+        if (hov) gw_fill_rgba(ix - 2, iy - 2, sz + 4, sz + 4, 0xFFFFFFu, 30);
+        gw_fill(ix, iy, sz, sz, gw_dock_col[i]);
+        gw_frame(ix, iy, sz, sz, 0x333333u);
+        char ch[2] = { gw_app_names[i][0], 0 };
+        int ts = (sz >= 28) ? 2 : 1;                     /* 小分辨率退回 1x 字 */
+        gfx_draw_text_scaled(ix + (sz - 8 * ts) / 2, iy + (sz - 8 * ts) / 2, ch, 0x0F, -1, ts);
+        if (gw_dock_running(i))                          /* 运行指示：图标下方橙色圆点 */
+            gw_fill(ix + sz / 2 - 2, iy + sz + 2, 4, 4, 0xE95420u);
+    }
+}
+
+/* 名称按空格拆最多两行（1x 字体每行最多 10 字符，正方形框内可容纳） */
+static void gw_icon_name_lines(const char *name, char *l1, char *l2)
+{
+    int i = 0, j = 0;
+    while (name[i] && name[i] != ' ' && i < 10) { l1[i] = name[i]; i++; }
+    l1[i] = 0;
+    if (name[i] == ' ') {
+        i++;
+        while (name[i] && j < 10) { l2[j] = name[i]; j++; i++; }
+    }
+    l2[j] = 0;
+}
+
+static void gw_draw_desktop_icon(int idx, int mx, int my)
+{
+    if (user_confined() && !gw_app_allowed(gw_desktop_icon_app[idx])) return;
+    int ix, iy, iw, ih;
+    if (!gw_desktop_icon_rect(idx, &ix, &iy, &iw, &ih)) return;
+    gw_dmg_add(ix, iy, iw, ih);       /* hover 高亮局部重绘：登记图标矩形 */
+    int hover = (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih);
+    if (hover)
+        gw_fill_rgba(ix, iy, iw, ih, 0xFFFFFFu, 60);
+    int sz = gw_scale_x(40);
+    int cx = ix + (iw - sz) / 2;
+    /* 图标：正方形色块 + 首字母 2x 白色大字（居中，透明背景避免色块底色杂边） */
+    gw_fill(cx, iy + 2, sz, sz, gw_desktop_icon_col[idx]);
+    gw_frame(cx, iy + 2, sz, sz, 0x333333u);
+    char ch[2] = { gw_desktop_icon_names[idx][0], 0 };
+    gfx_draw_text_scaled(cx + (sz - 16) / 2, iy + 2 + (sz - 16) / 2, ch, 0x0F, -1, 2);
+
+    /* 名称：1x 两行、深色背景条 + 白字高对比 */
+    char l1[16], l2[16];
+    gw_icon_name_lines(gw_desktop_icon_names[idx], l1, l2);
+    int w1 = gw_strlen(l1), w2 = gw_strlen(l2);
+    uint32_t bgc = hover ? gw_accent_dark : 0x202020u;
+    int ny = iy + sz + 4;                               /* 名称区起点（图标下方） */
+    int lines = w2 ? 2 : 1;
+    gw_fill(ix + 1, ny - 1, iw - 2, (lines == 2 ? 17 : 8) + 1, bgc);
+    gfx_draw_text(ix + (iw - w1 * 8) / 2, ny, l1, 0x0F, -1);
+    if (w2)
+        gfx_draw_text(ix + (iw - w2 * 8) / 2, ny + 9, l2, 0x0F, -1);
+}
+
+/* 整数平方根（牛顿法，freestanding 无 libm） */
+static long gw_isqrt(long v)
+{
+    if (v <= 0) return 0;
+    long x = v, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + v / x) / 2; }
+    return x;
+}
+
+void gw_draw_desktop(void)
+{
+    int mx = mouse_get_x(), my = mouse_get_y();
+
+    gw_dmg_add(0, 0, GFX_W, GFX_H);   /* 壁纸不透明铺满全屏：损伤=全屏 */
+    if (gw_theme_gnome()) {
+        /* Ubuntu 壁纸：aubergine 紫渐变 + 右下角橙色圆环（Ubuntu logo 风） */
+        gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x2C001Eu, 0x5E2750u);
+        int cx = GFX_W, cy = GFX_H;
+        long r1 = (long)GFX_W * 5 / 8;            /* 橙环外半径 */
+        long r2 = r1 - gw_scale_x(44);            /* 橙环内半径 */
+        long r12 = r1 * r1, r22 = r2 * r2;
+        for (int y = cy - (int)r1; y < cy; y++) { /* 圆心在右下角，只画屏内四分之一 */
+            if (y < 0) continue;
+            long dy = (long)(cy - y);
+            long rem1 = r12 - dy * dy;
+            if (rem1 <= 0) continue;
+            int hw1 = (int)gw_isqrt(rem1);        /* 橙盘行内半宽 */
+            int x0 = (int)cx - hw1;
+            if (x0 < 0) x0 = 0;
+            gw_fill(x0, y, (int)cx - x0, 1, 0xE95420u);
+            /* 内圆挖回壁纸渐变色（该行 vgrad 插值色） */
+            long rem2 = r22 - dy * dy;
+            if (rem2 > 0) {
+                int hw2 = (int)gw_isqrt(rem2);
+                int xi0 = (int)cx - hw2;
+                if (xi0 < 0) xi0 = 0;
+                if ((int)cx - xi0 > 0) {
+                    /* 行色 = lerp(top, bottom, y/(GFX_H-1))，与 vgrad 一致 */
+                    int a = y * 255 / (GFX_H - 1), ia = 255 - a;
+                    int tr = 0x2C, tg = 0x00, tb = 0x1E;
+                    int br = 0x5E, bg = 0x27, bb = 0x50;
+                    uint32_t c = (uint32_t)(((tr * ia + br * a) / 255) << 16)
+                               | (uint32_t)(((tg * ia + bg * a) / 255) << 8)
+                               | (uint32_t)(((tb * ia + bb * a) / 255));
+                    gw_fill(xi0, y, (int)cx - xi0, 1, c);
+                }
+            }
+        }
+    } else {
+        /* Win10 默认深蓝渐变壁纸 */
+        gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x0C7BD5u, 0x063B66u);
+    }
+    /* 右下角水印 */
+    gfx_draw_text(GFX_W - gw_scale_x(60), gw_desktop_bottom() - 12, "Cerulia", 0x0F, 0x0B);
+    /* Ubuntu Dock（GNOME 主题） */
+    gw_draw_dock();
+    /* 桌面图标 */
+    for (int i = 0; i < GW_DESK_ICONS; i++)
+        gw_draw_desktop_icon(i, mx, my);
+}
+
+/* 任务栏窗口按钮矩形：按绘制顺序返回第 btn_idx 个按钮的窗口与 x 宽度。
+ * 覆盖所有已用窗口（含最小化）；与 gw_draw_taskbar 绘制顺序一致，
+ * 供绘制与点击命中检测共用。返回 0 = 无此按钮 */
+static int gw_taskbar_btn_rect(int btn_idx, gw_window_t **pw, int *bx_out, int *tw_out)
+{
+    int bx = gw_tb_btn_x0();
+    /* GNOME 顶栏时钟居中：按钮区不得越过中央时钟左侧 */
+    int bx_max = gw_theme_gnome() ? GFX_W / 2 - gw_scale_x(60) : GFX_W - 90;
+    int n = 0;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used) continue;
+        int tw = 8 + gw_strlen(w->title) * 8 + 8;
+        if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
+        if (bx + tw > bx_max) break;
+        if (n == btn_idx) {
+            *pw = w; *bx_out = bx; *tw_out = tw;
+            return 1;
+        }
+        bx += tw + 4;
+        n++;
+    }
+    return 0;
+}
+
+/* 任务栏 / GNOME 顶栏 */
+void gw_draw_taskbar(void)
+{
+    int th = gw_taskbar_h();
+    int ty = gw_taskbar_y();
+    int mx = mouse_get_x(), my = mouse_get_y();
+
+    gw_dmg_add(0, ty, GFX_W, th);     /* 整条任务栏重绘：登记任务栏矩形 */
+    if (gw_theme_gnome()) {
+        /* GNOME 顶栏：纯黑底 + 底边阴影线 */
+        gw_fill(0, ty, GFX_W, th, 0x000000u);
+        gw_fill(0, ty + th - 1, GFX_W, 1, 0x0A0A0Au);
+    } else {
+        /* Win10 底部任务栏：深色半透明底 */
+        gw_fill_rgba(0, ty, GFX_W, th, CLR_TASKBAR, 235);
+        gw_fill(0, ty, GFX_W, 1, 0x3A3A3Au);
+    }
+
+    /* 开始按钮：Win10 "start" / GNOME "Activities" */
+    int bw = gw_tb_btn_x0() - 8;
+    int in_tb = gw_in_taskbar(my);
+    if (mx >= 4 && mx < 4 + bw && in_tb) {
+        if (gw_theme_gnome()) {
+            gw_fill_rgba(4, ty + 1, bw, th - 2, gw_start_menu_active ? 0xE95420u : 0xFFFFFFu,
+                         gw_start_menu_active ? 110 : 26);
+        } else {
+            gw_fill_rgba(4, ty + 1, bw, th - 2, 0xFFFFFFu, 26);
+            if (gw_start_menu_active) gw_fill_rgba(4, ty + 1, bw, th - 2, 0xFFFFFFu, 40);
+        }
+    }
+    gfx_draw_text(6, ty + (th - 8) / 2, gw_theme_gnome() ? "Activities" : "start",
+                  0x0F, GW_C_TASKBAR);
+
+    /* 任务按钮：所有窗口（最小化的暗显，可点击恢复） */
+    for (int btn = 0; ; btn++) {
+        gw_window_t *w;
+        int bx, tw;
+        if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+        int hov = (mx >= bx && mx < bx + tw && in_tb);
+        if (w->focused && !w->hidden) {
+            gw_fill(bx, ty + 1, tw, th - 2, 0x2A2A2Au);
+            /* 聚焦窗口：底边主题强调色指示条 */
+            gw_fill(bx, ty + th - 3, tw, 3, gw_accent);
+        } else if (w->hidden) {
+            gw_fill_rgba(bx, ty + 1, tw, th - 2, 0x000000u, 110);   /* 最小化：暗显 */
+        } else if (hov) {
+            gw_fill_rgba(bx, ty + 1, tw, th - 2, 0xFFFFFFu, 28);
+        }
+        gfx_draw_text(bx + 8, ty + (th - 8) / 2, w->title,
+                      w->hidden ? 0x08 : 0x0F,
+                      w->focused ? 0x08 : GW_C_TASKBAR);
+    }
+
+    /* 时钟 HH:MM + 小通知图标（GNOME 居中，Win10 靠右） */
+    /* 走统一的 RTC（kernel/rtc.c）：桌面时钟与文件时间戳必须是同一个
+     * 时间源，否则会出现"屏幕显示 2026-10-10、文件却是 2026-01-01"。 */
+    rtc_time_t rt;
+    uint8_t hour, minute;
+    if (rtc_now(&rt) == 0) {
+        hour = rt.hour; minute = rt.minute;
+    } else {
+        hour = 0; minute = 0;
+    }
+    char tbuf[8];
+    tbuf[0] = '0' + hour / 10; tbuf[1] = '0' + hour % 10;
+    tbuf[2] = ':';
+    tbuf[3] = '0' + minute / 10; tbuf[4] = '0' + minute % 10;
+    tbuf[5] = 0;
+    int tx = gw_theme_gnome() ? (GFX_W - 5 * 8) / 2 : GFX_W - 52;
+    if (!gw_theme_gnome()) {
+        /* 通知区小图标（仅 Win10 底栏） */
+        gw_fill(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x2A2A2Au);
+        gw_frame(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x555555u);
+        gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 3, 4, 2, 0xAAAAAAu);
+        gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 7, 4, 2, 0xAAAAAAu);
+    } else {
+        /* GNOME 右侧状态区：电量小块 */
+        gw_frame(GFX_W - 28, ty + (th - 10) / 2, 16, 10, 0x9A9A9Au);
+        gw_fill(GFX_W - 27, ty + (th - 10) / 2 + 1, 10, 8, 0x57C871u);
+        gw_fill(GFX_W - 12, ty + (th - 10) / 2 + 3, 2, 4, 0x9A9A9Au);
+    }
+    gfx_draw_text(tx, ty + (th - 8) / 2, tbuf, 0x0F, GW_C_TASKBAR);
+}
+
+/* ==================================================================
+ * 开始菜单
+ * ================================================================== */
+/* 开始菜单 */
+static int gw_menu_hover = -1;
+
+/* Both theme layouts and a 320x200 screen share these two hit rectangles. */
+static void gw_menu_session_button(int mx0, int my0, int action, int *x, int *y, int *w, int *h)
+{
+    *x = mx0 + (action == GW_SESSION_LOCK ? 6 : 54);
+    *y = my0 + gw_menu_title_h() - 17;
+    *w = action == GW_SESSION_LOCK ? 43 : 94;
+    *h = 15;
+}
+
+void gw_draw_start_menu(void)
+{
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
+    int mx = mouse_get_x(), my = mouse_get_y();
+
+    gw_dmg_add(mx0, my0, mw, mh);    /* 菜单整体重绘：登记菜单矩形 */
+    /* 菜单底（深色半透明）+ 阴影 */
+    gw_fill_rgba(mx0, my0, mw, mh, 0x1B1B1Bu, 245);
+    gw_fill_rgba(mx0 + 3, my0 + mh - 2, mw, 3, 0x000000u, 90);
+    gw_fill_rgba(mx0 + mw - 2, my0 + 3, 3, mh - 3, 0x000000u, 90);
+
+    /* 顶部用户区（GNOME：Ubuntu 橙→紫渐变；Win10：蓝渐变） */
+    if (gw_theme_gnome())
+        gw_fill_vgrad(mx0, my0, mw, gw_menu_title_h(), 0xE95420u, 0x77216Fu);
+    else
+        gw_fill_vgrad(mx0, my0, mw, gw_menu_title_h(), 0x0C7BD5u, 0x063B66u);
+    if (user_managed()) {
+        gfx_draw_text_scaled(mx0 + 7, my0 + 3, user_current_name(), 0x0F, -1, 1);
+        for (int action = GW_SESSION_LOCK; action <= GW_SESSION_SWITCH; action++) {
+            int x, y, w, h;
+            gw_menu_session_button(mx0, my0, action, &x, &y, &w, &h);
+            int over = mx >= x && mx < x + w && my >= y && my < y + h;
+            gw_fill(x, y, w, h, over ? 0x376DA3u : 0x202E41u);
+            gfx_draw_text_scaled(x + 3, y + 4, action == GW_SESSION_LOCK ? "Lock" : "Switch User",
+                                 0x0F, -1, 1);
+        }
+    } else {
+        gw_fill(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x3C3C3Cu);
+        gw_frame(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x555555u);
+        gfx_draw_text(mx0 + 40, my0 + gw_scale_y(15), "Cerulia User", 0x0F, 0x0B);
+    }
+
+    /* 应用列表 */
+    int row_h = gw_menu_row_h();   /* 与点击命中共用，小屏自动压缩 */
+    int list_y = my0 + gw_menu_list_top();
+    int lw = mw - gw_scale_x(64);
+    uint32_t hov_rgb = gw_theme_gnome() ? 0xE95420u : 0xFFFFFFu;   /* hover 高亮色 */
+    gw_menu_hover = -1;
+    for (int i = 0; i < GW_APP_COUNT; i++) {
+        if (!gw_app_allowed(i)) continue;
+        int ry = list_y + i * row_h;
+        if (ry + row_h > my0 + mh - gw_scale_y(60)) break;
+        int hov = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry && my < ry + row_h);
+        if (hov) {
+            gw_fill_rgba(mx0 + 2, ry, lw - 4, row_h, hov_rgb, 30);
+            gw_menu_hover = i;
+        }
+        /* 应用图标：彩色方块 + 首字母 */
+        uint32_t icc = 0x0078D7u;
+        if (i == 0) { icc = 0x8A9BA8u; }
+        else if (i == 1) { icc = 0xF5B800u; }
+        else if (i == 2) { icc = 0x0078D7u; }
+        else if (i == 3) { icc = 0x1E8E3Eu; }
+        else if (i == 4) { icc = 0x767676u; }
+        else if (i == 5) { icc = 0x00CC44u; }
+        else if (i == 6) { icc = 0x2A2A2Au; }
+        else if (i == 7) { icc = 0xE95420u; }
+        gw_fill(mx0 + 8, ry + (row_h - 18) / 2, 18, 18, icc);
+        gw_fill(mx0 + 11, ry + (row_h - 18) / 2 + 4, 12, 10, 0xFFFFFFu);
+        gfx_draw_text(mx0 + 33, ry + (row_h - 8) / 2, gw_app_names[i], 0x0F, hov ? 0x08 : GW_C_TASKBAR);
+        if (i < 5)
+            gw_fill(mx0 + 8, ry + row_h - 1, lw - 16, 1, 0x2A2A2Au);
+    }
+
+    /* 底部：返回终端（点击退出 GUI 回内核 shell） */
+    int ry7 = list_y + GW_APP_COUNT * row_h;
+    if (ry7 + row_h <= my0 + mh - gw_scale_y(60)) {
+        int hov7 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry7 && my < ry7 + row_h);
+        if (hov7) {
+            gw_fill_rgba(mx0 + 2, ry7, lw - 4, row_h, hov_rgb, 30);
+            gw_menu_hover = 6;
+        }
+        gw_fill(mx0 + 8, ry7 + (row_h - 18) / 2, 18, 18, 0x444444u);
+        gfx_draw_text(mx0 + 33, ry7 + (row_h - 8) / 2, "Back to Terminal", 0x0F, hov7 ? 0x08 : GW_C_TASKBAR);
+        gw_fill(mx0 + 8, ry7 + row_h - 1, lw - 16, 1, 0x2A2A2Au);
+    }
+
+    /* 重启项 */
+    int ry8 = ry7 + row_h;
+    if (ry8 + row_h <= my0 + mh - gw_scale_y(60)) {
+        int hov8 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry8 && my < ry8 + row_h);
+        if (hov8) {
+            gw_fill_rgba(mx0 + 2, ry8, lw - 4, row_h, hov_rgb, 30);
+            gw_menu_hover = 8;
+        }
+        gw_fill(mx0 + 8, ry8 + (row_h - 18) / 2, 18, 18, 0xFFB900u);
+        gfx_draw_text(mx0 + 33, ry8 + (row_h - 8) / 2, "Restart", 0x0F, hov8 ? 0x08 : GW_C_TASKBAR);
+        gw_fill(mx0 + 8, ry8 + row_h - 1, lw - 16, 1, 0x2A2A2Au);
+    }
+
+    /* 关机项 */
+    int ry9 = ry8 + row_h;
+    if (ry9 + row_h <= my0 + mh - gw_scale_y(60)) {
+        int hov9 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry9 && my < ry9 + row_h);
+        if (hov9) {
+            gw_fill_rgba(mx0 + 2, ry9, lw - 4, row_h, hov_rgb, 30);
+            gw_menu_hover = 9;
+        }
+        gw_fill(mx0 + 8, ry9 + (row_h - 18) / 2, 18, 18, 0xE81123u);
+        gfx_draw_text(mx0 + 33, ry9 + (row_h - 8) / 2, "Shut Down", 0x0F, hov9 ? 0x08 : GW_C_TASKBAR);
+        gw_fill(mx0 + 8, ry9 + row_h - 1, lw - 16, 1, 0x2A2A2Au);
+    }
+
+    /* 右侧竖列：设置 / 电源（关机）/ 重启 */
+    int sx = mx0 + lw + gw_scale_x(4);
+    int sw = mw - lw - gw_scale_x(8);
+    int sy0 = my0 + gw_menu_list_top();
+    int sh = gw_scale_y(34);
+    for (int i = 0; i < 3; i++) {
+        if (i == 0 && !gw_app_allowed(GW_APP_SETTINGS)) continue;
+        int ry = sy0 + i * sh;
+        if (ry + sh > my0 + mh - gw_scale_y(60)) break;   /* 与鼠标处理一致：仅绘制可视行 */
+        int hov = (mx >= sx && mx < sx + sw && my >= ry && my < ry + sh);
+        if (hov) gw_fill_rgba(sx, ry, sw, sh, hov_rgb, 30);
+        if (i == 0) {
+            gw_draw_circle(sx + sw / 2, ry + sh / 2, 6, 0xCCCCCCu);
+            gw_fill(sx + sw / 2 - 2, ry + sh / 2 - 2, 4, 4, 0x1B1B1Bu);
+        } else if (i == 1) {
+            gw_draw_circle(sx + sw / 2, ry + sh / 2, 6, 0xE81123u);
+            gw_fill(sx + sw / 2 - 2, ry + sh / 2 - 2, 4, 4, 0x1B1B1Bu);
+        } else {
+            gw_draw_circle(sx + sw / 2, ry + sh / 2, 6, 0xFFB900u);
+            gw_fill(sx + sw / 2 - 2, ry + sh / 2 - 2, 4, 4, 0x1B1B1Bu);
+        }
+    }
+    gfx_draw_text(sx + (sw - 7 * 8) / 2, sy0 + sh + 4, "Settings", GW_C_GRAY_TITLE, GW_C_TASKBAR);
+    gfx_draw_text(sx + (sw - 5 * 8) / 2, sy0 + sh * 2 + 4, "Power", GW_C_GRAY_TITLE, GW_C_TASKBAR);
+    gfx_draw_text(sx + (sw - 7 * 8) / 2, sy0 + sh * 3 + 4, "Restart", GW_C_GRAY_TITLE, GW_C_TASKBAR);
+}
+
+/* 鼠标移动触发的局部重绘（避免鼠标每移动 1px 就全屏重绘造成的可见绘制中间态，闪烁根因之一）：
+ * - 开始菜单打开 → 重绘菜单（hover 行高亮跟随鼠标）
+ * - 任务栏 hover → 重绘任务栏；刚离开任务栏 → 再重绘一次清除 hover 高亮
+ * - 桌面图标 hover 进出 → 局部重画图标（被窗口覆盖的图标不参与 hover）
+ * 其余情况画面保持不动（gw_dirty 置 0，鼠标仅靠光标背景缓存局部移动） */
+static int gw_last_icon_hover = -1;
+static int gw_last_in_taskbar = 0;
+
+static int gw_icon_covered(int ix, int iy, int iw, int ih)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used || w->hidden) continue;
+        if (ix < w->x + w->w && ix + iw > w->x && iy < w->y + w->h && iy + ih > w->y)
+            return 1;
+    }
+    return 0;
+}
+
+static void gw_dirty_from_mouse(int mx, int my, int th)
+{
+    (void)th;    /* 预留：拖拽阈值。当前由 task_lock 的临界区间接防抖 */
+    if (gw_start_menu_active) {
+        gw_draw_start_menu();
+        if (gw_in_taskbar(my)) gw_taskbar_dirty = 1;
+        return;
+    }
+    if (gw_in_taskbar(my)) {
+        gw_last_in_taskbar = 1;
+        gw_taskbar_dirty = 1;
+        return;
+    }
+    if (gw_last_in_taskbar) {
+        gw_last_in_taskbar = 0;
+        gw_taskbar_dirty = 1;   /* 刚离开任务栏：清除 hover 高亮 */
+        return;
+    }
+    int cur = -1;
+    for (int i = 0; i < GW_DESK_ICONS; i++) {
+        int ix, iy, iw, ih;
+        if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
+        if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
+            if (!gw_icon_covered(ix, iy, iw, ih)) { cur = i; break; }
+        }
+    }
+    if (cur != gw_last_icon_hover) {
+        if (gw_last_icon_hover >= 0) {
+            int ix, iy, iw, ih;
+            if (gw_desktop_icon_rect(gw_last_icon_hover, &ix, &iy, &iw, &ih) &&
+                gw_icon_covered(ix, iy, iw, ih)) {
+                gw_last_icon_hover = cur;
+                gw_dirty = 1;   /* 旧图标已被窗口覆盖：全屏重绘最稳妥 */
+                return;
+            }
+            gw_draw_desktop_icon(gw_last_icon_hover, mx, my);
+        }
+        if (cur >= 0)
+            gw_draw_desktop_icon(cur, mx, my);
+        gw_last_icon_hover = cur;
+    }
+    gw_dirty = 0;   /* 无 hover 变化，保持画面不动 */
+}
+
+/* 应用回调前置声明 */
+static void files_draw(gw_window_t *w);
+static void files_click(gw_window_t *w, int lx, int ly);
+static void files_mousedown(gw_window_t *w, int lx, int ly);
+static void files_key(gw_window_t *w, int key);
+static void notepad_draw(gw_window_t *w);
+static void notepad_key(gw_window_t *w, int key);
+static void notepad_click(gw_window_t *w, int lx, int ly);
+static void sysinfo_draw(gw_window_t *w);
+static void clock_draw(gw_window_t *w);
+static void settings_draw(gw_window_t *w);
+static void settings_click(gw_window_t *w, int lx, int ly);
+static void about_draw(gw_window_t *w);
+
+/* ==================================================================
+ * 应用：文件管理器（exFAT）
+ * ================================================================== */
+static fs_dir_entry_t fm_entries[40];
+static int fm_count = 0;
+static int fm_scroll = 0;
+static int fm_sel = 0;
+static int fm_mode = 0;          /* 0=目录浏览 1=文件查看 */
+static char fm_file_name[64];
+static uint8_t fm_file_buf[2048];
+static int fm_file_len = 0;
+static int fm_file_scroll = 0;
+
+static void fm_refresh(void)
+{
+    fm_count = fs_read_dir(fm_entries, 40);
+    if (fm_count < 0) fm_count = 0;
+    if (fm_scroll >= fm_count) fm_scroll = 0;
+    if (fm_sel >= fm_count) fm_sel = 0;
+}
+
+static void fm_enter(int idx)
+{
+    if (idx < 0 || idx >= fm_count) return;
+    fs_dir_entry_t *e = &fm_entries[idx];
+    if (gw_strlen(e->name) == 2 && e->name[0] == '.' && e->name[1] == '.') {
+        fs_change_dir("..");
+        fm_refresh();
+        fm_scroll = 0; fm_sel = 0;
+        return;
+    }
+    if (e->is_dir) {
+        if (fs_change_dir(e->name) == 0) {
+            fm_refresh();
+            fm_scroll = 0; fm_sel = 0;
+        }
+        return;
+    }
+    /* 文件：读取内容进查看模式 */
+    uint32_t sz = fs_get_file_size(e->name);
+    if (sz > 2047) sz = 2047;
+    int ok = fs_read_file(e->name, fm_file_buf, sz);
+    if (ok >= 0) {
+        fm_file_len = ok;
+        fm_file_scroll = 0;
+        fm_mode = 1;
+        int n = 0;
+        while (e->name[n] && n < 63) { fm_file_name[n] = e->name[n]; n++; }
+        fm_file_name[n] = 0;
+    }
+}
+
+static void fm_back(void)
+{
+    if (fm_mode) {
+        fm_mode = 0;
+        fm_file_len = 0;
+    } else {
+        fs_change_dir("..");
+        fm_refresh();
+    }
+}
+
+static void files_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+    int mx = mouse_get_x(), my = mouse_get_y();
+
+    if (fm_mode == 0) {
+        /* 地址栏 */
+        gw_fill(ox, oy, iw, 16, 0x0078D7u);
+        gfx_draw_text(ox + 3, oy + 4, fs_cwd_path(), 0x0F, GW_C_BLUE);
+        int row_h = 16;
+        int vis = (ih - 18) / row_h;
+        if (vis < 1) vis = 1;
+        int max_scroll = fm_count - vis;
+        if (max_scroll < 0) max_scroll = 0;
+        for (int r = 0; r < vis; r++) {
+            int idx = fm_scroll + r;
+            /* idx<0 防线：空白处点击后 fm_sel=-1，按 ↑ 会把 fm_scroll 拉成 -1，
+             * 直接索引 fm_entries[-1] 越界读崩溃 */
+            if (idx < 0) continue;
+            if (idx >= fm_count) break;
+            int ry = oy + 18 + r * row_h;
+            fs_dir_entry_t *e = &fm_entries[idx];
+            int hover = (mx >= ox && mx < ox + iw && my >= ry && my < ry + row_h);
+            if (idx == fm_sel) {
+                gw_fill(ox, ry, iw, row_h, CLR_BLUE_SEL);
+                gfx_draw_text(ox + 3, ry + 4, e->name, 0x00, 0x0E);
+            } else if (hover) {
+                gw_fill(ox, ry, iw, row_h, CLR_ROW_HOVER);
+                gfx_draw_text(ox + 3, ry + 4, e->name, 0x00, 0x0E);
+            } else {
+                gfx_draw_text(ox + 3, ry + 4, e->name, 0x00, 0x0F);
+            }
+            /* 类型/大小 */
+            char lb[24];
+            int n = 0;
+            if (e->is_dir) {
+                const char *d = "<DIR>";
+                for (int k = 0; d[k]; k++) lb[n++] = d[k];
+            } else {
+                uint32_t s = e->size;
+                char tmp[12];
+                int m = 0;
+                if (s == 0) tmp[m++] = '0';
+                while (s) { tmp[m++] = (char)('0' + s % 10); s /= 10; }
+                while (m) lb[n++] = tmp[--m];
+                lb[n++] = ' '; lb[n++] = 'B';
+            }
+            lb[n] = 0;
+            gfx_draw_text(ox + iw - 14 - gw_strlen(lb) * 8, ry + 4, lb, 0x07, (idx == fm_sel || hover) ? 0x0E : 0x0F);
+        }
+        gw_scrollbar(ox + iw - 6, oy + 18, ih - 18, (vis < fm_count) ? (ih - 18 - 12) * fm_scroll / max_scroll : 6,
+                     (vis < fm_count) ? 12 : (ih - 18), GW_C_GRAY_SLIDER);
+    } else {
+        /* 文件查看 */
+        gw_fill(ox, oy, iw, 16, 0x0078D7u);
+        gfx_draw_text(ox + 3, oy + 4, fm_file_name, 0x0F, GW_C_BLUE);
+        gfx_draw_text(ox + iw - 13 * 8, oy + 4, "[Esc] back", 0x0F, GW_C_BLUE);
+        int row_h = 8;
+        int vis = (ih - 18) / row_h;
+        int max_scroll = fm_file_len / row_h - vis;
+        if (max_scroll < 0) max_scroll = 0;
+        for (int r = 0; r < vis; r++) {
+            int off = (fm_file_scroll + r) * row_h;
+            if (off >= fm_file_len) break;
+            char line[41];
+            int n = 0;
+            while (n < 40 && off + n < fm_file_len && fm_file_buf[off + n] != '\n' && fm_file_buf[off + n] != '\r') {
+                line[n] = (char)fm_file_buf[off + n];
+                n++;
+            }
+            line[n] = 0;
+            gfx_draw_text(ox + 2, oy + 18 + r * row_h, line, 0x00, 0x0F);
+        }
+        gw_scrollbar(ox + iw - 6, oy + 18, ih - 18,
+                     (max_scroll > 0) ? (ih - 18 - 12) * fm_file_scroll / max_scroll : 6,
+                     (max_scroll > 0) ? 12 : (ih - 18), GW_C_GRAY_SLIDER);
+    }
+}
+
+static void files_mousedown(gw_window_t *w, int lx, int ly)
+{
+    (void)lx;
+    (void)w;
+    if (fm_mode == 0 && ly >= 18) {
+        int row = (ly - 18) / 16;
+        fm_sel = fm_scroll + row;
+        if (fm_sel >= fm_count) fm_sel = -1;
+    }
+}
+
+static void files_click(gw_window_t *w, int lx, int ly)
+{
+    (void)lx;
+    (void)w;
+    if (fm_mode == 0 && ly >= 18) {
+        int row = (ly - 18) / 16;
+        int idx = fm_scroll + row;
+        if (idx >= 0 && idx < fm_count) fm_enter(idx);
+    }
+}
+
+static void files_key(gw_window_t *w, int key)
+{
+    (void)w;
+    if (fm_mode == 1) {
+        int vis = (w->inner_h - 18) / 8;
+        int max_scroll = fm_file_len / 8 - vis;
+        if (max_scroll < 0) max_scroll = 0;
+        if (key == KEY_UP) { if (fm_file_scroll > 0) fm_file_scroll--; }
+        else if (key == KEY_DOWN) { if (fm_file_scroll < max_scroll) fm_file_scroll++; }
+        else if (key == 0x1B || key == 8) fm_mode = 0;
+        return;
+    }
+    int vis = (w->inner_h - 18) / 16;
+    if (vis < 1) vis = 1;
+    int max_scroll = fm_count - vis;
+    if (max_scroll < 0) max_scroll = 0;
+    /* fm_scroll 钳制：负值会让 files_draw 索引 fm_entries[-1] */
+    if (fm_scroll < 0) fm_scroll = 0;
+    if (fm_scroll > max_scroll) fm_scroll = max_scroll;
+    if (key == KEY_UP) {
+        if (fm_sel > 0) fm_sel--;
+        if (fm_sel < fm_scroll) fm_scroll = fm_sel;
+        if (fm_scroll < 0) fm_scroll = 0;
+    }
+    else if (key == KEY_DOWN) {
+        if (fm_sel < fm_count - 1) fm_sel++;
+        if (fm_sel >= fm_scroll + vis) fm_scroll = fm_sel - vis + 1;
+        if (fm_scroll < 0) fm_scroll = 0;
+        if (fm_scroll > max_scroll) fm_scroll = max_scroll;
+    }
+    else if (key == '\n' || key == '\r') { if (fm_sel >= 0) fm_enter(fm_sel); }
+    else if (key == 8 || key == 0x1B) fm_back();
+}
+
+/* ==================================================================
+ * 应用：记事本
+ * ================================================================== */
+#define NP_ROWS 24
+#define NP_COLS 40
+static char np_buf[NP_ROWS][NP_COLS + 1];
+static int np_row = 0, np_col = 0, np_scroll = 0;
+static int np_menu = 0;   /* 0=无菜单 1=File 2=Edit */
+static char np_fname[13] = "NOTE.TXT";   /* 当前文件名（8.3，exFAT 根目录） */
+static int np_dirty = 0;                 /* 有未保存修改 */
+
+/* 把文本缓冲载入记事本（Files 打开 .TXT / Open 菜单共用）。
+ * \n 换行、\r 忽略、控制字符替换为空格；超行/超宽截断。 */
+static void np_load_text(const char *name, const char *buf, int len)
+{
+    for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+    int r = 0, c = 0;
+    for (int i = 0; i < len && r < NP_ROWS; i++) {
+        char ch = buf[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') { r++; c = 0; continue; }
+        if ((unsigned char)ch < 32) ch = ' ';
+        if (c < NP_COLS) { np_buf[r][c++] = ch; np_buf[r][c] = 0; }
+    }
+    np_row = 0; np_col = 0; np_scroll = 0; np_dirty = 0;
+    int n = 0;
+    while (name[n] && n < 12) { np_fname[n] = name[n]; n++; }
+    np_fname[n] = 0;
+    /* 同步窗口标题 */
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (w->used && (unsigned long)w->user == GW_APP_NOTEPAD) {
+            int k = 0;
+            const char *p = "Notepad - ";
+            while (p[k] && k < GW_TITLE_MAX - 1) { w->title[k] = p[k]; k++; }
+            int j = 0;
+            while (np_fname[j] && k < GW_TITLE_MAX - 1) w->title[k++] = np_fname[j++];
+            w->title[k] = 0;
+        }
+    }
+}
+
+/* 保存：np_buf 序列化（每行追加 \n）后 exfat_create_file 覆盖写 */
+static void np_save(void)
+{
+    static uint8_t sbuf[NP_ROWS * (NP_COLS + 1) + 1];
+    int n = 0;
+    int lim = (int)sizeof(sbuf) - 1;
+    for (int r = 0; r < NP_ROWS; r++) {
+        for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
+        if (n < lim) sbuf[n++] = '\n';
+    }
+    if (fs_create_file(np_fname, sbuf, (uint32_t)n) == 0)
+        np_dirty = 0;
+}
+
+/* 打开：读当前文件名文件载入（失败提示保留原内容） */
+static int np_open(void)
+{
+    static uint8_t rbuf[NP_ROWS * (NP_COLS + 1) + 1];
+    uint32_t sz = fs_get_file_size(np_fname);
+    if (sz == 0) return 0;                       /* 文件不存在 */
+    if (sz > sizeof(rbuf) - 1) sz = sizeof(rbuf) - 1;
+    if (fs_read_file(np_fname, rbuf, sz) != (int)sz) return 0;
+    rbuf[sz] = 0;
+    np_load_text(np_fname, (const char *)rbuf, (int)sz);
+    return 1;
+}
+
+static void notepad_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+    /* 菜单栏 */
+    gw_fill(ox, oy, iw, 14, 0xF0F0F0u);
+    gw_fill(ox, oy + 14, iw, 1, 0xD0D0D0u);
+    gfx_draw_text(ox + 4, oy + 3, "File", 0x00, np_menu == 1 ? 0x0E : 0x0F);
+    gfx_draw_text(ox + 36, oy + 3, "Edit", 0x00, np_menu == 2 ? 0x0E : 0x0F);
+    /* 菜单栏右侧：文件名 + 修改标记 */
+    {
+        char fb[18];
+        int n = 0;
+        while (np_fname[n] && n < 12) { fb[n] = np_fname[n]; n++; }
+        if (np_dirty && n < 17) fb[n++] = '*';
+        fb[n] = 0;
+        gfx_draw_text(ox + iw - 8 * n - 4, oy + 3, fb, np_dirty ? 0x0E : 0x07, 0x0F);
+    }
+    /* 文本区（先画，下拉菜单必须在其上，否则菜单被文本区背景覆盖） */
+    gw_fill(ox, oy + 15, iw, ih - 15, CLR_EDIT_BG);
+    int row_h = 10;
+    int vis = (ih - 15) / row_h;
+    int mx = mouse_get_x();
+    for (int r = 0; r < vis; r++) {
+        int idx = np_scroll + r;
+        if (idx >= NP_ROWS) break;
+        int ry = oy + 15 + r * row_h;
+        int is_cur = (idx == np_row);
+        if (is_cur) gw_fill(ox, ry, iw, row_h, 0xF0F7FDu);
+        /* 无行号：文本从左侧 ox+2 起画 */
+        gfx_draw_text(ox + 2, ry + 1, np_buf[idx], 0x00, is_cur ? 0x0E : 0x0F);
+        if (is_cur && np_col < NP_COLS && mx >= ox && mx < ox + iw) {
+            /* 光标：反色块（静态，不闪烁以免引起视觉抖动） */
+            gw_fill(ox + 2 + np_col * 8, ry + 1, 1, 8, 0x0078D7u);
+        }
+    }
+    /* 下拉菜单（最后画，置顶显示） */
+    if (np_menu == 1) {
+        int my0 = oy + 14;
+        gw_fill(ox + 2, my0, 90, 4 * 16 + 2, 0xF0F0F0u);
+        gw_fill(ox + 2, my0, 90, 1, 0xD0D0D0u);
+        gw_fill(ox + 2, my0 + 4 * 16, 90, 1, 0xD0D0D0u);
+        gfx_draw_text(ox + 10, my0 + 4,  "New",  0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 20, "Open", 0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 36, "Save", 0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 52, "Clear", 0x00, 0x0F);
+    } else if (np_menu == 2) {
+        int my0 = oy + 14;
+        gw_fill(ox + 2, my0, 90, 2 * 16 + 2, 0xF0F0F0u);
+        gw_fill(ox + 2, my0, 90, 1, 0xD0D0D0u);
+        gw_fill(ox + 2, my0 + 32, 90, 1, 0xD0D0D0u);
+        gfx_draw_text(ox + 10, my0 + 4, "Home", 0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 20, "End", 0x00, 0x0F);
+    }
+}
+
+static void notepad_key(gw_window_t *w, int key)
+{
+    int vis = (w->inner_h - 15) / 10;
+    if (vis < 1) vis = 1;
+    if (key >= 32 && key < 127 && np_col < NP_COLS) {
+        char *line = np_buf[np_row];
+        int len = gw_strlen(line);
+        if (len < NP_COLS) {
+            for (int k = len; k > np_col; k--) line[k] = line[k - 1];
+            line[np_col] = (char)key;
+            line[len + 1] = 0;
+            np_col++;
+        }
+    } else if (key == 8 || key == 127) {
+        char *line = np_buf[np_row];
+        if (np_col > 0) {
+            for (int k = np_col - 1; k < NP_COLS; k++) line[k] = line[k + 1];
+            np_col--;
+        } else if (np_row > 0) {
+            np_row--;
+            np_col = gw_strlen(np_buf[np_row]);
+            if (np_col > NP_COLS) np_col = NP_COLS;
+            if (np_row < np_scroll) np_scroll = np_row;
+        }
+    } else if (key == '\n' || key == '\r') {
+        if (np_row < NP_ROWS - 1) {
+            np_row++;
+            np_col = 0;
+            if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1;
+        }
+    } else if (key == KEY_UP) {
+        if (np_row > 0) { np_row--; if (np_row < np_scroll) np_scroll = np_row; }
+    } else if (key == KEY_DOWN) {
+        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
+    } else if (key == KEY_LEFT) {
+        if (np_col > 0) np_col--;
+        else if (np_row > 0) { np_row--; np_col = gw_strlen(np_buf[np_row]); }
+    } else if (key == KEY_RIGHT) {
+        int len = gw_strlen(np_buf[np_row]);
+        if (np_col < len) np_col++;
+        else if (np_row < NP_ROWS - 1) { np_row++; np_col = 0; }
+    }
+}
+
+static void notepad_click(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    /* 菜单栏 */
+    if (ly < 14) {
+        if (lx >= 2 && lx < 34) np_menu = (np_menu == 1) ? 0 : 1;
+        else if (lx >= 34 && lx < 66) np_menu = (np_menu == 2) ? 0 : 2;
+        else np_menu = 0;
+        return;
+    }
+    /* File 下拉菜单项（宽 90，4 项 x 16，与绘制高度 4*16+2 一致） */
+    if (np_menu == 1 && lx >= 2 && lx < 92 && ly >= 14 && ly < 14 + 4 * 16 + 2) {
+        int item = (ly - 14) / 16;
+        if (item == 0) {   /* New：清空并回到 NOTE.TXT */
+            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+            np_row = 0; np_col = 0; np_scroll = 0;
+            np_load_text("NOTE.TXT", "", 0);
+        } else if (item == 1) {   /* Open：读当前文件名（失败保留原内容） */
+            np_open();
+        } else if (item == 2) {   /* Save：序列化后 exFAT 覆盖写 */
+            np_save();
+        } else if (item == 3) {   /* Clear：仅清空缓冲，文件不变 */
+            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+            np_row = 0; np_col = 0; np_scroll = 0;
+            np_dirty = 1;
+        }
+        np_menu = 0;
+        return;
+    }
+    if (np_menu == 2 && lx >= 2 && lx < 92 && ly >= 14 && ly < 48) {
+        int item = (ly - 14) / 16;
+        if (item == 0) { np_row = 0; np_col = 0; np_scroll = 0; }
+        else if (item == 1) { np_row = NP_ROWS - 1; np_col = gw_strlen(np_buf[np_row]); np_scroll = np_row - 9; if (np_scroll < 0) np_scroll = 0; }
+        np_menu = 0;
+        return;
+    }
+    np_menu = 0;   /* 点击其他区域：关闭菜单 */
+}
+
+/* ==================================================================
+ * 应用：画板（Paint）
+ * ================================================================== */
+#define PT_CW    240            /* 画布宽（实际像素） */
+#define PT_CH    160            /* 画布高 */
+#define PT_TB_W  26             /* 左侧工具栏宽 */
+#define PT_COLS  16             /* 调色板颜色数 */
+
+static uint8_t pt_canvas[PT_CW * PT_CH] __attribute__((section(".bss.hi")));  /* 画布：调色板索引（高内存 bss，给低地址 bss 腾地方） */
+static const uint32_t pt_rgb[PT_COLS] = {
+    0x000000u, 0xFFFFFFu, 0xD80000u, 0xF5A800u, 0xF5E100u, 0x00A800u,
+    0x00C8C8u, 0x0055D4u, 0xC800C8u, 0x8A4B00u, 0x606060u, 0xB8B8B8u,
+    0x0A5A0Au, 0x101080u, 0x7020A0u, 0xFF90C8u
+};
+static int pt_color = 0;        /* 当前颜色索引 */
+static int pt_brush = 0;        /* 笔刷号 0/1/2 -> 直径 1/2/4 */
+static const int pt_brush_d[3] = { 1, 2, 4 };
+static int pt_eraser = 0;       /* 橡皮：画白色 */
+static int pt_init = 0;         /* 画布初始化标记 */
+static int pt_last_x = -1, pt_last_y = -1;   /* 上一笔位置（画布坐标，-1=提笔） */
+
+/* 找到 Paint 窗口（单实例） */
+static gw_window_t *pt_win(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used &&
+            (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_PAINT)
+            return &gw_windows[i];
+    return NULL;
+}
+
+/* 画布坐标 -> 屏幕坐标（内容区逻辑坐标：画布左上角在 (PT_TB_W+3, 3)） */
+#define PT_CX0  (PT_TB_W + 3)
+#define PT_CY0  3
+
+/* 画一个笔刷点：写画布 + 直写屏幕（拖画即时反馈，不经全屏重绘） */
+static void pt_plot(int cx, int cy)
+{
+    if (cx < 0 || cy < 0 || cx >= PT_CW || cy >= PT_CH) return;
+    int idx = pt_eraser ? 1 : pt_color;   /* 1=白色 */
+    int d = pt_brush_d[pt_brush];
+    gw_window_t *w = pt_win();
+    if (!w) return;
+    int sx = gw_ox(w) + PT_CX0, sy = gw_oy(w) + PT_CY0;
+    int r = d / 2;
+    /* 直写 LFB：登记损伤，否则主循环收尾擦旧光标时会把这一笔按旧缓存
+     * 盖回去（16x16 笔触缺角）——2026-10-25 "鼠标消失"修复的配套项 */
+    gw_dmg_add(sx + cx - r, sy + cy - r, d, d);
+    for (int j = -r; j <= (d - 1 - r); j++) {
+        for (int i = -r; i <= (d - 1 - r); i++) {
+            int px = cx + i, py = cy + j;
+            if (px < 0 || py < 0 || px >= PT_CW || py >= PT_CH) continue;
+            pt_canvas[py * PT_CW + px] = (uint8_t)idx;
+            gw_px(sx + px, sy + py, pt_rgb[idx]);
+        }
+    }
+}
+
+/* 画布坐标 Bresenham 连线（拖动画出连续笔画） */
+static void pt_line(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        pt_plot(x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx)  { err += dx; y0 += sy; }
+    }
+}
+
+static void paint_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int ih = w->inner_h;
+
+    /* 工具栏底 + 分隔线 */
+    gw_fill(ox, oy, PT_TB_W, ih, 0xE8E8E8u);
+    gw_fill(ox + PT_TB_W, oy, 1, ih, 0xC8C8C8u);
+
+    /* 16 色块：2 列 x 8 行，8x8 间距 10 */
+    for (int i = 0; i < PT_COLS; i++) {
+        int cx = ox + 3 + (i % 2) * 10;
+        int cy = oy + 3 + (i / 2) * 10;
+        gw_fill(cx, cy, 8, 8, pt_rgb[i]);
+        if (i == pt_color && !pt_eraser)
+            gw_frame(cx - 1, cy - 1, 10, 10, 0x0078D7u);
+    }
+
+    /* 笔刷粗细：3 个按钮（直径 1/2/4 的示意点） */
+    for (int i = 0; i < 3; i++) {
+        int by = oy + 85 + i * 12;
+        gw_fill(ox + 3, by, 20, 11, 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        int d = pt_brush_d[i];
+        int mxp = ox + 13 - d / 2, myp = by + 5 - d / 2;
+        gw_fill(mxp, myp, d, d, 0x333333u);
+        if (i == pt_brush) gw_frame(ox + 2, by - 1, 22, 13, 0x0078D7u);
+    }
+
+    /* 橡皮 / 清空按钮 */
+    {
+        int by = oy + 85 + 3 * 12 + 2;
+        gw_fill(ox + 3, by, 20, 11, pt_eraser ? 0x0078D7u : 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        gfx_draw_text(ox + 8, by + 2, "E", pt_eraser ? 0x0F : 0x00,
+                      pt_eraser ? (uint8_t)GW_C_BLUE : (uint8_t)0x0F);
+        by += 13;
+        gw_fill(ox + 3, by, 20, 11, 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        gfx_draw_text(ox + 8, by + 2, "C", 0x00, 0x0F);
+    }
+
+    /* 画布边框 + 整幅 blit（重绘时从画布恢复） */
+    gw_frame(ox + PT_TB_W + 2, oy + 2, PT_CW + 2, PT_CH + 2, 0x808080u);
+    int x0 = ox + PT_CX0, y0 = oy + PT_CY0;
+    for (int y = 0; y < PT_CH; y++) {
+        for (int x = 0; x < PT_CW; x++) {
+            uint32_t rgb = pt_rgb[pt_canvas[y * PT_CW + x]];
+            if (gfx_bpp == 2)
+                ((uint16_t*)gfx_fb)[(y0 + y) * GFX_W + x0 + x] =
+                    gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+            else if (gfx_bpp == 4)
+                ((uint32_t*)gfx_fb)[(uint32_t)(y0 + y) * gfx_stride + x0 + x] = gw_rgb2pix32(rgb);
+            else
+                gfx_putpixel(x0 + x, y0 + y, gw_idx_near(rgb));
+        }
+    }
+}
+
+/* 工具栏命中：lx<PT_TB_W。返回 1=已处理 */
+static int pt_toolbar_click(int lx, int ly)
+{
+    if (lx >= PT_TB_W) return 0;
+    if (ly >= 3 && ly < 3 + 8 * 10) {          /* 色块区 */
+        int row = (ly - 3) / 10, col = (lx - 3) / 10;
+        if (col >= 0 && col < 2 && lx >= 3 && lx < 3 + 2 * 10) {
+            pt_color = row * 2 + col;
+            if (pt_color >= PT_COLS) pt_color = PT_COLS - 1;
+            pt_eraser = 0;
+            return 1;
+        }
+    }
+    if (ly >= 85 && ly < 85 + 3 * 12) {        /* 笔刷区 */
+        pt_brush = (ly - 85) / 12;
+        if (pt_brush > 2) pt_brush = 2;
+        return 1;
+    }
+    if (ly >= 85 + 3 * 12 + 2 && ly < 85 + 3 * 12 + 2 + 11) {
+        pt_eraser = !pt_eraser;                /* E：橡皮开关 */
+        return 1;
+    }
+    if (ly >= 85 + 3 * 12 + 2 + 13 && ly < 85 + 3 * 12 + 2 + 13 + 11) {
+        for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;   /* C：清空为白 */
+        gw_dirty = 1;
+        return 1;
+    }
+    return 1;   /* 工具栏空白：吞掉点击 */
+}
+
+static void paint_mousedown(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    if (pt_toolbar_click(lx, ly)) { pt_last_x = -1; return; }
+    pt_last_x = lx - PT_CX0;
+    pt_last_y = ly - PT_CY0;
+    pt_plot(pt_last_x, pt_last_y);
+}
+
+static void paint_mousemove(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    if (!(mouse_get_buttons() & 1)) {   /* 未按左键：提笔 */
+        pt_last_x = -1;
+        return;
+    }
+    if (lx < PT_TB_W) { pt_last_x = -1; return; }   /* 拖进工具栏：断笔 */
+    int cx = lx - PT_CX0, cy = ly - PT_CY0;
+    if (pt_last_x < 0) {              /* 从画布外按下后拖入：从当前点起笔 */
+        pt_last_x = cx; pt_last_y = cy;
+        pt_plot(cx, cy);
+        return;
+    }
+    pt_line(pt_last_x, pt_last_y, cx, cy);
+    pt_last_x = cx; pt_last_y = cy;
+}
+
+static void paint_key(gw_window_t *w, int key)
+{
+    (void)w;
+    if (key == 'c' || key == 'C') {
+        for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;
+        gw_dirty = 1;
+    } else if (key == 'e' || key == 'E') {
+        pt_eraser = !pt_eraser;
+        gw_dirty = 1;
+    } else if (key >= '1' && key <= '3') {
+        pt_brush = key - '1';
+        gw_dirty = 1;
+    }
+}
+
+/* ==================================================================
+ * 应用：系统信息
+ * ================================================================== */
+static void sysinfo_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w;
+    uint32_t lfb = *(volatile uint32_t*)0x5000;
+    uint16_t vxr = *(volatile uint16_t*)0x5004;
+    uint16_t vyr = *(volatile uint16_t*)0x5006;
+
+    static const char *lines[10] = {
+        "Cerulia System Information",
+        "CPU: i686 (protected mode)",
+        "Resolution: AUTO (VBE LFB)",
+        "Color depth: 16bpp RGB565",
+        "VBE probe: boot.asm 0x5000",
+        "exFAT: filesystem on slave",
+        "Mouse: PS/2 (IRQ12)",
+        "Keyboard: 8042 (IRQ1)",
+        "Theme: dynamic (Settings)",
+        "Build: 2026-08-20"
+    };
+    int y = oy + 6;
+    gfx_draw_text(ox + 4, y, lines[0], 0x00, 0x0F);
+    y += 14;
+    /* 分辨率 */
+    {
+        char buf[40];
+        int n = 0;
+        const char *p = "Resolution: ";
+        while (*p && n < 39) buf[n++] = *p++;
+        if (vxr > 0 && vyr > 0) {
+            buf[n++] = '0' + (vxr / 1000) % 10;
+            buf[n++] = '0' + (vxr / 100) % 10;
+            buf[n++] = '0' + (vxr / 10) % 10;
+            buf[n++] = '0' + vxr % 10;
+            buf[n++] = 'x';
+            buf[n++] = '0' + (vyr / 1000) % 10;
+            buf[n++] = '0' + (vyr / 100) % 10;
+            buf[n++] = '0' + (vyr / 10) % 10;
+            buf[n++] = '0' + vyr % 10;
+        } else {
+            const char *q = "320x200 (fallback)";
+            while (*q && n < 39) buf[n++] = *q++;
+        }
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+    }
+    y += 14;
+    /* LFB 十六进制 */
+    {
+        char buf[40];
+        int n = 0;
+        const char *p = "Framebuffer: 0x";
+        while (*p && n < 39) buf[n++] = *p++;
+        static const char hexd[] = "0123456789ABCDEF";
+        int started = 0;
+        for (int sh = 28; sh >= 0; sh -= 4) {
+            int d = (int)((lfb >> sh) & 0xF);
+            if (d || started || sh == 0) { started = 1; buf[n++] = hexd[d]; }
+        }
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+    }
+    y += 14;
+    /* 内存（CMOS 真实值） */
+    {
+        uint16_t conv = gw_cmos_read(0x15) | (gw_cmos_read(0x16) << 8);
+        uint16_t ext = gw_cmos_read(0x17) | (gw_cmos_read(0x18) << 8);
+        char buf[64];
+        int n = 0;
+        const char *p = "Memory (CMOS): ";
+        while (*p && n < 55) buf[n++] = *p++;
+        /* ext KB -> MB */
+        uint32_t mb = ext / 1024;
+        buf[n++] = '0' + (mb / 100) % 10;
+        buf[n++] = '0' + (mb / 10) % 10;
+        buf[n++] = '0' + mb % 10;
+        const char *q = " MB";
+        while (*q && n < 55) buf[n++] = *q++;
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+        /* 内存条 */
+        int barw = iw - 16;
+        gw_fill(ox + 4, y + 10, barw, 8, 0xD8D8D8u);
+        int used = barw * (int)(mb > 128 ? 128 : mb) / 128;
+        if (used > barw) used = barw;
+        gw_fill(ox + 4, y + 10, used, 8, 0x0078D7u);
+        (void)conv;
+        y += 24;
+    }
+    /* 运行时长（PIT 毫秒计数 -> mm:ss，每秒自动刷新） */
+    {
+        uint32_t up = g_pit_ticks / 1000;
+        char buf[40];
+        int n = 0;
+        const char *p = "Uptime: ";
+        while (*p && n < 39) buf[n++] = *p++;
+        uint32_t mm = up / 60, ss = up % 60;
+        if (mm > 0) {
+            if (mm >= 100) { buf[n++] = '0' + (mm / 100) % 10; mm %= 100; }
+            if (mm >= 10) buf[n++] = '0' + (mm / 10) % 10;
+            buf[n++] = '0' + mm % 10;
+            buf[n++] = 'm';
+        }
+        buf[n++] = '0' + (ss / 10) % 10;
+        buf[n++] = '0' + ss % 10;
+        buf[n++] = 's';
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+        y += 12;
+    }
+    /* 打开窗口数 */
+    {
+        char buf[40];
+        int n = 0;
+        const char *p = "Windows open: ";
+        while (*p && n < 39) buf[n++] = *p++;
+        int cnt = 0;
+        for (int i = 0; i < GW_MAX_WINDOWS; i++)
+            if (gw_windows[i].used && !gw_windows[i].hidden) cnt++;
+        buf[n++] = '0' + cnt;
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+        y += 12;
+    }
+    /* 其余静态行 */
+    for (int i = 4; i < 10; i++) {
+        gfx_draw_text(ox + 4, y, lines[i], 0x00, 0x0F);
+        y += 12;
+    }
+}
+
+/* ==================================================================
+ * 应用：时钟（模拟表盘 + 数字时间，自适应）
+ * ================================================================== */
+static void clock_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+    int cx = ox + iw / 2;
+    int r = (iw < ih ? iw : ih) / 2 - 12;
+    if (r < 16) r = 16;
+    int cy = oy + 12 + r;
+
+    /* 同上，走统一 RTC。rtc_now 已保证字段合法，不需要再 clamp。 */
+    rtc_time_t rt;
+    uint8_t hour, minute, second, day, month;
+    if (rtc_now(&rt) == 0) {
+        hour = rt.hour; minute = rt.minute; second = rt.second;
+        day = rt.day;  month = rt.month;
+    } else {
+        hour = minute = second = 0; day = 1; month = 1;
+    }
+
+    gw_draw_circle(cx, cy, r, 0x333333u);
+    gw_draw_circle(cx, cy, r - 1, 0x333333u);
+    for (int i = 0; i < 60; i += 5) {
+        int x1 = cx + gw_cos128[i] * (r - 6) / 128;
+        int y1 = cy - gw_sin128[i] * (r - 6) / 128;
+        int x2 = cx + gw_cos128[i] * r / 128;
+        int y2 = cy - gw_sin128[i] * r / 128;
+        gw_draw_line(x1, y1, x2, y2, 0x333333u);
+    }
+    int hidx = (hour % 12) * 5 + minute / 12;
+    int midx = minute;
+    int sidx = second;
+    gw_draw_line(cx, cy, cx + gw_cos128[hidx] * (r - 8) / 128, cy - gw_sin128[hidx] * (r - 8) / 128, 0x111111u);
+    gw_draw_line(cx, cy, cx + gw_cos128[midx] * (r - 4) / 128, cy - gw_sin128[midx] * (r - 4) / 128, 0x111111u);
+    gw_draw_line(cx, cy, cx + gw_cos128[sidx] * (r - 2) / 128, cy - gw_sin128[sidx] * (r - 2) / 128, 0xC42B1Cu);
+    gw_draw_circle(cx, cy, 2, 0x111111u);
+
+    char buf[8];
+    buf[0] = '0' + hour / 10; buf[1] = '0' + hour % 10;
+    buf[2] = ':';
+    buf[3] = '0' + minute / 10; buf[4] = '0' + minute % 10;
+    buf[5] = 0;
+    gfx_draw_text(ox + (iw - 5 * 8) / 2, cy + r + 8, buf, 0x00, 0x0F);
+    char buf2[8];
+    buf2[0] = '0' + day / 10; buf2[1] = '0' + day % 10;
+    buf2[2] = ' ';
+    static const char *gw_months[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    buf2[3] = gw_months[month % 12][0];
+    buf2[4] = gw_months[month % 12][1];
+    buf2[5] = gw_months[month % 12][2];
+    buf2[6] = 0;
+    gfx_draw_text(ox + (iw - 6 * 8) / 2, cy + r + 18, buf2, 0x00, 0x0F);
+}
+
+/* ==================================================================
+ * 应用：浏览器（ezos://dino —— 只内置谷歌小恐龙离线游戏）
+ *
+ * 窗口 = Chrome 风格工具栏（导航按钮 + 地址栏 + 刷新）+ 白色页面区；
+ * 页面内跑小恐龙跑酷：空格/上键/点击跳跃、下键蹲下（切换），
+ * 仙人掌障碍、计分 + 最高分（会话内）、速度随分数递增。
+ * 动画由 gw_demo 主循环的帧泵驱动（仅窗口聚焦时 ~60FPS 双缓冲重绘，
+ * 与 gw_game_yield 同思路；物理步进按 g_pit_ticks 实际毫秒推进）。
+ * ================================================================== */
+#define BR_STATE_IDLE 0
+#define BR_STATE_RUN  1
+#define BR_STATE_OVER 2
+
+#define BR_TOOLBAR_H  24
+#define BR_DINO_COLS  12
+#define BR_DINO_ROWS  14
+#define BR_PX         2          /* 恐龙像素放大倍数 */
+
+static int br_state = BR_STATE_IDLE;
+static int br_duck;              /* 蹲下标记（下键切换，跳跃时自动解除） */
+static int br_dino_y;            /* 离地高度（0=落地，向上为正） */
+static int br_dino_vy;           /* 垂直速度 px/步 */
+static int br_score;             /* 分数（整数，每 100 提速） */
+static int br_hi;                /* 会话最高分 */
+static int br_speed;             /* 地面卷动速度 px/步 */
+static int br_run_frm;           /* 奔跑腿部动画帧（0/1） */
+static uint32_t br_last_ms;      /* 上次物理推进时刻（g_pit_ticks） */
+static uint32_t br_seed = 12345; /* 障碍间距 LCG */
+
+/* 12x14 T-Rex 像素位图（MSB=左列；行 0-5 头、6-13 身体，尾在左） */
+static const uint16_t br_dino_bits[BR_DINO_ROWS] = {
+    0x07C, 0x07E, 0x07E, 0x07C, 0x07E, 0x07C,
+    0x0F8, 0x1F8, 0x3F8, 0x7F8, 0x7F8, 0x7F0, 0x3F0, 0x3E0
+};
+
+/* 仙人掌障碍（kind：0=单株小 1=双株小 2=单株大） */
+#define BR_OBS_N 4
+static int br_obs_used[BR_OBS_N];
+static int br_obs_x[BR_OBS_N];
+static int br_obs_kind[BR_OBS_N];
+static int br_spawn_gap;         /* 距下一株出生的滚动像素数 */
+
+static int br_cloud_x[2];        /* 两朵云（页面相对坐标） */
+static int br_ground_off;        /* 地面碎石滚动偏移 */
+static int br_page_w = 440;      /* 页面区宽度（browser_draw 每帧刷新，出生点用） */
+
+static uint32_t br_rand(void)
+{
+    br_seed = br_seed * 1103515245u + 12345u;
+    return br_seed >> 16;
+}
+
+static void br_reset(void)
+{
+    br_duck = 0;
+    br_dino_y = 0;
+    br_dino_vy = 0;
+    br_score = 0;
+    br_speed = 3;
+    br_run_frm = 0;
+    for (int i = 0; i < BR_OBS_N; i++) br_obs_used[i] = 0;
+    br_spawn_gap = 300;
+    br_cloud_x[0] = 180;
+    br_cloud_x[1] = 400;
+    br_ground_off = 0;
+    br_state = BR_STATE_RUN;
+}
+
+/* 跳跃 / 开始 / 重开（空格、上键、页面点击共用） */
+static void br_action(void)
+{
+    if (br_state == BR_STATE_IDLE || br_state == BR_STATE_OVER) {
+        br_reset();
+        return;
+    }
+    if (br_dino_y == 0) {
+        br_dino_vy = 11;
+        br_duck = 0;
+    }
+}
+
+static void br_step(void)
+{
+    /* 垂直运动 */
+    br_dino_y += br_dino_vy;
+    br_dino_vy -= 1;
+    if (br_dino_y <= 0) { br_dino_y = 0; br_dino_vy = 0; }
+
+    /* 滚动 */
+    br_ground_off = (br_ground_off + br_speed) % 24;
+    for (int i = 0; i < 2; i++) {
+        br_cloud_x[i] -= br_speed / 3 + 1;
+        if (br_cloud_x[i] < -40) br_cloud_x[i] = 300 + (int)(br_rand() % 200);
+    }
+
+    /* 障碍推进与出生 */
+    for (int i = 0; i < BR_OBS_N; i++)
+        if (br_obs_used[i]) {
+            br_obs_x[i] -= br_speed;
+            if (br_obs_x[i] < -40) br_obs_used[i] = 0;
+        }
+    br_spawn_gap -= br_speed;
+    if (br_spawn_gap <= 0) {
+        for (int i = 0; i < BR_OBS_N; i++) {
+            if (!br_obs_used[i]) {
+                br_obs_used[i] = 1;
+                br_obs_x[i] = br_page_w + 30;   /* 从页面右侧屏外进入 */
+                br_obs_kind[i] = (int)(br_rand() % 3);
+                break;
+            }
+        }
+        br_spawn_gap = 240 + (int)(br_rand() % 260) + br_speed * 10;
+    }
+
+    /* 计分与提速 */
+    br_score++;
+    if (br_score % 100 == 0 && br_speed < 10) br_speed++;
+    br_run_frm ^= 1;
+
+    /* 碰撞：恐龙横带 [40+5, 40+24-5]，底部离地 br_dino_y；
+     * 仙人掌横带 [x+2, x+w-2]、竖向占 [0, h]（贴地）。
+     * 竖向重叠 = 恐龙底部低于仙人掌顶（留 2px 容差；仙人掌均贴地，蹲下不豁免） */
+    int dx0 = 40 + 5, dx1 = 40 + 24 - 5;
+    for (int i = 0; i < BR_OBS_N; i++) {
+        if (!br_obs_used[i]) continue;
+        int ow = br_obs_kind[i] == 0 ? 8 : (br_obs_kind[i] == 1 ? 16 : 12);
+        int oh = br_obs_kind[i] == 2 ? 24 : 16;
+        int ox0 = br_obs_x[i] + 2, ox1 = br_obs_x[i] + ow - 2;
+        if (dx1 >= ox0 && dx0 <= ox1 && br_dino_y < oh - 2) {
+            if (br_score > br_hi) br_hi = br_score;
+            br_state = BR_STATE_OVER;
+            return;
+        }
+    }
+}
+
+/* 画恐龙：mode 0=站立 1/2=奔跑两帧；duck=纵向压扁 */
+static void br_draw_dino(int x, int gy)
+{
+    uint32_t c = 0x535353u;
+    int sy = br_duck ? 1 : BR_PX;   /* 蹲下：行高减半 */
+    int y0 = gy - br_dino_y - BR_DINO_ROWS * (br_duck ? 1 : BR_PX);
+    for (int r = 0; r < BR_DINO_ROWS; r++) {
+        uint16_t bits = br_dino_bits[r];
+        int yy = y0 + r * sy;
+        int rh = br_duck ? 1 : BR_PX;
+        for (int cidx = 0; cidx < BR_DINO_COLS; cidx++) {
+            if (bits & (1u << (BR_DINO_COLS - 1 - cidx)))
+                gw_fill(x + cidx * BR_PX, yy, BR_PX, rh, c);
+        }
+    }
+    /* 眼睛（白点） */
+    gw_fill(x + 10 * BR_PX, y0 + 1 * (br_duck ? 1 : BR_PX), BR_PX, br_duck ? 1 : BR_PX, 0xFFFFFFu);
+    /* 腿（身体下方 2 行像素）：空中/站立双腿着地，奔跑两帧交替 */
+    int lh = br_duck ? 1 : BR_PX;
+    int ly0 = y0 + BR_DINO_ROWS * (br_duck ? 1 : BR_PX);
+    if (br_dino_y > 0 || br_state != BR_STATE_RUN) {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+    } else if (br_run_frm == 0) {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0 + lh, BR_PX, lh, c);
+    } else {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 6 * BR_PX, ly0 + lh, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+    }
+}
+
+/* 画仙人掌（页面相对 x，贴地） */
+static void br_draw_cactus(int x, int gy, int kind)
+{
+    uint32_t c = 0x535353u;
+    if (kind == 2) {                 /* 大单株 12x24 */
+        gw_fill(x + 4, gy - 24, 4, 24, c);
+        gw_fill(x, gy - 18, 3, 3, c);
+        gw_fill(x, gy - 18, 2, 10, c);
+        gw_fill(x + 9, gy - 20, 3, 3, c);
+        gw_fill(x + 10, gy - 20, 2, 12, c);
+    } else if (kind == 1) {          /* 双株小 16x16 */
+        for (int k = 0; k < 2; k++) {
+            int bx = x + k * 9;
+            gw_fill(bx + 3, gy - 16, 3, 16, c);
+            gw_fill(bx, gy - 11, 2, 8, c);
+            gw_fill(bx + 6, gy - 12, 2, 8, c);
+        }
+    } else {                          /* 单株小 8x16 */
+        gw_fill(x + 3, gy - 16, 3, 16, c);
+        gw_fill(x, gy - 11, 2, 8, c);
+        gw_fill(x + 6, gy - 12, 2, 8, c);
+    }
+}
+
+static int dino_active;             /* Dino 正在跑（窗口聚焦时） */
+
+static void dino_draw(int px0, int py0, int pw, int ph)
+{
+    br_page_w = pw;
+    gw_fill(px0, py0, pw, ph, 0xFFFFFFu);
+    int gy = py0 + ph - 24;            /* 地面线（脚底基准） */
+
+    /* 物理推进：仅聚焦时按真实毫秒步进（16ms/步），失焦即暂停。
+     * dt 上限 250ms：慢渲染（如 QEMU TCG 单帧 >16ms）允许每帧追赶，
+     * 游戏速度保持墙钟正确；长时间暂停恢复也最多追 250ms（无跳变） */
+    uint32_t now = g_pit_ticks;
+    if (br_state == BR_STATE_RUN && dino_active) {
+        uint32_t dt = now - br_last_ms;
+        if (dt > 250) dt = 250;
+        while (dt >= 16) { br_step(); dt -= 16; if (br_state != BR_STATE_RUN) break; }
+    }
+    br_last_ms = now;
+
+    /* 地面线 + 滚动碎石 */
+    gw_fill(px0, gy, pw, 1, 0x535353u);
+    for (int x = -br_ground_off; x < pw; x += 24)
+        gw_fill(px0 + x + 4, gy + 6, 8, 1, 0xA8A8A8u);
+
+    /* 云 */
+    for (int i = 0; i < 2; i++) {
+        int cx = br_cloud_x[i], cy = py0 + 24 + i * 18;
+        gw_fill(px0 + cx, cy, 18, 4, 0xC8C8C8u);
+        gw_fill(px0 + cx + 5, cy - 3, 8, 3, 0xC8C8C8u);
+    }
+
+    /* 分数（右上角，Chrome 样式 HI xxxxx xxxxx） */
+    {
+        char buf[24];
+        int n = 0;
+        const char *p = "HI ";
+        while (*p) buf[n++] = *p++;
+        int hi = br_hi / 10, sc = br_score / 10;
+        for (int d = 10000; d >= 1; d /= 10) buf[n++] = (char)('0' + (hi / d) % 10);
+        buf[n++] = ' ';
+        for (int d = 10000; d >= 1; d /= 10) buf[n++] = (char)('0' + (sc / d) % 10);
+        buf[n] = 0;
+        gfx_draw_text(px0 + pw - n * 8 - 8, py0 + 8, buf, 0x07, 0x0F);
+    }
+
+    /* 恐龙固定横坐标 40（页面相对） */
+    br_draw_dino(px0 + 40, gy);
+
+    /* 障碍 */
+    for (int i = 0; i < BR_OBS_N; i++)
+        if (br_obs_used[i])
+            br_draw_cactus(px0 + br_obs_x[i], gy, br_obs_kind[i]);
+
+    /* 状态提示 */
+    if (br_state == BR_STATE_IDLE) {
+        const char *s = "Press SPACE or click to play";
+        gfx_draw_text(px0 + (pw - 28 * 8) / 2, py0 + ph / 2 - 20, s, 0x08, 0x0F);
+    } else if (br_state == BR_STATE_OVER) {
+        const char *s = "G A M E   O V E R";
+        gfx_draw_text(px0 + (pw - 18 * 8) / 2, py0 + ph / 2 - 20, s, 0x08, 0x0F);
+        const char *s2 = "Press SPACE to restart";
+        gfx_draw_text(px0 + (pw - 22 * 8) / 2, py0 + ph / 2 - 6, s2, 0x07, 0x0F);
+    }
+}
+
+static void dino_key(int key)
+{
+    if (key == ' ' || key == KEY_UP || key == 'w' || key == 'W' || key == '\n') {
+        br_action();
+    } else if (key == KEY_DOWN || key == 's' || key == 'S') {
+        if (br_state == BR_STATE_RUN && br_dino_y == 0)
+            br_duck = !br_duck;
+        else if (br_dino_y > 0)
+            br_dino_vy = -12;          /* 空中快速下落 */
+    }
+}
+
+static void dino_click(void)
+{
+    br_action();
+}
+
+/* ==================================================================
+ * 浏览器窗口（真正的网页浏览器）
+ *
+ * 窗口 = Chrome 风格工具栏（后退 / 前进 / 地址栏 / 状态）+ 页面区。
+ * 渲染全在 webview.c：那边已经把"抓 -> 解析 -> 排版"做完并缓存成行，
+ * 这里只负责按滚动偏移画出来、把点击/按键转成 wv_* 调用。
+ *
+ * `ezos://dino` 是内置页面（谷歌小恐龙），由上面那套 dino_* 代码渲染 ——
+ * 保留它是因为它是目前唯一不需要网络的"能玩的东西"，但它不再是浏览器
+ * 的全部：默认首页是真网页。
+ * ================================================================== */
+static int br_bar_x, br_bar_y, br_bar_w, br_bar_h;
+
+static void browser_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+
+    /* ---- 工具栏 ---- */
+    gw_fill(ox, oy, iw, BR_TOOLBAR_H, WV_C_TOOLBAR);
+    wv_draw_bar(ox, oy, iw, BR_TOOLBAR_H, &br_bar_x, &br_bar_y,
+                &br_bar_w, &br_bar_h);
+
+    /* ---- 页面区 ---- */
+    int py0 = oy + BR_TOOLBAR_H;
+    int ph = ih - BR_TOOLBAR_H;
+    if (ph < 20) ph = 20;
+    dino_active = wv_is_dino_url();
+    if (dino_active) {
+        dino_draw(ox, py0, iw, ph);
+    } else {
+        wv_draw_page(ox, py0, iw, ph);
+    }
+}
+
+static void browser_key(gw_window_t *w, int key)
+{
+    (void)w;
+    if (wv_is_dino_url()) {
+        /* Dino 页：地址栏聚焦时先给地址栏，否则全部交给游戏 */
+        if (!wv_bar_has_focus()) { dino_key(key); return; }
+    }
+    if (wv_bar_has_focus()) { wv_bar_key(key); return; }
+    if (key == KEY_LEFT || key == KEY_RIGHT) {
+        /* 左右键留给历史（上下键给滚动） */
+        if (key == KEY_LEFT) { wv_back(); return; }
+        wv_forward();
+        return;
+    }
+    wv_page_key(key);
+}
+
+static void browser_click(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    if (ly < BR_TOOLBAR_H) {
+        /* 工具栏：后退 / 前进 / 地址栏 */
+        if (lx >= 2 && lx < 14) { wv_back(); return; }
+        if (lx >= 15 && lx < 27) { wv_forward(); return; }
+        if (lx >= br_bar_x && lx < br_bar_x + br_bar_w) wv_bar_set_focus(1);
+        return;
+    }
+    if (wv_is_dino_url()) { dino_click(); return; }
+    /* 页面区：命中链接就跟随 */
+    uint16_t href = wv_hit_link(lx, ly + wv_scroll_get());
+    if (href) wv_follow(href);
+}
+
+static void browser_mousedown(gw_window_t *w, int lx, int ly)
+{
+    (void)w; (void)lx; (void)ly;
+}
+
+/* ==================================================================
+ * 应用：设置（主题切换）
+ * ================================================================== */
+static int settings_theme = 0;
+static int settings_mspeed = 256;
+
+static void settings_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w;
+    int mx = mouse_get_x(), my = mouse_get_y();
+    gfx_draw_text(ox + 4, oy + 4, "Settings", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 18, "Theme (click to switch):", 0x00, 0x0F);
+    int row_h = 18;
+    for (int i = 0; i < GW_THEME_COUNT; i++) {
+        int ry = oy + 30 + i * row_h;
+        const char *nm = gw_theme_name(i);
+        int hover = (mx >= ox && mx < ox + iw && my >= ry && my < ry + row_h);
+        if (i == settings_theme) {
+            gw_fill(ox, ry, iw, row_h, gw_accent);
+            gfx_draw_text(ox + 6, ry + 5, nm, 0x0F, (uint8_t)GW_C_BLUE);
+        } else if (hover) {
+            gw_fill(ox, ry, iw, row_h, CLR_ROW_HOVER);
+            gfx_draw_text(ox + 6, ry + 5, nm, 0x00, 0x0E);
+        } else {
+            gfx_draw_text(ox + 6, ry + 5, nm, 0x00, 0x0F);
+        }
+    }
+    int mrow = 30 + GW_THEME_COUNT * row_h + 18;
+    gfx_draw_text(ox + 4, oy + 30 + GW_THEME_COUNT * row_h + 6, "Resolution: auto-adaptive", 0x07, 0x0F);
+    gfx_draw_text(ox + 4, oy + 30 + GW_THEME_COUNT * row_h + 18, "Mouse speed (click to cycle):", 0x07, 0x0F);
+    {
+        char mb[24];
+        int v = settings_mspeed / 64 - 1;
+        const char *lvl[7] = {"1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8"};
+        if (v < 0) v = 0;
+        if (v > 6) v = 6;
+        mb[0] = 0;
+        for (int i = 0; i <= v; i++) { mb[i] = '#'; mb[i + 1] = 0; }
+        gfx_draw_text(ox + 130, oy + mrow - 12, mb, 0x07, 0x0E);
+        gfx_draw_text(ox + 130 + (v + 1) * 8 + 6, oy + mrow - 12, lvl[v], 0x07, 0x08);
+    }
+}
+
+static void settings_click(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    (void)lx;   /* 点击列由 ly 决定行，本面板无横向分区 */
+    int row = (ly - 30) / 18;
+    if (row >= 0 && row < GW_THEME_COUNT) {
+        settings_theme = row;
+        gw_set_theme(row);
+        return;
+    }
+    /* 鼠标速度行：y = 30 + 6*18 起 36px 高（覆盖条带与文字，避免点击文字无反应） */
+    if (ly >= 30 + GW_THEME_COUNT * 18 && ly < 30 + GW_THEME_COUNT * 18 + 36) {
+        settings_mspeed += 64;
+        if (settings_mspeed > 448) settings_mspeed = 64;
+        mouse_set_sensitivity(settings_mspeed);
+    }
+}
+
+/* ==================================================================
+ * 应用：关于
+ * ================================================================== */
+static void about_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    gfx_draw_text(ox + 4, oy + 6, "Cerulia - Windows 10 style UI", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 20, "Version 0.3-gui (v0.7 gfxwin)", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 34, "Base: RetrOS-32 (MIT)", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 48, "UI ref: sinwindows v2", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 62, "VBE 16bpp LFB, i686, QEMU", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 76, "Build 2026-08-20", 0x00, 0x0F);
+}
+
+/* ==================================================================
+ * 应用启动
+ * ================================================================== */
+static gw_window_t *gw_spawn_app(int idx)
+{
+    if (!gw_app_allowed(idx)) return NULL;
+    int ww = gw_scale_x(420), wh = gw_scale_y(300);
+    const char *title = gw_app_names[idx];
+    int flags = GW_F_MOVABLE;
+    int cascade = 0;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used) cascade++;
+    int wx = gw_scale_x(30) + (cascade % 4) * gw_scale_x(28);
+    int wy = gw_scale_y(24) + (cascade % 4) * gw_scale_y(22);
+
+    switch (idx) {
+    case GW_APP_FILES:    ww = gw_scale_x(440); wh = gw_scale_y(300); break;
+    case GW_APP_NOTEPAD:  ww = gw_scale_x(380); wh = gw_scale_y(300); break;
+    case GW_APP_SYSINFO:  ww = gw_scale_x(340); wh = gw_scale_y(260); break;
+    case GW_APP_CLOCK:    ww = gw_scale_x(200); wh = gw_scale_y(240); break;
+    case GW_APP_SETTINGS: ww = gw_scale_x(340); wh = gw_scale_y(300); break;
+    case GW_APP_ABOUT:    ww = gw_scale_x(320); wh = gw_scale_y(180); break;
+    case GW_APP_PAINT:    ww = PT_TB_W + PT_CW + 8; wh = PT_CH + GW_TITLE_H + 7; break;
+    case GW_APP_BROWSER:  ww = gw_scale_x(500); wh = gw_scale_y(360); break;
+    default: break;
+    }
+    gw_window_t *w = gw_create(title, wx, wy, ww, wh, flags);
+    if (!w) return NULL;
+    switch (idx) {
+    case GW_APP_FILES:
+        w->draw = files_draw; w->click = files_click;
+        w->mousedown = files_mousedown; w->key = files_key;
+        fm_refresh();
+        break;
+    case GW_APP_NOTEPAD:
+        w->draw = notepad_draw; w->key = notepad_key;
+        w->click = notepad_click;
+        /* np_buf/np_row/np_col 是全局静态：上次关窗残留的文本会带进新窗
+           （实测：打 "ab" 退格关窗重开，残留 "a"）。关闭重开应是空白文档。 */
+        for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+        np_row = 0; np_col = 0; np_scroll = 0;
+        np_menu = 0; np_dirty = 0;
+        {
+            const char *defname = "NOTE.TXT";
+            int fn = 0;
+            while (defname[fn] && fn < 12) { np_fname[fn] = defname[fn]; fn++; }
+            np_fname[fn] = 0;
+        }
+        break;
+    case GW_APP_SYSINFO:
+        w->draw = sysinfo_draw;
+        break;
+    case GW_APP_CLOCK:
+        w->draw = clock_draw;
+        break;
+    case GW_APP_SETTINGS:
+        w->draw = settings_draw; w->click = settings_click;
+        break;
+    case GW_APP_ABOUT:
+        w->draw = about_draw;
+        break;
+    case GW_APP_TERMINAL:
+        w->draw = term_draw;
+        w->key = term_key;
+        if (term_nrows == 0) {
+            term_print("Cerulia Terminal - type 'help' for commands");
+            term_newline();
+        }
+        term_prompt();   /* 打印 "> " 提示符，输入从提示符后开始 */
+        break;
+    case GW_APP_PAINT:
+        w->draw = paint_draw; w->key = paint_key;
+        w->mousedown = paint_mousedown; w->mousemove = paint_mousemove;
+        if (!pt_init) {   /* 首次启动：画布初始化为白色 */
+            for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;
+            pt_init = 1;
+        }
+        pt_last_x = -1;
+        break;
+    case GW_APP_BROWSER:
+        w->draw = browser_draw; w->key = browser_key;
+        w->click = browser_click;
+        w->mousedown = browser_mousedown;
+        break;
+    default:
+        break;
+    }
+    w->user = (void*)(unsigned long)idx;
+    w->app = idx;   /* 显式应用索引：user 在 idx=0 时是 NULL，无法区分 */
+    return w;
+}
+
+/* 启动/恢复应用（开始菜单入口） */
+void gw_launch_app(int idx)
+{
+    if (!gw_app_allowed(idx)) return;
+    /* 若已打开则恢复并置前 */
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (w->used && (unsigned long)w->user == (unsigned long)idx) {
+            gw_restore(w);
+            return;
+        }
+    }
+    gw_spawn_app(idx);
+}
+
+/* ==================================================================
+ * 开始菜单鼠标
+ * ================================================================== */
+static int gw_quit = 0;
+
+static int gw_start_menu_mouse(int mx, int my, int buttons)
+{
+    if (!gw_start_menu_active) return 0;
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
+    if (mx < mx0 || mx >= mx0 + mw || my < my0 || my >= my0 + mh) {
+        /* 点击菜单外：关闭菜单（若点击任务栏由桌面层处理，这里交给调用方） */
+        return 0;
+    }
+    if (!(buttons & 1)) return 1;   /* 仅按下时处理；移动/释放不关菜单 */
+
+    if (user_managed()) {
+        for (int action = GW_SESSION_LOCK; action <= GW_SESSION_SWITCH; action++) {
+            int x, y, w, h;
+            gw_menu_session_button(mx0, my0, action, &x, &y, &w, &h);
+            if (mx >= x && mx < x + w && my >= y && my < y + h) {
+                gw_start_menu_active = 0;
+                gw_session_request = action;
+                return 1;
+            }
+        }
+    }
+    int row_h = gw_menu_row_h();   /* 与绘制共用，小屏自动压缩 */
+    int list_y = my0 + gw_menu_list_top();
+    int lw = mw - gw_scale_x(64);
+    int hit = 0;   /* 本次按下是否命中有效项（列表行 / 右侧设置电源重启） */
+    if (mx < mx0 + lw) {
+        int i = (my - list_y) / row_h;
+        /* 与绘制一致：仅响应已绘制的行，避免小分辨率下菜单未绘制的底部区域误触关机/重启 */
+        int max_row = GW_APP_COUNT + 2;
+        if (i >= 0 && i <= max_row && (i >= GW_APP_COUNT || gw_app_allowed(i)) && my >= list_y &&
+            list_y + (i + 1) * row_h <= my0 + mh - gw_scale_y(60)) {
+            hit = 1;
+            gw_start_menu_active = 0;
+            if (i < GW_APP_COUNT)
+                gw_launch_app(i);   /* 0..7 应用（含 Terminal=6、Paint=7） */
+            else if (i == GW_APP_COUNT)
+                gw_quit = 1;   /* 返回终端：退出 GUI 回内核 shell */
+            else if (i == GW_APP_COUNT + 1)
+                system_reboot();   /* 重启：键盘控制器 8042 复位 */
+            else if (i == GW_APP_COUNT + 2)
+                system_shutdown();   /* 关机：ACPI 电源事件 */
+        }
+    } else {
+        /* 右侧设置/电源/重启 */
+        int sh = gw_scale_y(34);
+        int sy0 = my0 + gw_menu_list_top();
+        if (gw_app_allowed(GW_APP_SETTINGS) && my >= sy0 && my < sy0 + sh) {
+            hit = 1;
+            gw_start_menu_active = 0;
+            gw_launch_app(GW_APP_SETTINGS);
+        } else if (my >= sy0 + sh && my < sy0 + sh * 2) {
+            hit = 1;
+            gw_start_menu_active = 0;
+            system_shutdown();   /* 电源：关机 */
+        } else if (my >= sy0 + sh * 2 && my < sy0 + sh * 3) {
+            hit = 1;
+            gw_start_menu_active = 0;
+            system_reboot();     /* 电源：重启 */
+        }
+    }
+    /* 按下但未命中任何有效项 = 点在菜单 rect 内的空白/非交互区（典型：被
+     * 菜单盖住的窗口区域，如 Files 标题栏左段 x∈[12,484) y<130）：
+     * 返回 0 让调用方关闭菜单并把事件继续交给窗口层。老实现一律 return 1
+     * 吞掉——同一标题栏在菜单内的一段完全无响应（不聚焦、拖不动、菜单也
+     * 不关），菜单外的一段却正常，两段行为不一致；且从窗口标题栏起拖的
+     * 拖动第一帧被吞，整段拖动失效（probe_chain CH-13/CH-16 钉此行为）。 */
+    if (!hit) return 0;
+    return 1;
+}
+
+/* 桌面层鼠标处理：返回 1=已处理 */
+int gw_handle_desktop_mouse(int mx, int my, int buttons)
+{
+    /* 按钮按下状态：仅记录“按下的那一帧”，鼠标离开对应按钮区域立即复位，
+     * 避免第二次点击被上一次的按下状态吞掉（开关开始菜单/最小化恢复失效的根因） */
+    static int prev_btn = 0;
+    static int tbtn_prev = 0;
+    if (gw_in_taskbar(my)) {
+        /* 开始菜单内优先 */
+        if (gw_start_menu_mouse(mx, my, buttons)) return 1;
+        /* 开始按钮（优先于“任务栏其他区域关闭菜单”，避免按住 start 时菜单被误关） */
+        if (mx < gw_tb_btn_x0()) {
+            if ((buttons & 1) && !(prev_btn & 1)) {
+                gw_start_menu_active = !gw_start_menu_active;
+                gw_start_toggle++;
+            }
+            prev_btn = buttons;
+            return 1;
+        }
+        /* 点击任务栏其他区域：关闭开始菜单（排除开始按钮区域后） */
+        if (gw_start_menu_active && (buttons & 1))
+            gw_start_menu_active = 0;
+        prev_btn = 0;   /* 不在开始按钮上：清除按下状态 */
+        /* 任务按钮：与 gw_draw_taskbar 绘制顺序一致（含最小化窗口），
+         * 点击聚焦窗口=最小化，点击非聚焦/最小化窗口=恢复置顶 */
+        for (int btn = 0; ; btn++) {
+            gw_window_t *w; int bx, tw;
+            if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+            if (mx >= bx && mx < bx + tw) {
+                if ((buttons & 1) && !(tbtn_prev & 1)) {
+                    if (w->focused && !w->hidden) gw_minimize(w);
+                    else { gw_restore(w); gw_bring_front(w); }
+                }
+                tbtn_prev = buttons;
+                return 1;
+            }
+        }
+        tbtn_prev = 0;   /* 不在任务按钮上：清除按下状态 */
+        /* 时钟区：无操作 */
+        return 1;
+    }
+    /* 鼠标不在任务栏：复位按钮状态 */
+    prev_btn = 0;
+    tbtn_prev = 0;
+    /* Ubuntu Dock（GNOME 主题）：左侧竖排应用图标，点击启动/恢复 */
+    if (gw_theme_gnome() && mx < gw_dock_w() && my >= gw_desktop_top()) {
+        static int dock_prev = 0;
+        if ((buttons & 1) && !(dock_prev & 1)) {
+            for (int i = 0; i < GW_APP_COUNT; i++) {
+                int ix, iy, sz;
+                if (!gw_dock_icon_rect(i, &ix, &iy, &sz)) break;
+                if (mx >= ix && mx < ix + sz && my >= iy && my < iy + sz) {
+                    gw_launch_app(i);
+                    break;
+                }
+            }
+        }
+        dock_prev = buttons;
+        return 1;
+    }
+    return 0;
+}
+
+/* ==================================================================
+ * 窗口层鼠标 / 键盘
+ * ================================================================== */
+/* 是否有窗口正处于标题栏拖动态（按住标题栏移动中） */
+static int gw_any_moving(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].moving) return 1;
+    return 0;
+}
+
+/* 释按即终 drag：无论光标落在哪（命中容差外/任务栏/图标/开始菜单上）
+ * 都必须清除 moving。漏清的后果是拖动态残留：主循环每帧按 dragging
+ * 合并重绘窗口区（闪），且下次按下复用陈旧 move_dx → 窗口跳位 */
+static void gw_end_drags(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].moving) {
+            gw_windows[i].moving = 0;
+            gw_dirty = 1;
+        }
+}
+
+void gw_handle_mouse(int mx, int my, int buttons)
+{
+    static int last_btn = 0;
+    int pressed = (buttons & 1) && !(last_btn & 1);
+    int released = !(buttons & 1) && (last_btn & 1);
+
+    /* 拖动中：桌面层拦截（开始菜单/任务栏/图标双击）一律让位给拖动态。
+     * 否则窗口拖到图标列即死锁：光标在图标上→事件被图标吞→窗口收不到
+     * 位移→永远盖不住图标→永远被吞。实测窗口停在图标列右缘（x=124，
+     * 841px 宽的窗口盖不住 106px 宽的图标列），回拖时光标掠过图标列
+     * 的部分也全部丢事件 */
+    if (!gw_any_moving()) {
+        /* 开始菜单打开时：菜单区域点击优先交给菜单处理（应用项 / 返回终端 / 设置 / 电源） */
+        if (gw_start_menu_active && !gw_in_taskbar(my)) {
+            if (gw_start_menu_mouse(mx, my, buttons)) { last_btn = buttons; return; }
+            if (pressed) gw_start_menu_active = 0;   /* 点击菜单外桌面（按下沿）：关闭菜单 */
+        }
+
+        /* 任务栏区域：开始按钮开关菜单 + 窗口按钮切换（聚焦窗口点击=最小化，
+         * 非聚焦/最小化窗口点击=恢复置顶） */
+        if (gw_in_taskbar(my)) {
+            if (pressed) {
+                if (mx >= 4 && mx < gw_tb_btn_x0()) {
+                    gw_start_menu_active = !gw_start_menu_active;
+                    gw_start_toggle2++;
+                } else {
+                    for (int btn = 0; ; btn++) {
+                        gw_window_t *w; int bx, tw;
+                        if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+                        if (mx >= bx && mx < bx + tw) {
+                            if (w->focused && !w->hidden) gw_minimize(w);
+                            else { gw_restore(w); gw_bring_front(w); }
+                            break;
+                        }
+                    }
+                }
+                gw_dirty = 1;
+            }
+            last_btn = buttons;
+            return;
+        }
+
+        /* 桌面图标双击启动（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
+        if (!gw_in_taskbar(my)) {
+            int hit_icon = 0;
+            for (int i = 0; i < GW_DESK_ICONS; i++) {
+                int ix, iy, iw, ih;
+                if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
+                if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
+                    if (gw_icon_covered(ix, iy, iw, ih)) continue;   /* 被窗口覆盖：跳过图标，交给窗口命中 */
+                    hit_icon = 1;
+                    if (pressed) {
+                        /* 双击判定：400ms 内两次按下同一图标才启动 */
+                        static uint32_t last_ico_tick = 0;
+                        static int last_ico_idx = -1;
+                        uint32_t now = gw_now();
+                        if (i == last_ico_idx && now - last_ico_tick < 400) {
+                            last_ico_idx = -1;
+                            if (gw_desktop_icon_app[i] >= 0)
+                                gw_launch_app(gw_desktop_icon_app[i]);
+                            else
+                                gw_launch_game(gw_desktop_icon_game[i]);
+                        } else {
+                            last_ico_idx = i;
+                            last_ico_tick = now;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (hit_icon) { last_btn = buttons; return; }
+        }
+    }
+
+    /* ★ 拖动 = 指针抓取（pointer grab）：**左键没松，拖拽就归该窗独占**，
+     * 不再要求光标留在标题栏附近的容差盒里。
+     *
+     * 老实现用 ±8/±16 的容差盒去找"拖动中的窗口"，等价于给单包位移设了
+     * 上限：向上拖要求 step <= move_dy+8，向下拖要求 step < 20-move_dy。
+     * 于是快速拖动（真机 PS/2 100Hz 甩动单包可达 20px）会当场掉出容差，
+     * hit 落到别的窗口/桌面，拖动态再也找不回来——窗口一步不动，直到释按
+     * 收场。实测（2026-10-24 combo2 C8 op#70，drag(slot1 clock -> 0,83)，
+     * 12px 步进向上拖）：模型认为窗口到了 (0,83)，内核还停在 (581,467)；
+     * tests/dbg_dragv.py 用 20px 步进复现同一条路径。
+     *
+     * 抓取期间不做任何几何判据：拖过任务栏/桌面图标/别的窗口都不中断，
+     * 统一由释按（gw_end_drags）收场。 */
+    gw_window_t *hit = NULL;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (w->used && !w->hidden && w->moving) {
+            if (!(buttons & 1)) {
+                /* 按钮已松：清残留并吞掉本次释按。不能让它继续往下走——
+                 * 否则释按会被当成一次内容区 click 派发给光标下的窗口 */
+                gw_end_drags();
+                last_btn = buttons;
+                return;
+            }
+            hit = w;
+            break;
+        }
+    }
+    if (!hit) {
+        /* 从最上层（聚焦）窗口开始命中测试 */
+        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+            gw_window_t *w = &gw_windows[i];
+            if (!w->used || w->hidden) continue;
+            if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + w->h) {
+                hit = w;
+                if (w->focused) break;   /* 聚焦窗口优先 */
+            }
+        }
+    }
+    if (!hit) {
+        /* 桌面空白：恢复**slot 最小**的最小化窗口（按 slot 序扫，第一个
+         * hidden 的就是它）——不是"最近最小化的那个"。probe_fuzz A3 钉死
+         * 这条语义：先最小化 slot1 再最小化 slot0，点桌面恢复的是 slot0。 */
+        if (pressed) {
+            /* 标题栏按钮（关/最小）的连点第二次：吞掉，不恢复任何窗口
+             * ——否则"连点最小化"= 最小化后立刻被恢复（见 gw_tbtn_consume） */
+            if (gw_tbtn_consume(mx, my)) {
+                last_btn = buttons;
+                return;
+            }
+            for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+                gw_window_t *w = &gw_windows[i];
+                if (w->used && w->hidden) { gw_restore(w); break; }
+            }
+        }
+        last_btn = buttons;
+        return;
+    }
+
+    int title_btn = gw_title_btn_hit(hit, mx, my);
+    if (title_btn) {
+        if (pressed) {
+            if (title_btn == 2) { gw_close(hit); gw_tbtn_arm(mx, my); }
+            else if (title_btn == 1) { gw_minimize(hit); gw_tbtn_arm(mx, my); }
+        }
+        last_btn = buttons;
+        return;
+    }
+
+    /* 标题栏（或已被抓取的拖动态）进入拖动分支。
+     * hit->moving 为真是抓取态：光标在哪都不影响（见上方 pointer grab
+     * 的说明），所以这里不需要任何容差判据。 */
+    if (hit->moving || my < hit->y + GW_TITLE_H) {
+        /* 标题栏双击：最大化/还原（400ms 内两次按下同一窗口标题栏） */
+        static uint32_t last_title_tick = 0;
+        static gw_window_t *last_title_wnd = NULL;
+        if (pressed) {
+            /* 拖动非焦点窗口必须先置顶：否则窗口视觉仍被上层盖住，
+             * 拖动中它的移动与画面脱节（组合场景：B 盖着 A，拖 A 跳） */
+            gw_bring_front(hit);
+            uint32_t now = gw_now();
+            if (hit == last_title_wnd && now - last_title_tick < 400) {
+                gw_toggle_max(hit);
+                last_title_wnd = NULL;   /* 防三击连触发 */
+                last_btn = buttons;
+                return;
+            }
+            last_title_tick = now;
+            last_title_wnd = hit;
+        }
+        /* 标题栏拖动：实时跟随——拖动中直接更新窗口位置，主循环合并区域重绘 */
+        if (buttons & 1) {
+            if (!hit->moving) {
+                hit->moving = 1;
+                hit->move_dx = mx - hit->x;
+                hit->move_dy = my - hit->y;
+                hit->ghost_x = hit->x;   /* 记录上一帧位置，供主循环区域重绘 */
+                hit->ghost_y = hit->y;
+            }
+            if (!(hit->flags & GW_F_MOVABLE) || hit->maximized) {
+                hit->moving = 0;
+            } else {
+                int nx = mx - hit->move_dx;
+                int ny = my - hit->move_dy;
+                if (ny + hit->h > gw_desktop_bottom()) ny = gw_desktop_bottom() - hit->h;
+                if (nx + hit->w > gw_desktop_right()) nx = gw_desktop_right() - hit->w;
+                if (nx < gw_desktop_left()) nx = gw_desktop_left();
+                if (ny < gw_desktop_top()) ny = gw_desktop_top();
+                hit->x = nx;   /* 实时跟随：窗口本体随鼠标移动 */
+                hit->y = ny;
+                /* 边界钳制后按新位置重校准偏移，保证鼠标不会滑出标题栏导致拖动中断 */
+                hit->move_dx = mx - hit->x;
+                hit->move_dy = my - hit->y;
+            }
+        }
+        /* 释按终 drag 已在入口统一处理（gw_end_drags）：容差外/任务栏/图标上
+         * 释按同样清得干净，拖动态不残留、下次拖动不会跳位 */
+        last_btn = buttons;
+        return;
+    }
+
+    /* 内容区 */
+    if (pressed) {
+        gw_bring_front(hit);
+        if (hit->mousedown) hit->mousedown(hit, mx - gw_ox(hit), my - gw_oy(hit));
+    } else if (released) {
+        if (hit->click) hit->click(hit, mx - gw_ox(hit), my - gw_oy(hit));
+    }
+    /* 内容区鼠标移动回调（Paint 拖画：每帧调用，回调内自行读按键状态） */
+    if (hit->mousemove)
+        hit->mousemove(hit, mx - gw_ox(hit), my - gw_oy(hit));
+    /* 释按即终 drag：无论释按落在内容区/容差外/任务栏/图标上，都要清干净。
+     * gw_handle_desktop_mouse 先返回 1 时本函数不会被调用，故主循环里还有
+     * 一道兜底（见 gw_run 的 btn_released 分支）——两处合一保证 moving 不残留 */
+    if (released) gw_end_drags();
+    last_btn = buttons;
+}
+
+/* ==================================================================
+ * 窗口状态串口转储（F12 触发，探针对账用）
+ * ------------------------------------------------------------------
+ * 为什么需要：GUI 探针（tests/probe_*.py）必须与内核**真实**窗口状态
+ * 逐字段对账，否则"模型说关掉了、屏幕上也没了"这种一致性假象无法
+ * 区分是探针模型错了还是内核真有 bug。2026-10-24 实测 C7 场景：
+ * 探针模型说 notepad 已关闭，内核里它其实还在屏上（只是失焦），
+ * 光看截图分不清是谁错——有了这份转储，一次 F12 就能定位到是
+ * 模型错位还是内核行为与模型不符。
+ *
+ * 通道：**必须** serial_write 直写 COM1。GUI 模式下 terminal_writestring
+ * 已被 g_gfx_hook 重定向进 GUI 终端窗口缓冲，ezos_console_write 的输出
+ * 永远不进串口（见 ezos_console_write 的重定向链）。
+ *
+ * 格式：每行 [GW] 前缀 + 空格分隔的 key=value，机器可解析：
+ *   [GW] seq=7 n=3 focus=1 menu=0 mx=640 my=512 cgap=1
+ *   [GW] w slot=0 app=1 x=116 y=97 w=760 h=640 hid=0 foc=0 max=0
+ *   [GW] end
+ * seq= 自增序号：探针按 F12 后只认**自己那一份**（seq 等于它发出的
+ *       F12 次数），避免拿"上一次迟到"的转储跟当前模型比出假漂移。
+ * cgap= 光标"消失窗口"最大值(ms)：主循环里 擦除旧光标->重画光标 的
+ *       最大间隔。放在所有重绘之后擦（2026-10-25 修"鼠标有时候会
+ *       消失"）后应恒为 0-2；老大则说明又回到"重绘前擦光标"了。
+ * focus=99 表示无聚焦窗；app=99 表示非应用窗口（gw_create 直接建、
+ *         没走 gw_spawn_app）；tbx=-1 表示该窗口没有任务栏按钮。
+ * ================================================================== */
+static int gw_sdec(char *b, int n, uint32_t v)
+{
+    char tmp[12];
+    int t = 0;
+    if (!v) tmp[t++] = '0';
+    while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+    while (t) b[n++] = tmp[--t];
+    return n;
+}
+
+static int gw_skey(char *b, int n, const char *k)
+{
+    while (*k) b[n++] = *k++;
+    return n;
+}
+
+static void gw_dump_state_serial(void)
+{
+    char buf[256];
+    int n, i, used = 0, fslot = 99;
+    /* 自增序号：探针按 F12 后会**等自己那一份**转储。若内核忙/串口缓冲慢，
+     * 探针可能先读到**上一次请求迟到**的转储——拿旧状态跟当前模型比就会
+     * 报出根本不存在的"状态漂移"（2026-10-24 C8 op#75 实测：模型刚拖动
+     * 完的位置 vs 上一拍的旧转储 -> 假红）。seq 让探针能精确认领自己的
+     * 那一份，读不到就继续等，而不是拿旧的凑合。 */
+    static uint32_t seq = 0;
+    seq++;
+
+    for (i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used) used++;
+    /* 聚焦 slot：与探针模型的 focused 语义一致（gw_bring_front 唯一
+     * 置 focused=1 的地方；gw_minimize/gw_close 会清掉） */
+    for (i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && gw_windows[i].focused) { fslot = i; break; }
+
+    n = 0;
+    n = gw_skey(buf, n, "[GW] seq=");
+    n = gw_sdec(buf, n, seq);
+    n = gw_skey(buf, n, " n=");
+    n = gw_sdec(buf, n, (uint32_t)used);
+    n = gw_skey(buf, n, " focus=");
+    n = gw_sdec(buf, n, (uint32_t)fslot);
+    n = gw_skey(buf, n, " menu=");
+    n = gw_sdec(buf, n, gw_start_menu_active ? 1u : 0u);
+    n = gw_skey(buf, n, " mx=");
+    n = gw_sdec(buf, n, (uint32_t)mouse_get_x());
+    n = gw_skey(buf, n, " my=");
+    n = gw_sdec(buf, n, (uint32_t)mouse_get_y());
+    /* cgap= 光标消失窗口最大值(ms)：擦除旧光标 -> 重画光标 的最大间隔。
+     * 探针 probe_cursor.py 断言它足够小（老实现点一次鼠标=全屏重绘
+     * 100-300ms，修复后只剩微秒级的擦+存+画）。 */
+    n = gw_skey(buf, n, " cgap=");
+    n = gw_sdec(buf, n, gw_cur_gap_max);
+    /* evd= 按键沿事件队列被丢弃的条数（队列满）：非 0 说明有"按下沿"
+     * 在补派发前就丢了（点击丢失类故障的硬指标，探针按它判红）
+     * tr= 按键变迁总次数；raw= 收到的 PS/2 原始字节数；pkt= 拼成的完整包数
+     * （raw 与 3*pkt 的差额 = 丢掉的字节，能定位"点击在驱动层被吞"） */
+    n = gw_skey(buf, n, " evd=");
+    n = gw_sdec(buf, n, mouse_btn_ev_dropped());
+    n = gw_skey(buf, n, " tr=");
+    n = gw_sdec(buf, n, mouse_btn_trans_count());
+    n = gw_skey(buf, n, " raw=");
+    n = gw_sdec(buf, n, mouse_raw_total());
+    n = gw_skey(buf, n, " pkt=");
+    n = gw_sdec(buf, n, mouse_packet_count());
+    n = gw_skey(buf, n, " ep=");
+    n = gw_sdec(buf, n, gw_evt_popped);
+    n = gw_skey(buf, n, " tg=");
+    n = gw_sdec(buf, n, gw_start_toggle);
+    n = gw_skey(buf, n, " t2=");
+    n = gw_sdec(buf, n, gw_start_toggle2);
+    n = gw_skey(buf, n, " dp=");
+    n = gw_sdec(buf, n, gw_dispatch_cnt);
+    buf[n++] = '\n';
+    buf[n] = 0;
+    serial_write(buf);
+
+    for (i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used) continue;
+        n = 0;
+        n = gw_skey(buf, n, "[GW] w slot=");
+        n = gw_sdec(buf, n, (uint32_t)i);
+        n = gw_skey(buf, n, " app=");
+        n = gw_sdec(buf, n, w->app >= 0 ? (uint32_t)w->app : 99u);
+        n = gw_skey(buf, n, " x=");
+        n = gw_sdec(buf, n, (uint32_t)w->x);
+        n = gw_skey(buf, n, " y=");
+        n = gw_sdec(buf, n, (uint32_t)w->y);
+        n = gw_skey(buf, n, " w=");
+        n = gw_sdec(buf, n, (uint32_t)w->w);
+        n = gw_skey(buf, n, " h=");
+        n = gw_sdec(buf, n, (uint32_t)w->h);
+        n = gw_skey(buf, n, " hid=");
+        n = gw_sdec(buf, n, w->hidden ? 1u : 0u);
+        n = gw_skey(buf, n, " foc=");
+        n = gw_sdec(buf, n, w->focused ? 1u : 0u);
+        n = gw_skey(buf, n, " max=");
+        n = gw_sdec(buf, n, w->maximized ? 1u : 0u);
+        /* 任务栏按钮矩形：探针要按**内核真值**恢复最小化窗 / 点关闭，
+         * 用模型算的位置会落到别的按钮上——按钮宽度上限内核是
+         * gw_scale_x(180)=360，探针模型一直写的 180，标题一长就错位。 */
+        {
+            int tbx = -1, tw = 0;
+            for (int b = 0; ; b++) {
+                gw_window_t *bw;
+                if (!gw_taskbar_btn_rect(b, &bw, &tbx, &tw)) { tbx = -1; tw = 0; break; }
+                if (bw == w) break;
+            }
+            n = gw_skey(buf, n, " tbx=");
+            n = gw_sdec(buf, n, (uint32_t)tbx);
+            n = gw_skey(buf, n, " tw=");
+            n = gw_sdec(buf, n, (uint32_t)tw);
+        }
+        buf[n++] = '\n';
+        buf[n] = 0;
+        serial_write(buf);
+    }
+    serial_write("[GW] end\n");
+}
+
+void gw_handle_key(int key)
+{
+    if (user_managed() && key == KEY_F10) {
+        gw_start_menu_active = !gw_start_menu_active;
+        return;
+    }
+    if (user_managed() && gw_start_menu_active &&
+        (key == 'l' || key == 'L' || key == 'u' || key == 'U')) {
+        gw_session_request = (key == 'l' || key == 'L') ? GW_SESSION_LOCK : GW_SESSION_SWITCH;
+        gw_start_menu_active = 0;
+        return;
+    }
+    /* F12：窗口状态串口转储（探针对账用）。必须在**任何**窗口焦点状态
+     * 下都能触发——放在转发给应用 key 回调之前，否则有焦点窗口时
+     * 键会被应用吃掉（Notepad/Terminal 都会吞字符）。 */
+    if (key == KEY_F12) { gw_dump_state_serial(); return; }
+
+    /* Alt+Tab：循环切换到下一个可见窗口 */
+    if (key == KEY_ALT_TAB) {
+        int start = 0;
+        for (int i = 0; i < GW_MAX_WINDOWS; i++)
+            if (gw_focused_wnd == &gw_windows[i]) { start = i; break; }
+        for (int k = 1; k <= GW_MAX_WINDOWS; k++) {
+            gw_window_t *w = &gw_windows[(start + k) % GW_MAX_WINDOWS];
+            if (w->used && !w->hidden) {
+                if (w != gw_focused_wnd) gw_bring_front(w);
+                gw_dirty = 1;
+                return;
+            }
+        }
+        return;
+    }
+    if (!gw_focused_wnd) {
+        /* 桌面调试热键（排障复现用，正式版可移除）：
+         * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  b=Browser  q=退出GUI回终端 */
+        if (key == 'm' || key == 'M') { gw_start_menu_active = !gw_start_menu_active; return; }
+        if (key == 'q' || key == 'Q') { gw_quit = 1; return; }
+        if (key == 't' || key == 'T') { gw_launch_app(GW_APP_TERMINAL); return; }
+        if (key == 'b' || key == 'B') { gw_launch_app(GW_APP_BROWSER); return; }
+        if (key == 's' || key == 'S' || key == 'd' || key == 'D') {
+            gw_launch_game((key == 's' || key == 'S') ? 3 : 4);
+            return;
+        }
+    }
+    if (gw_focused_wnd && gw_focused_wnd->key)
+        gw_focused_wnd->key(gw_focused_wnd, key);
+}
+
+/* ==================================================================
+ * 控件
+ * ================================================================== */
+
+void gw_button_ex(int x, int y, int w, int h, const char *label, uint8_t color, int pressed)
+{
+    uint32_t base = gw_accent;
+    if (color == GW_C_GRAY_SLIDER) base = 0xE6E6E6u;
+    else if (color == 0x0F) base = 0xFFFFFFu;
+    gw_fill(x, y, w, h, pressed ? gw_accent_dark : base);
+    if (pressed || color != GW_C_GRAY_SLIDER)
+        gw_frame(x, y, w, h, gw_accent_dark);
+    else
+        gw_frame(x, y, w, h, 0xC8C8C8u);
+    int tx = x + (w - gw_strlen(label) * 8) / 2;
+    int ty = y + (h - 8) / 2 + (pressed ? 1 : 0);
+    gfx_draw_text(tx, ty, label, (color == GW_C_GRAY_SLIDER) ? 0x00 : 0x0F, pressed ? (uint8_t)GW_C_BLUE_DARK : color);
+}
+
+void gw_button(int x, int y, int w, int h, const char *label, uint8_t color)
+{
+    gw_button_ex(x, y, w, h, label, color, 0);
+}
+
+void gw_scrollbar(int x, int y, int h, int thumb_y, int thumb_h, uint8_t color)
+{
+    (void)color;
+    gw_fill(x, y, 6, h, 0xE8E8E8u);
+    if (thumb_h < 8) thumb_h = 8;
+    if (thumb_h > h) thumb_h = h;
+    if (thumb_y < 0) thumb_y = 0;
+    if (thumb_y + thumb_h > h) thumb_y = h - thumb_h;
+    if (thumb_y < 0) thumb_y = 0;
+    gw_fill(x + 1, y + thumb_y, 4, thumb_h, 0xB0B0B0u);
+}
+
+/* ==================================================================
+ * 每帧绘制
+ * ================================================================== */
+void gw_draw_all(void)
+{
+    gw_dmg_add(0, 0, GFX_W, GFX_H);   /* 全屏重绘：损伤=全屏（旧光标精灵必被覆盖） */
+    gw_draw_desktop();
+
+    /* 非聚焦窗口先画，聚焦窗口后画 */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+            gw_window_t *w = &gw_windows[i];
+            if (!w->used || w->hidden) continue;
+            int is_focused = w->focused;
+            if ((pass == 0 && is_focused) || (pass == 1 && !is_focused)) continue;
+            gw_draw_window(w);
+        }
+    }
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (w->used && w->moving)
+            gw_draw_ghost(w);
+    }
+
+    gw_draw_taskbar();
+    if (gw_start_menu_active)
+        gw_draw_start_menu();
+
+    gw_last_icon_hover = -1;   /* 全屏重绘后图标 hover 状态失效，待下次鼠标移动重建 */
+    /* 注意：不再置 gw_cursor_bg_valid=0。全屏重绘的损伤已由开头的
+     * gw_dmg_add(全屏) 登记，gw_cursor_restore_bg_excl 会正确地不恢复
+     * 任何像素（精灵已被新画面覆盖）。老实现在这里无脑失效：局部重绘
+     * （gw_redraw_region）若只部分盖住旧光标，剩下半个精灵永远擦不掉，
+     * 成为粘在原地的残影——2026-10-25 修"鼠标消失"前的真实缺陷。 */
+}
+
+/* 桌面层局部重绘（只覆盖 rect 内像素）。
+ * gw_draw_desktop() 是无条件全屏（壁纸 + 水印 + Dock + 13 个图标）。
+ * 拖动窗口时主循环每帧调 gw_redraw_region，老实现它第一件事就是全屏画
+ * 桌面——等于每帧把整屏擦一遍再画窗口，扫描线上看到的就是"桌面闪过 →
+ * 窗口才出现"的持续闪动（2026-10-25 用户报"闪动还是太严重"的根因；
+ * 此前被误判成 screendump 抓中间帧，只加了截图等待掩盖症状）。
+ * 这里只碰 rect 内：壁纸按**绝对 y** 插值（gw_fill_vgrad 内部基准是
+ * 相对 j，直接套用会把颜色算错、接缝可见），水印/图标仅在与 rect
+ * 相交时才画。GNOME 主题的右下角橙环与左侧 Dock 无法廉价局部化，
+ * 回退全屏（GNOME 非默认主题，默认 Win10 走局部）。 */
+static void gw_redraw_desktop_region(int x, int y, int w, int h)
+{
+    int mx, my;
+
+    if (w <= 0 || h <= 0) return;
+    mx = mouse_get_x(); my = mouse_get_y();
+
+    if (gw_theme_gnome()) { gw_draw_desktop(); return; }
+
+    /* Win10 深蓝渐变壁纸：逐行颜色与 gw_fill_vgrad(0,0,GFX_W,GFX_H,
+     * 0x0C7BD5, 0x063B66) 一致，插值基准必须用绝对 y */
+    {
+        int tr = 0x0C, tg = 0x7B, tb = 0xD5;
+        int br = 0x06, bg = 0x3B, bb = 0x66;
+        for (int yy = y; yy < y + h; yy++) {
+            int a, ia;
+            uint32_t c;
+            if (yy < 0 || yy >= GFX_H) continue;
+            a = yy * 255 / (GFX_H - 1); ia = 255 - a;
+            c = (uint32_t)(((tr * ia + br * a) / 255) << 16)
+              | (uint32_t)(((tg * ia + bg * a) / 255) << 8)
+              | (uint32_t)(((tb * ia + bb * a) / 255));
+            gw_fill(x, yy, w, 1, c);
+        }
+    }
+    /* 右下角水印（仅相交时重画） */
+    {
+        int wx = GFX_W - gw_scale_x(60), wy = gw_desktop_bottom() - 12;
+        if (wx < x + w && wx + 7 * 8 > x && wy < y + h && wy + 8 > y)
+            gfx_draw_text(wx, wy, "Cerulia", 0x0F, 0x0B);
+    }
+    /* 桌面图标：只画与 rect 相交的（hover 高亮取当前鼠标位，与全屏路径一致） */
+    for (int i = 0; i < GW_DESK_ICONS; i++) {
+        int ix, iy, iw, ih;
+        if (!gw_desktop_icon_rect(i, &ix, &iy, &iw, &ih)) continue;
+        if (ix < x + w && ix + iw > x && iy < y + h && iy + ih > y)
+            gw_draw_desktop_icon(i, mx, my);
+    }
+}
+
+/* 拖动中的窗口平移：显存内整块搬移（32 位块拷贝），只重画旧位置露出的
+ * 窄带。
+ *
+ * 老实现每帧用"旧位置∪新位置"的合并区重绘：局部桌面 + **整窗内容全量
+ * 重画** ≈ 1.1M 像素/帧（880x640 的窗口，含数千次文字/图标/渐变调用）。
+ * QEMU TCG 下单帧 200-400ms，超过鼠标包间隔（真机 PS/2 100Hz 只有 10ms）
+ * —— screendump 与肉眼都会持续看到"桌面已擦、窗口还没画完"的半成品帧，
+ * 即用户报的"闪动还是太严重"。2026-10-25 dbg_flicker.py 实测：24 帧里
+ * 4 成不完整，内容匹配率最低掉到 19%，帧间 diff 峰值 47 万像素。
+ *
+ * 窗口平移时**内容相对窗口不变**，逐行搬移即可；只有旧位置露出的 |d|
+ * 像素窄带需要真正重绘（露出的是桌面/被本窗盖住的窗口，交给
+ * gw_redraw_region 恢复）。每帧工作量降到一次矩形搬运 + 一条 6px 窄带。
+ *
+ * 纯横/纯竖走本快路径；斜向回退合并区重绘（L 形差集不值得写第二套
+ * 逻辑，且斜拖帧率低、用户容忍度高）。
+ *
+ * 注意：拖动中窗口内 hover 不再逐帧刷新（blit 保留上一帧像素）——拖动
+ * 时鼠标相对窗口的位置几乎不变，hover 态本就稳定，影响可忽略。 */
+static void gw_blit_rect(int sx, int sy, int dx, int dy, int w, int h)
+{
+    int pxsz = (gfx_bpp == 4) ? 4 : (gfx_bpp == 2 ? 2 : 1);
+    int stride = (gfx_bpp == 4) ? (int)gfx_stride : GFX_W;
+    uint8_t *fb = (uint8_t *)gfx_fb;
+    int row_bytes = w * pxsz;
+    int n = row_bytes / 4;               /* 32 位块数；窗口宽 ≥240，行字节数必为 4 的倍数 */
+    int j0 = (dy > 0) ? h - 1 : 0;       /* 目标在下：从后往前，防行间覆盖 */
+    int jd = (dy > 0) ? -1 : 1;
+    int i0 = (dx > 0) ? n - 1 : 0;       /* 目标在右：从后往前，防行内覆盖 */
+    int id = (dx > 0) ? -1 : 1;
+
+    if (n <= 0) return;
+    for (int jj = 0; jj < h; jj++) {
+        int j = j0 + jj * jd;
+        int sy_j = sy + j, ty_j = dy + j;
+        if (sy_j < 0 || sy_j >= GFX_H || ty_j < 0 || ty_j >= GFX_H) continue;
+        {
+            uint32_t *s = (uint32_t *)(fb + (uint32_t)sy_j * stride * pxsz
+                                       + (uint32_t)sx * pxsz);
+            uint32_t *d = (uint32_t *)(fb + (uint32_t)ty_j * stride * pxsz
+                                       + (uint32_t)dx * pxsz);
+            for (int ii = 0; ii < n; ii++) {
+                int i = i0 + ii * id;
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
+static void gw_drag_move(gw_window_t *w)
+{
+    int ox = w->ghost_x, oy = w->ghost_y;
+    int nx = w->x, ny = w->y;
+    int dx = nx - ox, dy = ny - oy;
+
+    w->ghost_x = nx;
+    w->ghost_y = ny;
+    if (dx == 0 && dy == 0) return;
+
+    if (dx != 0 && dy != 0) {
+        int rx = (dx < 0) ? nx : ox;
+        int ry = (dy < 0) ? ny : oy;
+        gw_redraw_region(rx, ry, w->w + (dx < 0 ? -dx : dx),
+                         w->h + (dy < 0 ? -dy : dy));
+        return;
+    }
+
+    /* 1. 显存内搬移整个窗口矩形。旧光标精灵**不**在 blit 前整块擦：
+     *    擦除到收尾重画之间隔着 blit+窄带重绘，WHPX 实测 59ms 光标消失。
+     *    改为 blit 后按缓存洗回"精灵下的内容"：缓存正是精灵下的背景，
+     *    也就是 blit 本该搬过去的内容，逐像素对号入座（被搬进 blit 框内
+     *    的洗到 +dx/+dy，框外没被搬走的原地洗）。精灵全程留在 LFB
+     *    （只被搬走一帧），消失窗口≈0。前提是本帧此前没有重绘动过精灵
+     *    区（缓存仍是原背景），有则退回老路 blit 前先擦。
+     *    洗完缓存失效：它描述的是旧位置，收尾 save_bg 按新位置重建。 */
+    int carry_ok = (gw_dmg_n == 0 && gw_cursor_bg_valid);
+    if (!carry_ok) {
+        /* 老路：blit 前先擦（缓存可能过期，或精灵区已被本帧重绘动过）；
+         * blit 前擦才不会把精灵像素搬到新位置粘住。 */
+        gw_cursor_restore_bg();
+    }
+    gw_dmg_add(ox < nx ? ox : nx, oy < ny ? oy : ny,
+               w->w + (dx < 0 ? -dx : dx), w->h + (dy < 0 ? -dy : dy));
+    gw_blit_rect(ox, oy, nx, ny, w->w, w->h);
+    if (carry_ok) {
+        for (int j = 0; j < 16; j++) {
+            for (int i = 0; i < 16; i++) {
+                int x = gw_cursor_bg_x + i, y = gw_cursor_bg_y + j;
+                int tx = x, ty = y;
+                if (x >= ox && x < ox + w->w && y >= oy && y < oy + w->h) {
+                    tx = x + dx; ty = y + dy;
+                }
+                if (tx < 0 || tx >= GFX_W || ty < 0 || ty >= GFX_H) continue;
+                uint32_t v = gw_cursor_bg[j * 16 + i];
+                if (gfx_bpp == 2)
+                    ((uint16_t*)gfx_fb)[ty * GFX_W + tx] = (uint16_t)v;
+                else if (gfx_bpp == 4)
+                    ((uint32_t*)gfx_fb)[(uint32_t)ty * gfx_stride + tx] = v;
+                else
+                    gfx_fb[ty * GFX_W + tx] = (uint8_t)v;
+            }
+        }
+        gw_cursor_bg_valid = 0;
+    }
+
+    /* 2. 旧位置露出的窄带：重绘成桌面/被盖窗口 */
+    if (dy > 0)
+        gw_redraw_region(ox, oy, w->w, dy);
+    else if (dy < 0)
+        gw_redraw_region(ox, oy + w->h + dy, w->w, -dy);
+    else if (dx > 0)
+        gw_redraw_region(ox, oy, dx, w->h);
+    else
+        gw_redraw_region(ox + w->w + dx, oy, -dx, w->h);
+}
+
+/* 局部区域重绘：桌面渐变（仅 rect 内）+ 相交图标 + 相交窗口（非聚焦先画）
+ * + 任务栏 + 开始菜单 */
+void gw_redraw_region(int x, int y, int w, int h)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+
+    /* 壁纸在 rect 内不透明铺满 + 相交窗口/任务栏/菜单整块重画：
+     * 整个 rect 都是损伤。旧光标精灵落在 rect 内的部分已被新内容覆盖
+     * （不能按缓存恢复，那是旧内容）；落在 rect 外的部分本函数没碰，
+     * 由主循环收尾的 gw_cursor_restore_bg_excl 安全擦除。 */
+    gw_dmg_add(x, y, w, h);
+    gw_redraw_desktop_region(x, y, w, h);
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+            gw_window_t *wi = &gw_windows[i];
+            if (!wi->used || wi->hidden) continue;
+            int is_focused = wi->focused;
+            if ((pass == 0 && is_focused) || (pass == 1 && !is_focused)) continue;
+            if (wi->x < x + w && wi->x + wi->w > x && wi->y < y + h && wi->y + wi->h > y)
+                gw_draw_window(wi);
+        }
+    }
+
+    int th = gw_taskbar_h();
+    if (y + h > GFX_H - th) gw_draw_taskbar();
+    if (gw_start_menu_active) {
+        int mw = gw_scale_x(300);
+        int mh = GFX_H - th - gw_scale_y(8);
+        int mx0 = gw_scale_x(6), my0 = GFX_H - th - mh - 2;
+        if (mx0 < x + w && mx0 + mw > x && my0 < y + h && my0 + mh > y)
+            gw_draw_start_menu();
+    }
+    /* 不再置 gw_cursor_bg_valid=0：本函数只重绘 rect 内，rect 外的旧
+     * 光标精灵还得靠缓存擦（见 gw_cursor_restore_bg_excl）。 */
+}
+
+/* ==================================================================
+ * 开机过渡动画
+ * ================================================================== */
+static void gw_boot_delay(void)
+{
+    volatile uint32_t n = 0;
+    while (n < 8000000u) n++;
+}
+
+static void gw_boot_anim(void)
+{
+    int steps = 6;
+    int bw = gw_scale_x(360);
+    if (bw > GFX_W - 40) bw = GFX_W - 40;
+    int bx = (GFX_W - bw) / 2, by = GFX_H / 2 + gw_scale_y(20);
+    int cx = GFX_W / 2, cy = GFX_H / 2 - gw_scale_y(40);
+
+    for (int s = 0; s <= steps; s++) {
+        /* 深蓝背景 */
+        gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x0C7BD5u, 0x042A4Au);
+        /* Logo：四窗格 */
+        int sz = gw_scale_x(48);
+        int lx = cx - sz / 2, ly = cy - sz / 2;
+        gw_fill(lx, ly, sz / 2, sz / 2, 0xFFFFFFu);
+        gw_fill(lx + sz / 2, ly, sz / 2, sz / 2, 0x9BD3F0u);
+        gw_fill(lx, ly + sz / 2, sz / 2, sz / 2, 0x9BD3F0u);
+        gw_fill(lx + sz / 2, ly + sz / 2, sz / 2, sz / 2, 0x0078D7u);
+        /* 标题（居中：7 字符 × 8px / 2 = 28；改品牌名时这里要跟着改） */
+        gfx_draw_text(cx - 28, cy + sz / 2 + gw_scale_y(10), "Cerulia", 0x0F, 0x0B);
+        /* 进度条 */
+        gw_fill(bx, by, bw, gw_scale_y(10), 0x1B3D5Cu);
+        gw_fill(bx, by, bw * s / steps, gw_scale_y(10), 0xFFFFFFu);
+        /* 步骤文字 */
+        static const char *msgs[7] = {
+            "Booting Cerulia...",
+            "Loading kernel modules...",
+            "Probing VBE graphics...",
+            "Initializing window system...",
+            "Starting Win10 desktop...",
+            "Welcome",
+            ""
+        };
+        gfx_draw_text(cx - 11 * 8, by + gw_scale_y(18), msgs[s], 0x0F, 0x0B);
+        gw_boot_delay();
+        if (keyboard_getchar() != 0) break;   /* 任意键跳过 */
+    }
+}
+
+/* ==================================================================
+ * 入口
+ * ================================================================== */
+/* ==================================================================
+ * 终端窗口（GUI 内运行 shell 命令，支持颜色/重定向/管道）
+ * ================================================================== */
+static char term_buf[TERM_ROWS * TERM_COLS];
+static int term_nrows = 0;
+static int term_caret = 0;
+
+/* 终端**实际**列宽。
+ *
+ * 缓冲是 24x80，但窗口常常放不下 80 列（默认 420px 宽的窗口只能画 ~50 列）。
+ * 如果换行按 80 列算、绘制按 50 列画，每行后 30 个字符就被切掉，下一条日志
+ * 接上来显示——开机自检那种一行 60+ 字符的输出看起来就是"整片炸了"。
+ *
+ * 所以换行与绘制必须用**同一个**列宽：打开终端时按窗口内宽算出来，之后
+ * term_newline / term_print / term_draw / 光标定位全部用它。
+ * 上限仍是 TERM_COLS（窗口比 80 列还宽时不跟着变宽，80 是缓冲的行宽）。 */
+static int term_cols = TERM_COLS;
+
+/* [DEBUG-TERMBUF] 临时访问函数：供任务栏调试打印 term_buf/游标状态 */
+void term_dbg_dump(char *hx, int maxb)
+{
+    static const char hd[] = "0123456789ABCDEF";
+    int k = 0, i;
+    for (i = 0; i < maxb && i < TERM_ROWS * TERM_COLS; i++) {
+        unsigned char b = (unsigned char)term_buf[i];
+        hx[k++] = hd[b >> 4];
+        hx[k++] = hd[b & 15];
+    }
+    hx[k] = 0;
+}
+int term_dbg_nrows(void) { return term_nrows; }
+int term_dbg_caret(void) { return term_caret; }
+static char term_input[TERM_INPUT_MAX + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
+static int  term_input_len = 0;
+/* 当前输入在 term_buf 里的起始下标。退格不能越过它——否则会把提示符 "> "
+ * 也擦掉。以前用"光标不在行首"来判断，输入一折行这个判据就失效了。 */
+static int  term_input_base = 0;
+
+/* 命令历史（GUI 终端）：回车提交入栈，Up/Down 翻阅 */
+#define TERM_HIST_MAX 16
+static char term_hist[TERM_HIST_MAX][TERM_INPUT_MAX + 1];
+static int  term_hist_count = 0;
+static int  term_hist_idx = -1;          /* -1 = 正在编辑新输入 */
+
+static void term_scroll_if_full(void);   /* 前向声明：定义在本组函数之后 */
+static void term_scroll_if_full_raw(void);
+static void term_input_erase_raw(void);
+
+static void term_input_reset(void)
+{
+    term_input_len = 0;
+    term_input[0] = 0;
+}
+
+/* 历史入栈（跳过空行与连续重复；满则整体上移一行）。
+ * 历史数组是跨任务共享状态：关中断窗口防撕裂。 */
+static void term_hist_push(const char *line)
+{
+    uint32_t _if = irq_save_disable();
+    int len = 0;
+    while (line[len]) len++;
+    if (len == 0) { irq_restore(_if); return; }
+    if (term_hist_count > 0) {
+        const char *last = term_hist[term_hist_count - 1];
+        int same = 1;
+        for (int i = 0; i <= len; i++) {
+            if (last[i] != line[i]) { same = 0; break; }
+        }
+        if (same) { irq_restore(_if); return; }
+    }
+    if (term_hist_count < TERM_HIST_MAX) {
+        term_hist_count++;
+    } else {
+        for (int i = 0; i < TERM_HIST_MAX - 1; i++) {
+            for (int j = 0; j <= TERM_INPUT_MAX; j++) term_hist[i][j] = term_hist[i + 1][j];
+        }
+    }
+    char *dst = term_hist[term_hist_count - 1];
+    for (int i = 0; i < len && i < TERM_INPUT_MAX; i++) dst[i] = line[i];
+    dst[len > TERM_INPUT_MAX ? TERM_INPUT_MAX : len] = 0;
+    irq_restore(_if);
+}
+
+/* 擦除当前输入（可能跨了好几行），光标回到提示符后。
+ * _raw 版本供已持锁的上层（term_input_set）复用，避免嵌套开中断。 */
+static void term_input_erase_raw(void)
+{
+    while (term_input_len > 0 && term_caret > term_input_base) {
+        term_input_len--;
+        term_caret--;
+        term_buf[term_caret] = ' ';
+    }
+    term_input[0] = 0;
+    term_nrows = term_caret / term_cols + 1;
+}
+
+static void term_input_erase(void)
+{
+    uint32_t _if = irq_save_disable();
+    term_input_erase_raw();
+    irq_restore(_if);
+}
+
+/* 用历史行替换当前输入（重绘进终端缓冲） */
+static void term_input_set(const char *s)
+{
+    uint32_t _if = irq_save_disable();
+    term_input_erase_raw();
+    while (*s && term_input_len < TERM_INPUT_MAX) {
+        term_scroll_if_full_raw();
+        term_input[term_input_len++] = *s;
+        term_buf[term_caret++] = *s;
+        s++;
+    }
+    term_input[term_input_len] = 0;
+    term_nrows = term_caret / term_cols + 1;
+    irq_restore(_if);
+}
+
+/* 打印 shell 提示符并清空输入缓冲 */
+static void term_prompt(void)
+{
+    term_print("> ");
+    term_input_reset();
+    term_input_base = term_caret;      /* 退格擦到这里为止，不能再往前 */
+}
+
+/* 一行有多少格 / 缓冲里第 n 行从哪开始：全部走 term_cols，不再直接写
+ * TERM_COLS——窗口窄于 80 列时按 80 换行、按实际列数画，每行后半截就被
+ * 切掉（自检那种 60+ 字符的行看着就是整片乱掉）。 */
+static int term_row_begin(int row) { return row * term_cols; }
+
+/* _raw 版本：term_buf/term_caret/term_nrows 是跨任务共享状态，
+ * 所有改动方（term_newline/term_scroll_if_full/term_print/term_input_set）
+ * 都在自己的关中断窗口里调 raw 版本，故不设独立包装。 */
+static void term_scroll_up_one_raw(void)
+{
+    for (int _ti = 0; _ti < (TERM_ROWS - 1) * term_cols; _ti++)
+        term_buf[_ti] = term_buf[_ti + term_cols];
+    term_caret -= term_cols;
+    /* 上移之后最后一行还是"它自己的旧内容"（只搬了前 ROWS-1 行），
+     * 不清就是一行擦不掉的残影，看着像换行错了一行。 */
+    for (int _ti = (TERM_ROWS - 1) * term_cols; _ti < TERM_ROWS * term_cols; _ti++)
+        term_buf[_ti] = ' ';
+}
+
+static void term_newline_raw(void)
+{
+    while (term_caret % term_cols != 0) term_buf[term_caret++] = ' ';
+    if (term_caret >= TERM_ROWS * term_cols) term_scroll_up_one_raw();
+    term_nrows = term_caret / term_cols + 1;
+}
+
+static void term_newline(void)
+{
+    uint32_t _if = irq_save_disable();
+    term_newline_raw();
+    irq_restore(_if);
+}
+
+static void term_scroll_if_full_raw(void)
+{
+    if (term_caret >= TERM_ROWS * term_cols) term_scroll_up_one_raw();
+}
+
+static void term_scroll_if_full(void)
+{
+    uint32_t _if = irq_save_disable();
+    term_scroll_if_full_raw();
+    irq_restore(_if);
+}
+
+static void term_print(const char *s)
+{
+    uint32_t _if = irq_save_disable();
+    while (*s) {
+        /* 回车 = 回到行首。不认它的话 0x0D 会被当成普通字符画出来。 */
+        if (*s == '\r') { term_caret -= term_caret % term_cols; s++; continue; }
+        if (*s == '\n') { term_newline_raw(); s++; continue; }
+        if (*s == '\t') {
+            /* Tab 按 4 列制表位展开（空格填充） */
+            int nxt = (term_caret + 4) & ~3;
+            while (term_caret < nxt) {
+                term_scroll_if_full_raw();
+                term_buf[term_caret++] = ' ';
+            }
+            s++;
+            continue;
+        }
+        term_scroll_if_full_raw();   /* 写入前滚动，防止 term_buf 越界写 */
+        term_buf[term_caret++] = *s++;
+    }
+    term_nrows = term_caret / term_cols + 1;
+    irq_restore(_if);
+}
+
+/* GUI 模式输出重定向：shell 命令输出进入终端窗口缓冲 */
+void gw_term_output(const char *s)
+{
+    term_print(s);
+}
+
+/* 列宽按 Terminal 窗口内宽动态算：固定 80 列会把 53~80 列的内容画到窗口外 */
+static void term_sync_cols(const gw_window_t *w)
+{
+    int cols = ((int)w->inner_w - 8) / 8;
+    if (cols < 10) cols = 10;
+    if (cols > TERM_COLS) cols = TERM_COLS;
+    term_cols = cols;
+}
+
+static void term_draw(gw_window_t *w)
+{
+    term_sync_cols(w);   /* 列宽与窗口内宽保持同步（最大化/还原后也正确） */
+    /* 与窗口内容区对齐：内容区背景起点 = (w->x+1, w->y+GW_TITLE_H+1)。
+     * 旧代码用 x+4/y+T+4 相对内容区偏移(+3,+3)，导致字符笔画与 8px 网格错位
+     * （白底从内容区起、字形从+3起），看起来就是"乱码"。 */
+    int x = w->x + 1, y = w->y + GW_TITLE_H + 1;
+    int cw = 8, ch = 16;
+    /* 绘制列宽必须与换行用的 term_cols 一致，否则每行后半截被切掉。
+     * 窗口比 80 列宽时按 80 画（缓冲的行宽就是 80）。 */
+    int cols = term_cols;
+    int rows = (w->inner_h - 8) / ch;
+    if (cols < 0) cols = 0;
+    if (rows < 0) rows = 0;
+    if (rows > TERM_ROWS) rows = TERM_ROWS;
+    int start = 0;
+    if (term_nrows > rows) start = term_nrows - rows;
+    /* 先整体填充终端底色，避免未写行露出白底/黑底导致颜色错乱 */
+    gw_fill(x, y, w->inner_w - 8, w->inner_h - 8, 0xF0F0F0);
+    for (int r = 0; r < rows; r++) {
+        int src_row = start + r;
+        /* nrows 短暂超过 TERM_ROWS（缓冲写满最后一格）时 row_begin 会越出
+         * 缓冲：用 TERM_ROWS 封顶，宁可少画一行也不越界读 */
+        if (src_row >= term_nrows || src_row >= TERM_ROWS) break;
+        for (int c = 0; c < cols; c++) {
+            char ch2[2];
+            ch2[0] = term_buf[term_row_begin(src_row) + c];
+            if (ch2[0] == 0) ch2[0] = ' ';
+            ch2[1] = 0;   /* NUL-terminate: gfx_draw_text_scaled stops at NUL */
+            /* Win10 palette: white bg + black fg (transparent bg draw) */
+            gfx_draw_text_scaled(x + c * cw, y + r * ch, ch2, 0x00, -1, 1);
+        }
+    }
+    /* 光标 */
+    int cx = (term_caret % term_cols);
+    int cy = (term_caret / term_cols) - start;
+    if (cy < 0) cy = 0;
+    if (cy >= rows) cy = rows - 1;
+    gfx_draw_text_scaled(x + cx * cw, y + cy * ch, "_", 0x00, -1, 1);
+}
+
+static void term_key(gw_window_t *w, int key)
+{
+    (void)w;    /* 单终端实例，无需区分窗口 */
+    if (key == '\n' || key == '\r') {
+        /* 执行输入缓冲中的完整命令（保留空格参数） */
+        char line[TERM_INPUT_MAX + 1];
+        int len = term_input_len;
+        if (len > TERM_INPUT_MAX) len = TERM_INPUT_MAX;
+        for (int i = 0; i < len; i++) line[i] = term_input[i];
+        line[len] = 0;
+        term_newline();
+        if (len > 0) {
+            term_hist_push(line);
+            /* 命令输出走终端窗口缓冲：terminal_putchar 已挂 gfx hook */
+            shell_exec_line(line);
+        }
+        /* 输出不以换行结尾时补一个——不补的话提示符会接在输出尾巴上。
+         * 但输出已经换行了还补，就是每条命令后平白多一个空行（原来这里
+         * 是无条件 term_newline()）。所以看光标是不是已经在行首。 */
+        if (term_caret % term_cols != 0) term_newline();
+        term_prompt();
+        term_hist_idx = -1;
+    } else if (key == 0x08) {  /* Backspace */
+        if (term_input_len > 0 && term_caret > term_input_base) {
+            term_input_len--;
+            term_input[term_input_len] = 0;
+            term_caret--;
+            term_buf[term_caret] = ' ';
+        }
+    } else if (key == KEY_UP) {        /* 历史上一条（更早） */
+        if (term_hist_count > 0 && term_hist_idx < term_hist_count - 1) {
+            term_hist_idx++;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        }
+    } else if (key == KEY_DOWN) {      /* 历史下一条（更新） */
+        if (term_hist_idx > 0) {
+            term_hist_idx--;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        } else if (term_hist_idx == 0) {
+            term_hist_idx = -1;
+            term_input_erase();
+        }
+    } else if (key == '\t') {          /* Tab 补全第一个词（命令名） */
+        if (term_input_len > 0) {
+            int has_space = 0;
+            for (int i = 0; i < term_input_len; i++) {
+                if (term_input[i] == ' ') { has_space = 1; break; }
+            }
+            if (!has_space) {
+                char full[TERM_INPUT_MAX + 1];
+                const char *matches[12];
+                int r = shell_complete_command(term_input, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    term_input_set(full);
+                } else if (r >= 2) {
+                    /* 先保存当前输入（term_input_set 会清空源缓冲） */
+                    char keep[TERM_INPUT_MAX + 1];
+                    for (int i = 0; i <= term_input_len; i++) keep[i] = term_input[i];
+                    term_newline();
+                    term_print("  ");
+                    for (int i = 0; i < r && i < 12; i++) {
+                        term_print(matches[i]);
+                        term_print(" ");
+                    }
+                    term_newline();
+                    term_prompt();
+                    term_input_set(keep);
+                }
+            }
+        }
+    } else if (key >= 0x20 && key < 0x7F) {
+        /* 上限就是输入缓冲的大小。折行由 term_buf 的线性布局天然支持
+         * （绘制按 term_cols 切行），写到底部由 term_scroll_if_full 上滚。 */
+        if (term_input_len < TERM_INPUT_MAX) {
+            term_input[term_input_len++] = (char)key;
+            term_input[term_input_len] = 0;
+            term_scroll_if_full();   /* scroll before write: prevent overflow */
+            term_buf[term_caret++] = (char)key;
+            term_nrows = term_caret / term_cols + 1;
+        }
+    }
+}
+
+/* ==================================================================
+ * 游戏图形绘制：基于 games.h 导出状态，把 7 个游戏画成图形界面。
+ * 猜数字(1) 本身走文本缓冲（games_gfx_buf），其余由本组函数绘制。
+ * ================================================================== */
+static void gw_game_draw_text_center(int x, int y, int w, int h, const char *s, uint8_t fg, int scale)
+{
+    if (scale < 1) scale = 1;
+    int len = 0;
+    while (s[len]) len++;
+    int tw = len * 8 * scale;
+    gfx_draw_text_scaled(x + (w - tw) / 2, y + (h - 8 * scale) / 2, s, fg, -1, scale);
+}
+
+static void gw_draw_score_line(int x, int y, const char *label, int value, uint8_t fg)
+{
+    char buf[24];
+    int n = 0, i = 0;
+    while (label[i]) buf[n++] = label[i++];
+    if (value == 0) {
+        buf[n++] = '0';
+    } else {
+        char d[8];
+        int m = 0;
+        while (value) { d[m++] = (char)('0' + value % 10); value /= 10; }
+        while (m) buf[n++] = d[--m];
+    }
+    buf[n] = 0;
+    gfx_draw_text(x, y, buf, fg, 0);
+}
+
+static void gw_game_draw_tic(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cw = iw / 3, chh = ih / 3;
+    if (cw < 16) cw = 16;
+    if (chh < 16) chh = 16;
+    int bw = cw * 3, bh = chh * 3;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 3, oy - 3, bw + 6, bh + 6, 0xE8E8E8);
+    for (int i = 1; i < 3; i++) {
+        gw_fill(ox + i * cw - 1, oy, 2, bh, 0x606060);
+        gw_fill(ox, oy + i * chh - 1, bw, 2, 0x606060);
+    }
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            int b = games_tic_board(r * 3 + c);
+            if (b != 'X' && b != 'O') continue;
+            char s[2] = { (char)b, 0 };
+            int scale = (chh < cw ? chh : cw) / 12;
+            if (scale < 1) scale = 1;
+            if (scale > 6) scale = 6;
+            gw_game_draw_text_center(ox + c * cw, oy + r * chh, cw, chh, s,
+                                     (b == 'X') ? 0x0C : 0x09, scale);
+        }
+    }
+    gfx_draw_text(x0, y0 + ih - 12, "1-9/click: move   Q: quit", 0x08, 0);
+}
+
+static void gw_game_draw_snake(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 20 < ih / 10) ? iw / 20 : ih / 10;
+    if (cell < 1) cell = 1;
+    int bw = cell * 20, bh = cell * 10;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x202020);
+    for (int y = 0; y < 10; y++)
+        for (int x = 0; x < 20; x++)
+            gw_fill(ox + x * cell + 1, oy + y * cell + 1, cell - 1, cell - 1, 0x181818);
+    gw_fill(ox + games_snake_food_x() * cell + 1, oy + games_snake_food_y() * cell + 1,
+            cell - 1, cell - 1, 0xE04040);
+    int n = games_snake_len();
+    for (int i = 0; i < n; i++) {
+        int sx = games_snake_body_x(i), sy = games_snake_body_y(i);
+        uint32_t col = (i == n - 1) ? 0x50E050 : 0x10A010;
+        gw_fill(ox + sx * cell + 1, oy + sy * cell + 1, cell - 1, cell - 1, col);
+    }
+    gfx_draw_text(ox, oy + bh + 6,
+                  games_snake_alive() ? "Arrows: move   Q: quit" : "Game Over - press Q",
+                  0x0F, 0);
+}
+
+static void gw_game_draw_2048(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+    if (cell < 12) cell = 12;
+    int bw = cell * 4, bh = cell * 4;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - 8 - bh) / 2;
+    gw_fill(ox - 4, oy - 4, bw + 8, bh + 8, 0xBBADA0);
+    for (int i = 0; i < 16; i++) {
+        int r = i / 4, c = i % 4;
+        int v = games_2048_cell(i);
+        uint32_t col = 0xCDC1B4;
+        if (v >= 128) col = 0xEDC22E;
+        else if (v >= 64) col = 0xF65E3B;
+        else if (v >= 32) col = 0xF67C5F;
+        else if (v >= 16) col = 0xF59563;
+        else if (v >= 8) col = 0xF2B179;
+        else if (v >= 4) col = 0xEDE0C8;
+        else if (v >= 2) col = 0xEEE4DA;
+        gw_fill(ox + c * cell + 2, oy + r * cell + 2, cell - 4, cell - 4, col);
+        if (v > 0) {
+            char num[8];
+            int len = 0, t = v;
+            do { num[len++] = (char)('0' + t % 10); t /= 10; } while (t);
+            for (int k = 0; k < len / 2; k++) {
+                char tmp = num[k]; num[k] = num[len - 1 - k]; num[len - 1 - k] = tmp;
+            }
+            num[len] = 0;
+            int scale = cell / 14;
+            if (scale < 1) scale = 1;
+            if (scale > 5) scale = 5;
+            gw_game_draw_text_center(ox + c * cell, oy + r * cell, cell, cell, num,
+                                     (v >= 8) ? 0x0F : 0x08, scale);
+        }
+    }
+    gfx_draw_text(ox, oy + bh + 8, "Arrows: slide   R: restart   Q: quit", 0x0F, 0);
+}
+
+static void gw_game_draw_ms(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
+    if (cell < 1) cell = 1;
+    int bw = cell * 9, bh = cell * 9;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x606060);
+    for (int r = 0; r < 9; r++) {
+        for (int c = 0; c < 9; c++) {
+            int px = ox + c * cell, py = oy + r * cell;
+            int rev = games_ms_revealed(r, c);
+            int flg = games_ms_flagged(r, c);
+            int v = games_ms_cell(r, c);
+            gw_fill(px + 1, py + 1, cell - 2, cell - 2, rev ? 0xD0D0D0 : 0x9E9E9E);
+            if (flg) {
+                gw_game_draw_text_center(px, py, cell, cell, "F", 0x0C, 1);
+            } else if (rev) {
+                if (v == 9) {
+                    gw_game_draw_text_center(px, py, cell, cell, "*", 0x00, 1);
+                } else if (v > 0) {
+                    char s[2] = { (char)('0' + v), 0 };
+                    uint8_t ci = (v == 1) ? 0x09 : (v == 2) ? 0x0A : (v == 3) ? 0x0C : 0x0D;
+                    gw_game_draw_text_center(px, py, cell, cell, s, ci, 1);
+                }
+            }
+        }
+    }
+    gw_frame(ox + games_ms_cursor_x() * cell, oy + games_ms_cursor_y() * cell, cell, cell, 0x0000E0);
+    gfx_draw_text(ox, oy + bh + 6, "Arrows: move  Enter: open  F: flag  Q: quit", 0x0F, 0);
+}
+
+static void gw_game_draw_rps(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    gw_fill(x0, y0, iw, ih, 0xF4F4F4);
+    gw_game_draw_text_center(x0, y0 + 8, iw, 18, "Rock Paper Scissors", 0x06, 2);
+    int colw = iw / 3;
+    gw_draw_score_line(x0 + 8, y0 + 34, "You : ", games_rps_pwins(), 0x0A);
+    gw_draw_score_line(x0 + colw + 8, y0 + 34, "CPU: ", games_rps_cwins(), 0x0C);
+    gw_draw_score_line(x0 + colw * 2 + 8, y0 + 34, "Draw: ", games_rps_draws(), 0x08);
+    int lp = games_rps_last_p(), lc = games_rps_last_c();
+    char ps[2] = { 0 }, cs[2] = { 0 };
+    if (lp >= 1 && lp <= 3) ps[0] = "RPS"[lp - 1];
+    if (lc >= 1 && lc <= 3) cs[0] = "RPS"[lc - 1];
+    int half = ih / 2 + 10;
+    if (lp) {
+        gw_game_draw_text_center(x0, y0 + half - 44, iw / 2, 32, ps, 0x09, 3);
+        gw_game_draw_text_center(x0, y0 + half - 12, iw / 2, 14, "YOU", 0x01, 1);
+    }
+    if (lc) {
+        gw_game_draw_text_center(x0 + iw / 2, y0 + half - 44, iw / 2, 32, cs, 0x0C, 3);
+        gw_game_draw_text_center(x0 + iw / 2, y0 + half - 12, iw / 2, 14, "CPU", 0x04, 1);
+    }
+    int d = games_rps_last_d();
+    if (d >= 0) {
+        const char *res = (d == 1) ? "You win!" : (d == 2) ? "CPU wins" : "Draw";
+        gw_game_draw_text_center(x0, y0 + ih - 36, iw, 16, res,
+                                 (d == 1) ? 0x0A : (d == 2) ? 0x0C : 0x08, 2);
+    }
+    gfx_draw_text(x0 + 8, y0 + ih - 14, "1:Rock  2:Paper  3:Scissors   Q:quit", 0x00, 0);
+}
+
+static void gw_game_draw_mem(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+    if (cell < 12) cell = 12;
+    int bw = cell * 4, bh = cell * 4;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - 8 - bh) / 2;
+    gw_fill(ox - 3, oy - 3, bw + 6, bh + 6, 0x103040);
+    for (int i = 0; i < 16; i++) {
+        int r = i / 4, c = i % 4;
+        int face = games_mem_face(i), show = games_mem_show(i);
+        uint32_t col = face ? 0x40C040 : (show ? 0xFFFFFF : 0x2A6BB8);
+        gw_fill(ox + c * cell + 2, oy + r * cell + 2, cell - 4, cell - 4, col);
+        if (face || show) {
+            char s[2] = { (char)games_mem_cell(i), 0 };
+            gw_game_draw_text_center(ox + c * cell, oy + r * cell, cell, cell, s, 0x00, 2);
+        }
+    }
+    gw_frame(ox + games_mem_cursor_x() * cell, oy + games_mem_cursor_y() * cell, cell, cell, 0xE03030);
+    gfx_draw_text(ox, oy + bh + 8, "Arrows: move  Enter: flip  Q: quit", 0x0F, 0);
+}
+
+/* 分派：当前游戏类型对应的图形绘制（kind 1 猜数字走文本缓冲） */
+static void gw_game_draw(gw_window_t *w)
+{
+    int kind = games_gfx_kind();
+    switch (kind) {
+    case 2: gw_game_draw_tic(w); break;
+    case 3: gw_game_draw_snake(w); break;
+    case 4: gw_game_draw_2048(w); break;
+    case 5: gw_game_draw_ms(w); break;
+    case 6: gw_game_draw_rps(w); break;
+    case 7: gw_game_draw_mem(w); break;
+    default: break;
+    }
+}
+
+/* 游戏合集图形菜单 */
+static void gw_game_draw_menu(gw_window_t *w, int sel)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    gw_fill(x0, y0, iw, ih, 0xF0F0F0);
+    gw_game_draw_text_center(x0, y0 + 8, iw, 20, "Cerulia Games", 0x06, 2);
+    static const char *names[7] = {
+        "1  Guess the Number", "2  Tic-Tac-Toe", "3  Snake",
+        "4  2048", "5  Minesweeper", "6  Rock-Paper-Scissors", "7  Memory"
+    };
+    int row_h = (ih - 60) / 7;
+    if (row_h < 1) row_h = 1;
+    for (int i = 0; i < 7; i++) {
+        int ry = y0 + 40 + i * row_h;
+        if (i + 1 == sel) {
+            gw_fill(x0 + 20, ry, iw - 40, row_h - 4, 0x2A6BB8);
+            gfx_draw_text(x0 + 40, ry + (row_h - 8) / 2, names[i], 0x0F, 0);
+        } else {
+            gfx_draw_text(x0 + 40, ry + (row_h - 8) / 2, names[i], 0x00, 0);
+        }
+    }
+    gfx_draw_text(x0 + 20, y0 + ih - 18, "Up/Down: select  Enter: run  Q: back", 0x08, 0);
+}
+
+/* ==================================================================
+ * 游戏宿主：桌面图标启动游戏，复用 Terminal 窗口渲染 24x80 缓冲
+ * ================================================================== */
+
+/* 把鼠标坐标映射为当前游戏语义坐标（棋盘行列 / 方向 / 出拳）。
+ * 返回 0=未命中游戏区，1=命中；a/b 含义随 kind 而定：
+ *   2: a=row b=col (0..2)   3/4: a=方向(0上 1下 2左 3右)
+ *   5: a=row b=col (0..8)   6: a=1..3（Rock/Paper/Scissors）
+ *   7: a=row b=col (0..3) */
+static int gw_game_mouse_cell(gw_window_t *tw, int kind, int *a, int *b)
+{
+    if (!tw) return 0;
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int x0 = tw->x + 4, y0 = tw->y + GW_TITLE_H + 4;
+    int iw = tw->inner_w - 8, ih = tw->inner_h - 8;
+    if (mx < x0 || my < y0 || mx >= x0 + iw || my >= y0 + ih) return 0;
+    int ox, oy, bw, bh, cell;
+    switch (kind) {
+    case 2:   /* 井字棋 3x3 */
+        cell = (iw / 3 < ih / 3) ? iw / 3 : ih / 3;
+        if (cell < 16) cell = 16;
+        bw = cell * 3; bh = cell * 3;
+        ox = x0 + (iw - bw) / 2; oy = y0 + (ih - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    case 3:
+    case 4:   /* 贪吃蛇/2048：点击相对窗口中心的方向 */
+        {
+            int dx = mx - (x0 + iw / 2);
+            int dy = my - (y0 + ih / 2);
+            int ax = dx < 0 ? -dx : dx;
+            int ay = dy < 0 ? -dy : dy;
+            if (ax >= ay) *a = (dx < 0) ? 2 : 3;   /* 水平 左/右 */
+            else          *a = (dy < 0) ? 0 : 1;   /* 垂直 上/下 */
+            *b = 0;
+            return 1;
+        }
+    case 5:   /* 扫雷 9x9 */
+        cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
+        if (cell < 6) cell = 6;
+        bw = cell * 9; bh = cell * 9;
+        ox = x0 + (iw - bw) / 2; oy = y0 + (ih - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    case 6:   /* 石头剪刀布：三列按钮 */
+        {
+            int colw = iw / 3;
+            int c2 = (mx - x0) / colw;
+            if (c2 < 0 || c2 > 2) return 0;
+            *a = c2 + 1; *b = 0;
+            return 1;
+        }
+    case 7:   /* 记忆翻牌 4x4 */
+        cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+        if (cell < 12) cell = 12;
+        bw = cell * 4; bh = cell * 4;
+        ox = x0 + (iw - bw) / 2;
+        oy = y0 + (ih - 20 - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    }
+    return 0;
+}
+
+/* 上一帧鼠标按钮状态（点击沿检测用，文件级） */
+static int g_game_mbtn_prev = 0;
+
+/* 游戏 GUI yield 回调：处理鼠标点击沿 + 双缓冲整窗重绘（含 60FPS 节流）；
+ * 猜数字(1) 走文本缓冲由 term_draw 渲染。
+ * 旧实现在可见帧缓冲上"清背景->重绘"且每次 yield 都执行（轮询频率极高），
+ * 无垂直同步时表现为游戏窗口持续闪动看不清 —— 双缓冲后彻底消除。 */
+static void gw_game_yield(void)
+{
+    gw_window_t *tw = NULL;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_TERMINAL) {
+            tw = &gw_windows[i];
+            break;
+        }
+    }
+    if (!tw) return;
+    int kind = games_gfx_kind();
+    if (kind == 1) {
+        /* 文本游戏（猜数字）：同步缓冲，绘制交给下方统一重绘 */
+        char *gb = games_gfx_buf();
+        for (int r = 0; r < TERM_ROWS; r++) {
+            for (int c = 0; c < TERM_COLS; c++) {
+                char ch2 = gb[r * TERM_COLS + c];
+                term_buf[r * TERM_COLS + c] = (ch2 == 0) ? ' ' : ch2;
+            }
+        }
+        term_caret = games_gfx_pos();
+        term_nrows = TERM_ROWS;
+    } else {
+        /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列。
+         * 必须每次 yield 执行（不受节流限制），否则快速点击可能丢沿 */
+        int bt = mouse_get_buttons();
+        int edge = 0;
+        if ((bt & 1) && !(g_game_mbtn_prev & 1)) edge = 1;
+        else if ((bt & 2) && !(g_game_mbtn_prev & 2)) edge = 2;
+        g_game_mbtn_prev = bt;
+        if (edge) {
+            int a = -1, b = -1;
+            if (gw_game_mouse_cell(tw, kind, &a, &b))
+                games_set_mouse(a, b, edge);
+        }
+    }
+
+    /* 帧率节流：距上帧不足 16ms 跳过重绘（游戏输入轮询在上面已处理） */
+    uint32_t now = g_pit_ticks;
+    if ((uint32_t)(now - gw_game_last_draw_ms) < GW_BB_FPS_MS) return;
+    gw_game_last_draw_ms = now;
+
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int cur_in_win = gw_cursor_in_win(tw, mx, my);
+    int old_in_win = gw_cursor_old_in_win(tw);
+
+    /* 先擦除旧光标：旧位置在窗口外时 blit 不会覆盖它，需手工恢复背景；
+     * 必须在保存新位置背景（gw_cursor_save_bg）之前完成，否则旧背景缓存被新位置覆盖 */
+    if (!old_in_win)
+        gw_cursor_restore_bg();
+
+    if (gw_bb_begin()) {
+        /* 1. 新帧画进离屏缓冲（较慢）：期间 LFB 仍显示上一帧（含光标），
+         *    光标持续可见。旧实现先擦光标再慢慢绘制，绘制耗时一旦接近
+         *    帧周期，光标在两次重绘之间几乎无可见时间——这正是
+         *    "游戏内看不到鼠标"的根因 */
+        if (kind == 1) {
+            gw_draw_window_body(tw, 1);          /* 窗框 + 终端文本内容 */
+        } else {
+            gw_draw_window_body(tw, 0);          /* 窗框 + 内容底色 */
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+        /* 2. 光标完全在窗口内：画进离屏缓冲，随 blit 原子上屏
+         *    （不存在独立的擦除阶段，光标零间隙可见） */
+        if (cur_in_win) {
+            gw_cursor_save_bg(mx, my);           /* 保存离屏缓冲中光标下背景 */
+            gw_cursor_draw(mx, my);
+        }
+        gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+        /* 3. 光标（部分）在窗口外：blit 后直绘，背景从 LFB 保存 */
+        if (!cur_in_win) {
+            gw_cursor_save_bg(mx, my);
+            gw_cursor_draw(mx, my);
+        }
+    } else {
+        /* 8bpp 回退 / 分辨率超限：维持旧直绘路径 */
+        if (kind == 1) {
+            term_draw(tw);
+        } else {
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+        gw_cursor_draw(mx, my);
+    }
+}
+
+/* 运行单个游戏（idx 1..7），复用 Terminal 窗口宿主；不打印提示符，
+ * 供桌面图标与 shell 命令两条入口共用 */
+static int gw_run_game(int idx)
+{
+    if (idx < 1 || idx > 7) return 0;
+    gw_launch_app(GW_APP_TERMINAL);   /* 打开/复用 Terminal 窗口作为游戏宿主 */
+    gw_window_t *tw = NULL;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_TERMINAL) {
+            tw = &gw_windows[i];
+            break;
+        }
+    }
+    if (!tw) return 0;
+    games_set_gfx(1, gw_game_yield);
+    term_input_reset();           /* 游戏期间终端输入缓冲失效，先清空 */
+    gw_game_last_draw_ms = 0;     /* 进入游戏立即绘制首帧 */
+    g_game_mbtn_prev = mouse_get_buttons();   /* 消化启动点击，防止幻影点击传入游戏 */
+    mouse_btn_ev_flush();                     /* 同上：清按键沿队列（含启动双击的残留沿） */
+    games_play(idx);              /* 阻塞运行，yield 驱动重绘；游戏内部读键盘 */
+    games_set_gfx(0, NULL);
+    mouse_btn_ev_flush();         /* 游戏期间的点击归游戏，退出后不补派发给 GUI */
+    /* 游戏结束不回到终端：直接关闭宿主窗口回桌面 */
+    gw_close(tw);
+    return 1;
+}
+
+/* 桌面图标启动游戏：idx 为 1..7，对应 gw_desktop_icon_app 中 7 个游戏 */
+static int gw_launch_game(int idx)
+{
+    if (user_confined()) return 0;
+    /* 游戏结束时 gw_run_game 已关闭宿主窗口，这里不再打印提示符回终端 */
+    gw_dirty = 1;
+    return gw_run_game(idx);
+}
+
+/* 游戏合集图形菜单（games 命令图形入口） */
+static int gw_game_menu(void)
+{
+    gw_launch_app(GW_APP_TERMINAL);
+    gw_window_t *tw = NULL;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_TERMINAL) {
+            tw = &gw_windows[i];
+            break;
+        }
+    }
+    if (!tw) return 0;
+    games_set_gfx(1, gw_game_yield);
+    term_input_reset();
+    mouse_btn_ev_flush();         /* 同 gw_run_game：清启动点击残留 */
+    int sel = 1;
+    gw_game_last_draw_ms = 0;   /* 菜单进入立即绘制首帧 */
+    for (;;) {
+        /* 忙等循环：节流 + 双缓冲重绘，消除菜单高速直绘造成的闪动。
+         * 光标画进离屏缓冲随 blit 原子上屏（同 gw_game_yield，见其注释） */
+        uint32_t now = g_pit_ticks;
+        if ((uint32_t)(now - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
+            gw_game_last_draw_ms = now;
+            int mx = mouse_get_x(), my = mouse_get_y();
+            int cur_in_win = gw_cursor_in_win(tw, mx, my);
+            int old_in_win = gw_cursor_old_in_win(tw);
+            /* 先擦除旧光标（窗口外不会被 blit 覆盖），再保存/绘制新位置背景 */
+            if (!old_in_win)
+                gw_cursor_restore_bg();
+            if (gw_bb_begin()) {
+                gw_draw_window_body(tw, 0);
+                gw_game_draw_menu(tw, sel);
+                if (cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
+                gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+                if (!cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
+            } else {
+                gw_game_draw_menu(tw, sel);
+                gw_cursor_draw(mx, my);
+            }
+        }
+        int c = keyboard_getchar();
+        if (c == 0) continue;
+        if (c == 'q' || c == 'Q' || c == 0x1B) break;
+        if (c == KEY_UP) { sel--; if (sel < 1) sel = 1; }
+        else if (c == KEY_DOWN) { sel++; if (sel > 7) sel = 7; }
+        else if (c == '\n' || c == '\r') games_play(sel);
+        else if (c >= '1' && c <= '7') games_play(c - '0');
+    }
+    games_set_gfx(0, NULL);
+    mouse_btn_ev_flush();         /* 菜单期间的点击不补派发给 GUI */
+    gw_close(tw);                /* 菜单退出：关闭宿主窗口回桌面 */
+    return 1;
+}
+
+/* shell 命令（games/guess/...）图形入口：0=图形菜单，1..7=直接运行 */
+int gw_launch_gui_game(int idx)
+{
+    if (user_confined()) return 0;
+    if (idx == 0) return gw_game_menu();
+    return gw_run_game(idx);
+}
+
+/* Keep all desktop input and redraw dispatch stopped while the account screen
+ * owns the framebuffer. It is not a window that can be closed or minimized. */
+static void gw_session_button(int x, int y, int w, const char *label)
+{
+    gw_fill(x, y, w, 20, 0x244D74u);
+    gfx_draw_text_scaled(x + (w - gw_strlen(label) * 8) / 2, y + 6, label, 0x0F, -1, 1);
+}
+
+static void gw_session_field(int x, int y, int w, const char *value, int selected)
+{
+    gw_fill(x, y, w, 20, 0x0E1B2Au);
+    gw_frame(x, y, w, 20, selected ? 0x4293E0u : 0x647588u);
+    gfx_draw_text_scaled(x + 5, y + 6, value, 0x0F, -1, 1);
+}
+
+static int gw_session_dialog(int mode)
+{
+    char name[USER_NAME_MAX + 1] = {0}, pass[AUTH_MAX_PASSWORD + 1] = {0};
+    unsigned nn = 0, pn = 0, excess = 0, name_excess = 0;
+    int field = mode != GW_SESSION_SIGNIN;
+    int redraw = 1, ok = 0;
+    uint32_t retry_at = 0;
+    const char *hint = NULL;
+    int w = GFX_W < 380 ? GFX_W - 20 : 360;
+    int h = 158, x = (GFX_W - w) / 2, y = (GFX_H - h) / 2;
+    int button_y = y + 108, input_x = x + 88, input_w = w - 102;
+
+    gw_cursor_bg_valid = 0;
+    gfx_set_clip(0, 0, GFX_W, GFX_H);
+    gw_fill(0, 0, GFX_W, GFX_H, 0x0E1B2Au);
+    keyboard_discard_boot_input();
+    mouse_btn_ev_flush();
+    int last_bt = mouse_get_buttons() & 1;
+    keyboard_set_private_input(1);
+    if (mode == GW_SESSION_LOCK) serial_write("DESKTOP: locked\n");
+    if (mode == GW_SESSION_SIGNIN) serial_write("DESKTOP: sign-in\n");
+    for (;;) {
+        if (retry_at && (int32_t)(g_pit_ticks - retry_at) >= 0) {
+            retry_at = 0;
+            redraw = 1;
+        }
+        int mx = mouse_get_x(), my = mouse_get_y(), bt = mouse_get_buttons() & 1;
+        int click = bt && !last_bt;
+        last_bt = bt;
+        int c = keyboard_getchar();
+        int submit = c == '\n' || c == '\r';
+        int button = click && my >= button_y && my < button_y + 20;
+        if (button && mx >= x + w - 96 && mx < x + w - 14) submit = 1;
+        if (mode == GW_SESSION_SWITCH || mode == GW_SESSION_BUSY) {
+            if (submit) { ok = 1; break; }
+            if (c == 27 || (mode == GW_SESSION_SWITCH && button && mx >= x + 14 && mx < x + 96))
+                break;
+        } else {
+            if (mode == GW_SESSION_SIGNIN && click && mx >= input_x && mx < input_x + input_w) {
+                if (my >= y + 47 && my < y + 67) field = 0;
+                if (my >= y + 77 && my < y + 97) field = 1;
+                redraw = 1;
+            }
+            if (c == 27) {
+                auth_wipe(pass, sizeof(pass));
+                pn = excess = 0;
+                redraw = 1;
+            } else if (c == '\t' && mode == GW_SESSION_SIGNIN) {
+                field = !field;
+                redraw = 1;
+            } else if (submit && !retry_at) {
+                if (mode == GW_SESSION_SIGNIN && (!nn ||
+                    (!field && !pn && c && user_password_required(name)))) {
+                    field = nn != 0;
+                } else {
+                    if (!excess && !name_excess)
+                        ok = mode == GW_SESSION_LOCK ? user_check_password(pass, pn) :
+                             user_auth_login(name, pass, pn) == 0;
+                    auth_wipe(pass, sizeof(pass));
+                    pn = excess = 0;
+                    if (ok) break;
+                    hint = mode == GW_SESSION_LOCK ? "Incorrect password." : "Sign-in failed.";
+                    retry_at = g_pit_ticks + 750u;
+                    serial_write("DESKTOP: authentication failed\n");
+                }
+                redraw = 1;
+            } else if (c == '\b') {
+                if (field && excess) excess--;
+                else if (field && pn) pass[--pn] = 0;
+                else if (!field && name_excess) name_excess--;
+                else if (!field && nn) name[--nn] = 0;
+                redraw = 1;
+            } else if (field && c >= 32 && c <= 126) {
+                if (pn < AUTH_MAX_PASSWORD) pass[pn++] = (char)c;
+                else if (excess != 0xffffffffu) excess++;
+                redraw = 1;
+            } else if (!field && c >= 32 && c <= 126) {
+                if (nn < USER_NAME_MAX) name[nn++] = (char)c;
+                else if (name_excess != 0xffffffffu) name_excess++;
+                redraw = 1;
+            }
+        }
+
+        if (redraw || !gw_cursor_bg_valid || mx != gw_cursor_bg_x || my != gw_cursor_bg_y) {
+            gw_cursor_restore_bg();
+            if (redraw) {
+                const char *title = mode == GW_SESSION_LOCK ? "Session locked" :
+                    mode == GW_SESSION_SWITCH ? "Switch user?" :
+                    mode == GW_SESSION_SIGNIN ? "Cerulia sign-in" : "Programs still running";
+                gw_fill(x, y, w, h, 0x1B2A39u);
+                gw_frame(x, y, w, h, 0x647588u);
+                gfx_draw_text_scaled(x + 14, y + 13, title, 0x0F, -1,
+                                     gw_strlen(title) * 16 <= w - 28 ? 2 : 1);
+                if (mode == GW_SESSION_SWITCH || mode == GW_SESSION_BUSY) {
+                    gfx_draw_text_scaled(x + 14, y + 53,
+                        mode == GW_SESSION_SWITCH ? "Open windows will be closed." :
+                                                   "Close running programs first.", 0x0F, -1, 1);
+                    if (mode == GW_SESSION_SWITCH) {
+                        gfx_draw_text_scaled(x + 14, y + 73, "Unsaved changes will be lost.", 0x0F, -1, 1);
+                        gw_session_button(x + 14, button_y, 82, "Cancel");
+                    }
+                } else {
+                    char masked[AUTH_MAX_PASSWORD + 1];
+                    unsigned shown = pn + (excess != 0);
+                    if (shown > (unsigned)(input_w - 10) / 8u) shown = (unsigned)(input_w - 10) / 8u;
+                    for (unsigned i = 0; i < shown; i++) masked[i] = '*';
+                    masked[shown] = 0;
+                    gfx_draw_text_scaled(x + 14, y + 53, "User", 0x0F, -1, 1);
+                    gw_session_field(input_x, y + 47, input_w,
+                                     mode == GW_SESSION_LOCK ? user_current_name() : name, !field);
+                    gfx_draw_text_scaled(x + 14, y + 83, "Password", 0x0F, -1, 1);
+                    gw_session_field(input_x, y + 77, input_w, masked, field);
+                    if (hint) gfx_draw_text_scaled(x + 14, y + 139, hint, 0x0E, -1, 1);
+                }
+                gw_session_button(x + w - 96, button_y, 82,
+                    mode == GW_SESSION_LOCK ? "Unlock" : mode == GW_SESSION_SIGNIN ? "Sign in" :
+                    mode == GW_SESSION_SWITCH ? "Switch" : "OK");
+                redraw = 0;
+            }
+            gw_cursor_save_bg(mx, my);
+            gw_cursor_draw(mx, my);
+        }
+        if (!c && !click) asm volatile("sti; hlt");
+    }
+    auth_wipe(pass, sizeof(pass));
+    keyboard_discard_boot_input();
+    keyboard_set_private_input(0);
+    uint32_t release_start = g_pit_ticks;
+    while ((mouse_get_buttons() & 1) && (uint32_t)(g_pit_ticks - release_start) < 250u) {
+        keyboard_getchar(); /* polls USB input, but never dispatches a queued click/key */
+        asm volatile("sti; hlt");
+    }
+    keyboard_discard_boot_input();
+    mouse_btn_ev_flush();
+    gw_cursor_bg_valid = 0;
+    if (ok && mode == GW_SESSION_LOCK) serial_write("DESKTOP: unlocked\n");
+    if (ok && mode == GW_SESSION_SIGNIN) serial_write("DESKTOP: signed in\n");
+    return ok;
+}
+
+void gw_forget_session(void)
+{
+    /* A different account must not inherit cached text or a previous desktop. */
+    auth_wipe(gw_windows, sizeof(gw_windows));
+    auth_wipe(fm_entries, sizeof(fm_entries));
+    auth_wipe(fm_file_buf, sizeof(fm_file_buf));
+    auth_wipe(fm_file_name, sizeof(fm_file_name));
+    fm_count = fm_scroll = fm_sel = fm_mode = fm_file_len = fm_file_scroll = 0;
+    auth_wipe(np_buf, sizeof(np_buf));
+    auth_wipe(np_fname, sizeof(np_fname));
+    np_row = np_col = np_scroll = np_menu = np_dirty = 0;
+    auth_wipe(term_buf, sizeof(term_buf));
+    auth_wipe(term_hist, sizeof(term_hist));
+    auth_wipe(term_input, sizeof(term_input));
+    term_nrows = term_caret = term_input_base = term_input_len = term_hist_count = 0;
+    term_cols = TERM_COLS;
+    term_hist_idx = -1;
+    auth_wipe(pt_canvas, sizeof(pt_canvas));
+    pt_init = 0;
+    wv_init();
+    br_state = BR_STATE_IDLE;
+    gw_last_icon_hover = -1;
+    gw_focused_wnd = NULL;
+    gw_start_menu_active = 0;
+    gw_cursor_bg_valid = 0;
+}
+
+void gw_demo(void)
+{
+    gw_gui_active = 1;
+    gw_win10_palette();   /* 先写默认 Win10 槽位 */
+    gw_init();            /* 再恢复持久化主题（刷新 F0/F1/F2 覆盖默认） */
+    gw_quit = 0;
+    gw_session_request = 0;
+    gw_start_menu_active = 0;
+    gw_cursor_bg_valid = 0;
+    gw_dirty = 1;
+    /* GUI 模式下 shell 输出重定向到终端窗口缓冲 */
+    terminal_set_gfx_hook(gw_term_output);
+    /* shell 游戏命令（games/guess/tictactoe/snake）在图形桌面走图形入口 */
+    games_set_gui_launcher(gw_launch_gui_game);
+
+    /* 不自动打开窗口：保持桌面干净，避免窗口覆盖桌面图标导致“应用打不开” */
+    /* （需要时由用户点击桌面图标 / 开始菜单启动） */
+
+    int last_mx = -1, last_my = -1, last_sec = -1, last_bt = 0;
+    int changed_user = 0;
+    for (;;) {
+        int mx = mouse_get_x(), my = mouse_get_y();
+        int bt = mouse_get_buttons();
+        int c = keyboard_getchar();
+
+        int mouse_moved = (mx != last_mx || my != last_my);
+        int btn_pressed = (bt & 1) && !(last_bt & 1);
+        int btn_released = !(bt & 1) && (last_bt & 1);
+        int sec = gw_bcd(gw_cmos_read(0x00));
+        int sec_changed = (sec != last_sec);
+        if (sec_changed) last_sec = sec;
+
+        /* 新的一帧：损伤从零记起。本帧所有重绘入口各自 gw_dmg_add，
+         * 收尾擦旧光标时按它排除"已被重画成新内容"的像素。 */
+        gw_dmg_reset();
+
+        if (c) {
+            if (c == 0x1B) {
+                if (gw_start_menu_active) gw_start_menu_active = 0;
+            } else {
+                gw_handle_key(c);
+            }
+            gw_dirty = 1;
+        }
+        /* 鼠标按下/释放：全屏重绘一次，保证窗口/菜单/图标交互结果立即可见 */
+        if (btn_pressed || btn_released) gw_dirty = 1;
+
+        /* 释按即终 drag：光标压在任务栏/开始菜单/GNOME Dock 上时
+         * gw_handle_desktop_mouse 直接返回 1，gw_handle_mouse 根本不会被
+         * 调用——漏清 moving 的后果见 gw_end_drags 注释 */
+        if (btn_released) gw_end_drags();
+
+        /* 按键沿补派发：TCG 全屏重绘 200-400ms 期间的"按下+松开"整段落在
+         * 两次电平采样之间，btn_pressed/last_btn 边沿检测永远看不到按下沿
+         * （开始按钮/标题按钮/双击最大化"点了没反应"的根因）。驱动把每次
+         * 按键变迁连同发生时刻排进队列（mouse.c），这里按时间序补派发，
+         * 事件时刻写进 gw_ev_tick（双击 400ms 判定按真实发生时刻算）。
+         * handler 的 prev_btn/last_btn 自带去重，与下方常规电平派发不双触发 */
+        {
+            mouse_btn_ev_t ev;
+            while (!gw_session_request && mouse_btn_ev_pop(&ev)) {
+                gw_evt_popped++;
+                if ((ev.prev & 1) && !(ev.buttons & 1)) gw_end_drags();
+                gw_ev_tick = ev.tick;
+                /* 按事件发生坐标派发：用帧采样位置会把点击投到陈旧坐标上
+                 * （实测 C8：菜单开着时补派发落到"关机"行 → guest 直接断电） */
+                if (!gw_handle_desktop_mouse(ev.mx, ev.my, ev.buttons))
+                    gw_handle_mouse(ev.mx, ev.my, ev.buttons);
+                gw_ev_tick = 0;
+                gw_dirty = 1;
+            }
+            /* 补派发后 bt 已陈旧（帧顶采样，可能早于队列里的变迁）：
+             * 不刷新就用旧电平派发会幻影"释按+再按下"（双击最大化误触发）
+             * ——用驱动当前电平继续，边沿由 handler 静态量去重 */
+            bt = mouse_get_buttons();
+        }
+
+        if (!gw_session_request && !gw_handle_desktop_mouse(mx, my, bt))
+            gw_handle_mouse(mx, my, bt);
+        gw_dispatch_cnt++;
+        if (gw_session_request) {
+            int action = gw_session_request;
+            gw_session_request = 0;
+            gw_end_drags();
+            if (user_session_busy()) {
+                gw_session_dialog(GW_SESSION_BUSY);
+            } else if (action == GW_SESSION_LOCK) {
+                gw_session_dialog(GW_SESSION_LOCK);
+            } else if (gw_session_dialog(GW_SESSION_SWITCH)) {
+                if (user_logout() == 0) {
+                    shell_forget_session();
+                    changed_user = 1;
+                    gw_session_dialog(GW_SESSION_SIGNIN);
+                } else {
+                    gw_session_dialog(GW_SESSION_BUSY);
+                }
+            }
+            gw_dirty = 1;
+            last_mx = last_my = -1;
+            last_bt = 0;
+            continue;
+        }
+        if (gw_quit) break;
+
+        /* 事件处理可能整段跑一个游戏（桌面图标双击 -> gw_run_game 阻塞），
+         * 游戏自带光标协议、自己擦自己画。它的擦除时刻不能算进本帧的
+         * 消失窗口计量，清掉残留戳记。 */
+        gw_cur_erase_tick = 0;
+
+        /* 拖动中：仅重绘 上一帧位置∪当前位置 的合并区域，避免全屏重绘闪烁。
+         * 搬移前的光标擦除在 gw_drag_move 内部做（blit 会把精灵像素一起
+         * 搬走）；没位移的帧不擦——那一帧只走全屏重绘，光标不该消失。 */
+        int dragging = 0;
+        gw_window_t *drag_w = NULL;
+        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+            if (gw_windows[i].used && gw_windows[i].moving) { dragging = 1; drag_w = &gw_windows[i]; break; }
+        }
+        if (dragging && drag_w) {
+            gw_drag_move(drag_w);
+            gw_dirty = 0;
+        }
+
+        /* 浏览器小恐龙帧泵：聚焦且运行中时 ~60FPS 重绘窗口（16bpp 走双缓冲，
+         * 整窗 blit 无闪动）。**不**在泵前擦光标：老实现先擦再泵，泵一帧
+         * 多久（TCG 下整窗离屏绘制可 >100ms）光标就消失多久——小恐龙开着
+         * 时鼠标等于不存在。现在光标旧精灵一直留在 LFB 里，泵完由收尾的
+         * gw_cursor_restore_bg_excl 按损伤精确擦（两条回传带之外的区域
+         * 缓存仍然有效）。物理步进在 browser_draw 内按 g_pit_ticks 推进 */
+        {
+            gw_window_t *bw = NULL;
+            for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+                gw_window_t *wi = &gw_windows[i];
+                if (wi->used && !wi->hidden && !wi->moving && wi->focused &&
+                    (unsigned long)wi->user == (unsigned long)GW_APP_BROWSER) {
+                    bw = wi;
+                    break;
+                }
+            }
+            if (bw && br_state == BR_STATE_RUN &&
+                (uint32_t)(g_pit_ticks - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
+                gw_game_last_draw_ms = g_pit_ticks;
+                if (gw_bb_begin()) {
+                    gw_draw_window(bw);
+                    /* 整窗画进离屏（RAM，快），仅回传两条动态带：
+                     * 顶带 = 标题栏+工具栏+分数+云；底带 = 恐龙(跳跃顶点)/
+                     * 仙人掌/地面线/碎石。中部纯白区帧间不变，不回传，
+                     * LFB 搬运量 ~1/3（QEMU TCG 下单帧可 >100ms，很关键）*/
+                    int oy = gw_oy(bw);
+                    int ph = bw->inner_h - BR_TOOLBAR_H - 1;
+                    int gy = oy + BR_TOOLBAR_H + 1 + ph - 24;
+                    int by0 = gy - 104, by1 = gy + 16;
+                    if (by0 < oy + BR_TOOLBAR_H + 1) by0 = oy + BR_TOOLBAR_H + 1;
+                    if (by1 > bw->y + bw->h) by1 = bw->y + bw->h;
+                    int top_h = (oy + BR_TOOLBAR_H + 57) - bw->y;
+                    if (top_h > bw->h) top_h = bw->h;
+                    /* 损伤 = 真正回传 LFB 的两条带（不是整窗！中部没回传，
+                     * 旧光标精灵在中部还得靠缓存擦） */
+                    gw_dmg_add(bw->x, bw->y, bw->w, top_h);
+                    if (by1 > by0)
+                        gw_dmg_add(bw->x, by0, bw->w, by1 - by0);
+                    gw_bb_end(bw->x, bw->y, bw->w, top_h);
+                    if (by1 > by0)
+                        gw_bb_end(bw->x, by0, bw->w, by1 - by0);
+                } else {
+                    /* 8bpp/超限回退：整窗直绘 LFB */
+                    gw_dmg_add(bw->x, bw->y, bw->w, bw->h);
+                    gw_draw_window(bw);
+                }
+            }
+        }
+
+        int taskbar_redrawn = 0;
+        if (gw_dirty) {
+            gw_draw_all();
+            gw_dirty = 0;
+            taskbar_redrawn = 1;
+        } else if (mouse_moved) {
+            /* 拖动中已由上面的合并区域重绘处理；其余移动走局部重绘（8bpp/16bpp 均有光标背景缓存，无需全屏） */
+            int th = gw_taskbar_h();
+            gw_dirty_from_mouse(mx, my, th);
+            if (gw_taskbar_dirty) {
+                gw_draw_taskbar();
+                gw_taskbar_dirty = 0;
+                taskbar_redrawn = 1;
+            } else if (gw_dirty) {
+                gw_draw_all();
+                gw_dirty = 0;
+                taskbar_redrawn = 1;
+            }
+        }
+        /* 秒变化：仅重绘任务栏刷新时钟（8bpp/16bpp 均局部重绘，光标背景缓存防残影） */
+        if (sec_changed && !taskbar_redrawn) {
+            gw_draw_taskbar();
+        }
+        /* 系统监视器：SysInfo 窗口打开时每秒刷新（运行时长/窗口数动态变化）。
+         * **只重绘该窗口本身**：老实现置 gw_dirty=1 走全屏重绘（260 万像素），
+         * TCG 下单次 200ms+——开着 System Info 就等于每秒一次整屏闪烁
+         * （2026-10-25 "闪动还是太严重"排查出的第二源；真机上也白烧
+         * 一整帧带宽）。gw_redraw_region 登记自己的矩形为损伤，收尾的
+         * gw_cursor_restore_bg_excl 只擦窗口外的旧光标部分，无残影。 */
+        if (sec_changed) {
+            for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+                gw_window_t *w = &gw_windows[i];
+                if (w->used && !w->hidden &&
+                    (unsigned long)w->user == (unsigned long)GW_APP_SYSINFO) {
+                    gw_redraw_region(w->x, w->y, w->w, w->h);
+                    break;
+                }
+            }
+        }
+
+        /* 收尾：先擦旧光标（跳过已被本帧重绘覆盖的像素），再按新位置
+         * 保存背景并重画。**擦除必须放在所有重绘之后**——老实现放在
+         * 开头，重绘多久光标就消失多久（点一次鼠标全屏重绘 100-300ms，
+         * 就是 2026-10-25 用户报的"有时候鼠标会消失"）。
+         * 安静帧（没重绘、指针没动、位置没变）整段跳过：光标已经在
+         * LFB 里画好，再擦一遍画一遍只会让光标区帧帧闪烁——WHPX 下
+         * 空闲主循环 2-3ms 一迭代、擦+存+画占大半，LFB 光标区约一半
+         * 时间是空的，QEMU screendump 并发采样随机抓到无光标/半画
+         * 帧（探针 C1 级红因，2026-11-05 实证：截到过画到一半的精灵）。 */
+        {
+            int cx = mx, cy = my;
+            if (cx > GFX_W - 16) cx = GFX_W - 16;
+            if (cy > GFX_H - 16) cy = GFX_H - 16;
+            if (!gw_cursor_bg_valid || gw_dmg_n > 0 || mouse_moved ||
+                cx != gw_cursor_bg_x || cy != gw_cursor_bg_y) {
+                gw_cursor_restore_bg_excl();
+                gw_cursor_save_bg(mx, my);
+                gw_cursor_draw(mx, my);
+            }
+        }
+
+        /* 消失窗口计量：本帧若擦过光标，记录 擦除->重画 的间隔 */
+        if (gw_cur_erase_tick) {
+            uint32_t gap = (uint32_t)(g_pit_ticks - gw_cur_erase_tick);
+            if (gap > gw_cur_gap_max) gw_cur_gap_max = gap;
+            gw_cur_erase_tick = 0;
+        }
+
+        last_mx = mx;
+        last_my = my;
+        last_bt = bt;
+    }
+
+    /* 先解除 tty 输出重定向：GUI 期间 terminal_writestring 全部走 gw_term_output
+     * 且不更新 terminal_row/column，若不清 hook，返回文本模式后 shell 的
+     * banner/提示符/命令输出仍被重定向到已不可见的 GUI 缓冲，屏幕只剩按键回显，
+     * 行列状态与屏幕脱节，表现为"显示不完整 + 按键出竖线 + clear 无效"。 */
+    terminal_set_gfx_hook(NULL);
+    gfx_restore_text();
+    if (changed_user) terminal_reset_session();
+    gw_gui_active = 0;
+}
+
+/* gw_start: 初始化图形模式，播放开机动画，进入窗口 GUI */
+void gw_start(void)
+{
+    gfx_init();
+    gfx_set_palette();
+    gfx_load_font();
+    /* mouse_init 在内核启动早期执行（当时 GFX 仍是 320x200 默认值），
+     * 进入实际分辨率桌面后把指针重新居中 */
+    mouse_warp(GFX_W / 2, GFX_H / 2);
+    gw_boot_anim();
+    gw_demo();
+}

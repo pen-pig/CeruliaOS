@@ -1,0 +1,683 @@
+/*
+ * ahci.c - AHCI 1.3 SATA 磁盘驱动（真机点亮 H1b）
+ *
+ * 关键阶段全部经 dmesg_write 打点（真机串口诊断通道，见 H1a）：
+ *   控制器发现/版本/端口数 -> 每实现端口的探测结果 -> 首例读/写成功。
+ *
+ * 不可信字段上界检查（红线）：CAP.NP、PI 位图、port 序号在用作下标/循环
+ * 上界前一律夹紧到 [0, AHCI_MAX_PORTS] / 32；PRDT 长度恒为 1。
+ *
+ * 缓冲全部静态落在 .bss（19MB 区，identity 映射 == 物理地址），AHCI 直接拿
+ * 内核地址当物理地址用，无需 bounce。轮询 CI 位 + 超时 fail closed，不接 IRQ。
+ *
+ * 2026-10-18 真机 bring-up 审查（QEMU test_ahci 10/10 绿的前提下修了三处
+ * QEMU 看不见的问题，详见各点注释）：
+ *   1. 命令头 W 位曾用 bit 7（P 位）——QEMU 按命令字定向 DMA，不读该位；
+ *      真机 HBA 按 W 位编程总线主控方向，写命令会坏。已修 + 命名宏钉死。
+ *   2. BOHC 握手曾重写 BOS 却等 OOS——真机 BIOS 持控制器时必等满 1 秒且
+ *      拿不到所有权。已按规范 10.6 修（置 OOS，等 OOS=1 && BOS=0）。
+ *   3. ABAR 页映射 uint32 回绕（0xFFFFF000 一带）+ pa=0 不设防。已修。
+ * 另显式关 PxIE。HBA reset（GHC.HR）仍保持关闭：端口级 stop/COMRESET 已
+ * 够用，reset 在部分控制器上会挂——真机端口起不来时再作为诊断手段开。
+ */
+#include "ahci.h"
+#include "pci.h"
+#include "paging.h"
+#include "dmesg.h"
+#include "isr.h"        /* g_pit_ticks：1ms 真实时间基准（ahci_init 在 pit_init+sti 之后） */
+
+/* ---------- 寄存器偏移（相对 ABAR） ---------- */
+#define GHC_CAP   0x00
+#define GHC_GHC   0x04
+#define GHC_IS    0x08
+#define GHC_PI    0x0C
+#define GHC_VS    0x10
+#define GHC_CAP2  0x24
+#define GHC_BOQC  0x28
+
+/* 端口寄存器（相对端口基址 0x100 + port*0x80） */
+#define PX_CLB  0x00
+#define PX_CLBU 0x04
+#define PX_FB   0x08
+#define PX_FBU  0x0C
+#define PX_IS   0x10
+#define PX_IE   0x14
+#define PX_CMD  0x18
+#define PX_TFD  0x20
+#define PX_SIG  0x24
+#define PX_SSTS 0x28
+#define PX_SCTL 0x2C
+#define PX_SERR 0x30
+#define PX_CI   0x38
+
+/* 位定义 */
+#define GHC_AE  (1u << 31)   /* AHCI Enable */
+#define GHC_HR  (1u << 0)    /* HBA Reset */
+#define GHC_IE  (1u << 1)    /* Interrupt Enable */
+
+#define PXCMD_ST   (1u << 0)  /* Start */
+#define PXCMD_SUD  (1u << 1)  /* Spin-Up Device */
+#define PXCMD_FRE  (1u << 4)  /* FIS Receive Enable */
+#define PXCMD_FR   (1u << 14) /* FIS Receive Running */
+#define PXCMD_CR   (1u << 15) /* Command List Running */
+
+/* 命令头 DW0 位定义（AHCI 1.3.1 规范表 30 / Intel AHCI 1.0 规范 Figure 8）：
+ *   CFL[4:0] 命令 FIS 长度（dword）；A(ATAPI)=5；W(写)=6；P(预取)=7；
+ *   R=8；B=9；C=10；PMP[15:12]；PRDTL[31:16]。
+ * 曾经写命令标志用 (1u << 7)——那是 P 位，W 位（bit 6）根本没置。QEMU 对
+ * DMA 命令按 FIS 里的命令字定向（hw/ide/core.c 的 IDE_DMA_WRITE 分派），
+ * 读都不读这个位，所以 E2E 全程绿；真机 HBA 按 W 位编程总线主控 DMA 方向，
+ * 写命令 W=0 会被当成"设备→内存"，数据永远到不了盘（或协议错误超时）。
+ * 双处佐证：Intel AHCI 1.0 规范 Figure 8（W 在 06 行）+ QEMU
+ * hw/ide/ahci-internal.h 的 AHCI_CMD_WRITE = (1 << 6)。 */
+#define CH_CFL(fis_dwords) ((uint32_t)(fis_dwords))     /* bits 4:0 */
+#define CH_ATAPI  (1u << 5)
+#define CH_WRITE  (1u << 6)   /* 1 = 系统内存→设备（写） */
+#define CH_PREFETCH (1u << 7)
+#define CH_RESET  (1u << 8)
+#define CH_BIST   (1u << 9)
+#define CH_CLR_BUSY (1u << 10)
+#define CH_PMP(p) ((uint32_t)(p) << 12)
+#define CH_PRDTL(n) ((uint32_t)(n) << 16)
+
+/* BIOS/OS 所有权交接（BOHC @ ABAR+0x28，AHCI 1.3.1 规范 3.1.11 / 10.6）：
+ *   bit0 BOS = BIOS 持有；bit1 OOS = OS 请求（拿到所有权的条件是
+ *   OOS 读回 1 且 BOS 读回 0）；bit2 SOOE；bit3 OOC(RWC)；bit4 BB = BIOS
+ *   正在为交接做清理。
+ * 曾经这里写 boqc|1（又写了一遍 BOS）却等 bit1——OOS 从未被置起来，每次
+ * 必等满 1 秒且所有权根本拿不到。真机 BIOS 从 SATA 启动时 BOS 恒为 1，
+ * 这条路径必踩（QEMU 未实现 BOHC，读回 0，所以 E2E 看不见）。
+ * 注意：BOHC 不受 HBA reset 影响。 */
+#define BOHC_BOS (1u << 0)
+#define BOHC_OOS (1u << 1)
+#define BOHC_BB  (1u << 4)
+
+#define SSTS_DET(p) ((p) & 0x0Fu)
+#define TFD_ERR     (1u << 0)
+#define TFD_BSY     (1u << 7)
+
+#define SIG_ATA 0x00000101u   /* SATA 直连 ATA 设备（硬盘） */
+#define SIG_ATAPI 0xEB140101u
+
+#define AHCI_CMD_TIMEOUT 2000000u
+
+/* BIOS/OS 所有权交接（BOQC.OS）的等待上限（毫秒）。规范给的是"最多 2 秒
+ * 无响应即放弃"，这里给 1 秒：启动路径上等太久不如直接继续，让后面的
+ * HBA Reset 去暴露控制器状态。 */
+#define AHCI_BOQC_HANDSHAKE_MS 1000u
+
+/* ---- 真实时间上限（毫秒）----
+ * 曾经全部用"迭代次数"当时间：等 SSTS.DET 的上限是 500 万次 MMIO 读，
+ * 5 个空口每次都跑满 = 2500 万次读 ≈ 2.9 秒开机延迟（实测 PCI->FS 从
+ * 0.006s 涨到 2.87s）。MMIO 读一次的成本在不同机器上差一个数量级，
+ * 所以等待一律用 g_pit_ticks(1ms) 计时，并让没有设备的口早退。
+ */
+#define AHCI_LINK_WAIT_MS   150u   /* 链路建立（DET==3）上限 */
+#define AHCI_ABSENT_MS       20u   /* DET==0 持续这么久即判空口，不再傻等 */
+#define AHCI_ENGINE_MS       50u   /* FRE/ST 起停上限 */
+#define AHCI_SIG_MS          50u   /* 等设备回签名 FIS 上限 */
+#define AHCI_CMD_MS        2000u   /* 单条命令完成上限（慢盘/真机留足） */
+
+/* 以 g_pit_ticks 为基准的忙等（1ms 粒度） */
+static void ahci_delay_ms(uint32_t ms) {
+    uint32_t t0 = g_pit_ticks;
+    while ((uint32_t)(g_pit_ticks - t0) < ms) { }
+}
+
+/* ---------- DMA 缓冲（.bss 19MB 区，identity 映射 == 物理地址） ---------- */
+static uint8_t g_cl[AHCI_MAX_PORTS][1024] __attribute__((aligned(1024)));
+static uint8_t g_fb[AHCI_MAX_PORTS][256]  __attribute__((aligned(256)));
+static uint8_t g_ct[AHCI_MAX_PORTS][256]  __attribute__((aligned(128)));
+static uint8_t g_id[AHCI_MAX_PORTS][512];
+
+static volatile uint32_t *g_abar;
+static uint8_t  g_online[AHCI_MAX_PORTS];
+static uint8_t  g_lba48[AHCI_MAX_PORTS];
+static uint8_t  g_port_count;
+static int      g_first_read_done;
+static int      g_first_write_done;
+
+/* ---------- 寄存器访问（ABAR 已被映射到虚拟==物理的高地址空间） ---------- */
+static inline uint32_t ar(uint32_t off) { return g_abar[off >> 2]; }
+static inline void     aw(uint32_t off, uint32_t v) { g_abar[off >> 2] = v; }
+
+/* 在时间窗内等 mask 的位全部置起；返回最后读到的值（调用方自己判断成败） */
+static uint32_t ahci_wait_set(uint32_t off, uint32_t mask, uint32_t ms) {
+    uint32_t t0 = g_pit_ticks, v = ar(off);
+    while ((v & mask) != mask) {
+        if ((uint32_t)(g_pit_ticks - t0) >= ms) break;
+        v = ar(off);
+    }
+    return v;
+}
+
+/* 在时间窗内等 mask 的位全部清空 */
+static uint32_t ahci_wait_clear(uint32_t off, uint32_t mask, uint32_t ms) {
+    uint32_t t0 = g_pit_ticks, v = ar(off);
+    while ((v & mask) != 0) {
+        if ((uint32_t)(g_pit_ticks - t0) >= ms) break;
+        v = ar(off);
+    }
+    return v;
+}
+
+/* ---------- klog 打点 ---------- */
+static void aklog(const char *s) { dmesg_write(s); }
+
+/* label + 8 位十六进制值（调试 AHCI 寄存器） */
+static void aklog_hex(const char *pre, uint32_t v, const char *suf) {
+    char buf[64];
+    int i = 0;
+    while (*pre && i < 40) buf[i++] = *pre++;
+    static const char hx[] = "0123456789ABCDEF";
+    for (int s = 28; s >= 0; s -= 4) {
+        if (i >= 48) break;
+        buf[i++] = hx[(v >> s) & 0xF];
+    }
+    while (*suf && i < 60) buf[i++] = *suf++;
+    buf[i] = 0;
+    dmesg_write(buf);
+}
+
+static void aklog_dec(const char *pre, uint32_t v, const char *suf) {
+    char buf[48];
+    int i = 0;
+    while (*pre && i < 40) buf[i++] = *pre++;
+    if (v == 0) buf[i++] = '0';
+    else {
+        char tmp[11]; int n = 0;
+        while (v) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+        while (n > 0) buf[i++] = tmp[--n];
+    }
+    while (*suf && i < 46) buf[i++] = *suf++;
+    buf[i] = 0;
+    dmesg_write(buf);
+}
+
+/* ---------- 端口起停 ---------- */
+static void ahci_stop_port(uint32_t pr) {
+    uint32_t c = ar(pr + PX_CMD);
+    if (c & PXCMD_ST) {
+        aw(pr + PX_CMD, c & ~PXCMD_ST);
+        ahci_wait_clear(pr + PX_CMD, PXCMD_CR, AHCI_ENGINE_MS);
+    }
+    c = ar(pr + PX_CMD);
+    if (c & PXCMD_FRE) {
+        aw(pr + PX_CMD, c & ~PXCMD_FRE);
+        ahci_wait_clear(pr + PX_CMD, PXCMD_FR, AHCI_ENGINE_MS);
+    }
+}
+
+/* 通用 COMRESET：SCTL.DET=1 触发 COMRESET，延时后写回 0 恢复正常工作。
+ * 链路（SSTS.DET）真正升到 3 需要端口随后被 start（ST=1）+ FIS 接收使能，
+ * 故 COMRESET 之后由调用方继续 FRE/ST 流程。延时给足（icount 下虚拟时间）。 */
+static void ahci_comreset(uint32_t pr) {
+    aw(pr + PX_SERR, ~0u);
+    aw(pr + PX_SCTL, 0x00000001u);   /* DET=1：发起 COMRESET */
+    ahci_delay_ms(2);                /* 规范：保持 >=1ms */
+    aw(pr + PX_SCTL, 0x00000000u);   /* DET=0：恢复，开始链路检测 */
+    ahci_delay_ms(2);
+}
+
+/* ---------- 提交一条 DMA 命令（槽 0，PRDT 长度 1） ----------
+ * count：扇区数（1 = 单扇区，兼容旧形态）。缓冲必须 count*512B 连续
+ * （.bss identity 映射，AHCI 拿内核地址当物理地址用）。 */
+static int ahci_submit(uint8_t port, uint8_t ata_cmd, int is_write,
+                       uint32_t lba, void *buf, uint32_t count) {
+    if (port >= AHCI_MAX_PORTS) return -1;
+    if (count == 0 || count > 128u) return -1;   /* PRDT 单条目上限内 */
+    /* 注意：探测路径在置 g_online 之前就要发 IDENTIFY，这里不能按
+     * g_online 拦——否则探测自锁（IDENTIFY 永远发不出去，曾踩）。
+     * online 门槛由 read/write_sector 的调用方各自把关。 */
+
+    uint8_t *cl = g_cl[port];
+    uint8_t *ct = g_ct[port];
+    uint32_t pr = 0x100u + (uint32_t)port * 0x80u;
+
+    /* 命令头：清 8 个 dword */
+    for (int i = 0; i < 8; i++) ((uint32_t *)cl)[i] = 0;
+    /* CFL=5（CFIS 5 dword），W=写标志（bit 6，见 CH_WRITE 注释里的真机事故），
+     * PRDTL=1。曾误用 bit 7（P 位）当 W——QEMU 不读该位所以测试照绿。 */
+    ((uint32_t *)cl)[0] = CH_CFL(5u) | (is_write ? CH_WRITE : 0u) | CH_PRDTL(1u);
+    ((uint32_t *)cl)[2] = (uint32_t)(size_t)ct;   /* CTBA */
+    ((uint32_t *)cl)[3] = 0;                       /* CTBAU */
+
+    /* 命令表：清 64 个 dword（256 字节） */
+    for (int i = 0; i < 64; i++) ((uint32_t *)ct)[i] = 0;
+
+    /* H2D 寄存器 FIS（20 字节），位于命令表偏移 0 */
+    ct[0] = 0x27;                       /* FIS type */
+    ct[1] = 0x80;                       /* C=1（命令），PM port=0 */
+    ct[2] = ata_cmd;
+    ct[3] = 0;                          /* feature low */
+    /* H2D FIS 字节映射（AHCI 1.3 / QEMU 同构，曾整体错位一格，曾致扇区数恒为 0）：
+     *   [4] LBA 7:0   [5] LBA 15:8  [6] LBA 23:16  [7] device(LBA 27:24)
+     *   [8] LBA 31:24 [9] LBA 39:32 [10] LBA 47:40  [11] feature 15:8
+     *   [12] 扇区数 7:0  [13] 扇区数 15:8
+     * 扇区数必须写 [12]/[13]：写错位置会让每条读写变成 0 扇区（静默不做事）。
+     */
+    ct[4] = (uint8_t)(lba & 0xFFu);
+    ct[5] = (uint8_t)((lba >> 8) & 0xFFu);
+    ct[6] = (uint8_t)((lba >> 16) & 0xFFu);
+    ct[12] = (uint8_t)(count & 0xFFu);   /* 扇区数 7:0 */
+    ct[13] = (uint8_t)((count >> 8) & 0xFFu);   /* 扇区数 15:8 */
+    if (g_lba48[port]) {
+        ct[7] = 0x40;                   /* device: LBA 模式 */
+        ct[8] = (uint8_t)((lba >> 24) & 0xFFu);
+        ct[9] = 0;                      /* LBA 39:32（块接口 lba 为 32 位，恒 0） */
+        ct[10] = 0;                     /* LBA 47:40 恒 0 */
+        ct[11] = 0;                     /* feature 15:8 */
+    } else {
+        ct[7] = (uint8_t)(0x40u | ((lba >> 24) & 0x0Fu)); /* LBA28：高 4 位入 device */
+        ct[8] = 0;
+        ct[9] = 0; ct[10] = 0; ct[11] = 0;
+    }
+
+    /* PRDT（命令表偏移 0x80，规范定义；QEMU 硬编码同值）：单条目覆盖
+     * count*512 字节（缓冲连续），I=1 */
+    uint32_t *prdt = (uint32_t *)(ct + 0x80);
+    prdt[0] = (uint32_t)(size_t)buf;
+    prdt[1] = 0;
+    prdt[2] = 0;
+    prdt[3] = (count * 512u - 1u) | (1u << 31);
+
+    /* 结构写好后再发命令（UC MMIO 强序 + 编译器屏障） */
+    asm volatile("" ::: "memory");
+
+    /* 清错误状态，等槽 0 空闲（时间上限，不是迭代次数） */
+    aw(pr + PX_SERR, ~0u);
+    aw(pr + PX_IS, ~0u);
+    ahci_wait_clear(pr + PX_CI, 1u, AHCI_CMD_MS);
+
+    asm volatile("" ::: "memory");
+    aw(pr + PX_CI, ar(pr + PX_CI) | 1u);   /* 发出命令 */
+
+    /* 轮询 CI 位清零 = 完成；超时 fail closed */
+    if (ahci_wait_clear(pr + PX_CI, 1u, AHCI_CMD_MS) & 1u) return -1;
+
+    uint32_t tfd = ar(pr + PX_TFD);
+    if (tfd & (TFD_ERR | TFD_BSY)) return -1;
+    return 0;
+}
+
+/* ---------- 端口探测 ---------- */
+static int ahci_probe_port(uint8_t port) {
+    uint32_t pr = 0x100u + (uint32_t)port * 0x80u;
+
+    /* 干净起停端口（先清 ST/CR、FRE/FR，再装基址） */
+    ahci_stop_port(pr);
+    aw(pr + PX_CLB,  (uint32_t)(size_t)g_cl[port]);
+    aw(pr + PX_CLBU, 0);
+    aw(pr + PX_FB,   (uint32_t)(size_t)g_fb[port]);
+    aw(pr + PX_FBU,  0);
+    aw(pr + PX_SERR, ~0u);
+    /* 轮询模式：显式关端口中断。GHC.IE=0 时 HBA 本就不该拉中断线，但真机
+     * BIOS 可能给 PxIE 留着位，个别控制器照拉不误——撞进没有处理函数的
+     * IRQ 向量就是一次莫名重启。写 0 是一行钱的保险。 */
+    aw(pr + PX_IE, 0);
+
+    /* HBA reset 之后链路默认不会起来，发 COMRESET 让设备重新协商 */
+    ahci_comreset(pr);
+
+    /* FIS 接收使能（收签名 FIS 必需），等 FR */
+    aw(pr + PX_CMD, ar(pr + PX_CMD) | PXCMD_FRE);
+    if (!(ahci_wait_set(pr + PX_CMD, PXCMD_FR, AHCI_ENGINE_MS) & PXCMD_FR)) {
+        aklog_dec("AHCI: port ", port, " FIS receive enable failed");
+        return 0;
+    }
+    /* 命令列表启动，等 CR */
+    aw(pr + PX_CMD, ar(pr + PX_CMD) | PXCMD_ST);
+    if (pr == 0x100)
+        aklog_hex("AHCI: after ST PXCMD=0x", ar(pr + PX_CMD), "");
+    if (!(ahci_wait_set(pr + PX_CMD, PXCMD_CR, AHCI_ENGINE_MS) & PXCMD_CR)) {
+        aklog_dec("AHCI: port ", port, " command start failed");
+        return 0;
+    }
+
+    /* 等链路就绪：SSTS.DET == 3（设备存在 + 协商完成）。
+     * 在 QEMU ich9-ahci 上，DET 升到 3 需要端口已 start（ST=1）+ FIS 接收使能，
+     * 故放在 FRE/ST 之后轮询。
+     * 时间按真实毫秒计：DET==0（PHY 上没有任何东西）持续 AHCI_ABSENT_MS
+     * 就判空口立刻走人——空口曾经每个都傻等 500 万次 MMIO 读，是开机变慢主因。 */
+    uint32_t ssts = 0;
+    {
+        uint32_t t0 = g_pit_ticks, absent_t0 = 0;
+        for (;;) {
+            ssts = ar(pr + PX_SSTS);
+            uint32_t det = SSTS_DET(ssts);
+            if (det == 3) break;
+            uint32_t el = g_pit_ticks - t0;
+            if (det == 0) {
+                if (absent_t0 == 0) absent_t0 = g_pit_ticks;
+                if ((uint32_t)(g_pit_ticks - absent_t0) >= AHCI_ABSENT_MS) break;
+            } else {
+                absent_t0 = 0;      /* 设备有反应，重新开始计时 */
+            }
+            if (el >= AHCI_LINK_WAIT_MS) break;
+        }
+    }
+    aklog_hex("AHCI: port ", (uint32_t)port, " SSTS=0x");
+    aklog_hex("        SSTS=0x", ssts, "");
+    if (SSTS_DET(ssts) != 3) {
+        aklog_dec("AHCI: port ", port, " absent (SSTS.DET != 3)");
+        return 0;
+    }
+
+    /* 等签名：ATA 直连 = 0x00000101（FIS 接收使能后设备会回签名 FIS） */
+    uint32_t sig = 0;
+    {
+        uint32_t t0 = g_pit_ticks;
+        for (;;) {
+            sig = ar(pr + PX_SIG);
+            if (sig != 0) break;
+            if ((uint32_t)(g_pit_ticks - t0) >= AHCI_SIG_MS) break;
+        }
+    }
+    if (sig != SIG_ATA) {
+        if (sig == SIG_ATAPI)
+            aklog_dec("AHCI: port ", port, " is ATAPI (unsupported, skip)");
+        else
+            aklog_dec("AHCI: port ", port, " bad signature, skip");
+        return 0;
+    }
+
+    /* IDENTIFY DEVICE：验证读 DMA 路径并取型号 */
+    if (ahci_submit(port, 0xEC, 0, 0, g_id[port], 1u) != 0) {
+        aklog_hex("AHCI: port ", port, " IDENTIFY failed");
+        aklog_hex("        TFD=0x", ar(pr + PX_TFD), "");
+        aklog_hex("        IS =0x", ar(pr + PX_IS), "");
+        aklog_hex("        SERR=0x", ar(pr + PX_SERR), "");
+        aklog_hex("        CI =0x", ar(pr + PX_CI), "");
+        return 0;
+    }
+
+    /* 型号字符串（IDENTIFY 字 27-46，每字字节对交换） */
+    char model[42];
+    int mi = 0;
+    for (int w = 27; w <= 46 && mi < 40; w++) {
+        uint8_t b0 = g_id[port][w * 2];
+        uint8_t b1 = g_id[port][w * 2 + 1];
+        if (mi < 40) model[mi++] = (char)b1;
+        if (mi < 40) model[mi++] = (char)b0;
+    }
+    while (mi > 0 && (model[mi - 1] == ' ' || model[mi - 1] == 0)) mi--;
+    model[mi] = 0;
+
+    /* 字 83 bit10：LBA48 支持 */
+    uint16_t w83 = (uint16_t)(g_id[port][166] | ((uint16_t)g_id[port][167] << 8));
+    g_lba48[port] = (uint8_t)((w83 >> 10) & 1u);
+
+    g_online[port] = 1;
+    char line[64];
+    int li = 0;
+    const char *p = "AHCI: port ";
+    while (*p && li < 20) line[li++] = *p++;
+    if (port < 10) line[li++] = (char)('0' + port);
+    else { line[li++] = (char)('0' + port / 10); line[li++] = (char)('0' + port % 10); }
+    p = " online (model: ";
+    while (*p && li < 48) line[li++] = *p++;
+    for (int k = 0; k < mi && li < 60; k++) line[li++] = model[k];
+    p = ")";
+    while (*p && li < 62) line[li++] = *p++;
+    line[li] = 0;
+    dmesg_write(line);
+    return 1;
+}
+
+/* ---------- 对外接口 ---------- */
+int ahci_port_present(uint8_t port) {
+    if (port >= AHCI_MAX_PORTS) return 0;
+    return g_online[port];
+}
+
+uint8_t ahci_port_count(void) { return g_port_count; }
+
+/* 端口总扇区数（512B/扇区）。未上线/解析不出容量时返回 0（fail closed，
+ * 调用方据此拒绝格式化，而不是按猜的大小写盘）。
+ *
+ * IDENTIFY 字段：字 60-61 = LBA28 扇区数；字 100-103 = LBA48 扇区数
+ * （低 32 位在字 100-101）。支持 LBA48 时优先用它——LBA28 上限 128GB，
+ * 大盘上字 60-61 会被截断成 0x0FFFFFFF。 */
+uint32_t ahci_capacity(uint8_t port) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return 0;
+    const uint8_t *id = g_id[port];
+    uint32_t n = 0;
+    if (g_lba48[port]) {
+        n = (uint32_t)id[200] | ((uint32_t)id[201] << 8) |
+            ((uint32_t)id[202] << 16) | ((uint32_t)id[203] << 24);
+    }
+    if (n == 0) {
+        n = (uint32_t)id[120] | ((uint32_t)id[121] << 8) |
+            ((uint32_t)id[122] << 16) | ((uint32_t)id[123] << 24);
+    }
+    /* 0 或 0x0FFFFFFF（LBA28 截断哨兵）都当作"不可信" */
+    if (n == 0 || n == 0x0FFFFFFFu) return 0;
+    /* 块层 lba 是 uint32：>2TB 的部分截断，不溢出 */
+    if (n > 0xFFFFFFFEu) n = 0xFFFFFFFEu;
+    return n;
+}
+
+int ahci_read_sector(uint8_t port, uint32_t lba, uint8_t *buffer) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return -1;
+    uint8_t cmd = g_lba48[port] ? 0x25u : 0xC8u;   /* READ DMA EXT / READ DMA */
+    int r = ahci_submit(port, cmd, 0, lba, buffer, 1u);
+    if (r == 0 && !g_first_read_done) {
+        g_first_read_done = 1;
+        aklog("AHCI: first read OK");
+    }
+    return r;
+}
+
+int ahci_write_sector(uint8_t port, uint32_t lba, const uint8_t *buffer) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return -1;
+    uint8_t cmd = g_lba48[port] ? 0x35u : 0xCAu;   /* WRITE DMA EXT / WRITE DMA */
+    int r = ahci_submit(port, cmd, 1, lba, (void *)buffer, 1u);
+    if (r == 0 && !g_first_write_done) {
+        g_first_write_done = 1;
+        aklog("AHCI: first write OK");
+    }
+    return r;
+}
+
+int ahci_read_sectors(uint8_t port, uint32_t lba, uint32_t count, uint8_t *buffer) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return -1;
+    uint8_t cmd = g_lba48[port] ? 0x25u : 0xC8u;
+    return ahci_submit(port, cmd, 0, lba, buffer, count);
+}
+
+int ahci_write_sectors(uint8_t port, uint32_t lba, uint32_t count, const uint8_t *buffer) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return -1;
+    uint8_t cmd = g_lba48[port] ? 0x35u : 0xCAu;
+    return ahci_submit(port, cmd, 1, lba, (void *)buffer, count);
+}
+
+int ahci_init(void) {
+    const pci_device_t *dev = 0;
+
+    /* 1) PCI 扫描 class 0x0106（SATA AHCI）：class 0x01, subclass 0x06 */
+    int npci = pci_device_count();
+    for (int i = 0; i < npci; i++) {
+        const pci_device_t *d = pci_get_device(i);
+        if (!d) continue;
+        if (d->class_code == 0x01 && d->subclass == 0x06) { dev = d; break; }
+    }
+    /* 回退：已知 AHCI 控制器 PCIID（BIOS 把它设成兼容模式时 class 可能不符） */
+    if (!dev) {
+        static const struct { uint16_t v; uint16_t d; } known[] = {
+            { 0x8086, 0x2922 }, { 0x8086, 0x2829 }, { 0x8086, 0x1E02 },
+            { 0x8086, 0x8C02 }, { 0x1B4B, 0x9230 }, { 0x1CC4, 0x8630 },
+        };
+        for (int i = 0; i < npci; i++) {
+            const pci_device_t *d = pci_get_device(i);
+            if (!d) continue;
+            for (int k = 0; k < 6; k++)
+                if (d->vendor_id == known[k].v && d->device_id == known[k].d) {
+                    dev = d; break;
+                }
+            if (dev) break;
+        }
+    }
+    if (!dev) {
+        aklog("AHCI: no SATA/AHCI controller found, skipping");
+        return 0;
+    }
+
+    /* 2) 打开 PCI 内存解码 + 总线主控（DMA 必需） */
+    uint32_t cmd = pci_read_dword(dev->bus, dev->dev, dev->func, PCI_REG_COMMAND);
+    cmd |= (uint32_t)PCI_CMD_MEM_SPACE | (uint32_t)PCI_CMD_BUS_MASTER;
+    pci_write_dword(dev->bus, dev->dev, dev->func, PCI_REG_COMMAND, cmd);
+
+    /* 3) 映射 ABAR（BAR5，内存 BAR）。ABAR 通常在高物理地址，需 map 进内核空间。
+     *    选 virt = phys（高地址不与 0-32MB identity 区冲突），uncacheable。 */
+    uint32_t bar = dev->bar[5];
+    if (bar & 0x1u) {                    /* bit0=1 说明是 IO BAR，AHCI 必为 mem */
+        aklog("AHCI: BAR5 is not a memory BAR, abort");
+        return -1;
+    }
+    uint32_t pa = bar & 0xFFFFFFF0u;
+    /* pa=0 说明 BAR5 没被固件编程（或拿到的不是真 AHCI 设备）。曾经直接
+     * 拿 0 当 ABAR：映射掉 0 页（IVT/BDA 区）后读出来的"CAP/SIG"全是垃圾，
+     * 现象是控制器假上线、端口全 absent——极具误导性。fail closed。 */
+    if (pa == 0) {
+        aklog("AHCI: BAR5 not programmed (pa=0), abort");
+        return -1;
+    }
+    /* 端口寄存器区 = [pa, pa + 0x100 + 31*0x80 + 0x43] ≈ 4.3KB。按页向下
+     * 对齐后最多跨 3 页，映射 4 页富余。页号用 64 位算：ABAR 落在
+     * 0xFFFFF000 附近时，uint32 的 page_pa + 3*4096 会回绕成 0x2EF0，
+     * 把低地址页映射掉、顶端寄存器区反而没映射——真机上 ABAR 就经常在
+     * 0xFExxF000 这一带。 */
+    uint64_t page_pa = (uint64_t)pa & ~(uint64_t)0xFFFu;
+    for (int i = 0; i < 4; i++) {
+        uint64_t pg = page_pa + (uint64_t)i * 4096u;
+        if (pg > 0xFFFFFFFFu) break;     /* BAR5 是 32 位区，4GB 外不映射 */
+        if (paging_map((uint32_t)pg, (uint32_t)pg, PAGING_MMIO_FLAGS) != 0) {
+            aklog_hex("AHCI: ABAR page map failed at 0x", (uint32_t)pg, "");
+            return -1;
+        }
+    }
+    g_abar = (volatile uint32_t *)(size_t)pa;
+
+    /* 诊断：确认 ABAR 物理地址与页表映射确实覆盖端口寄存器区 */
+    {
+        uint32_t qp = 0, qf = 0;
+        int q1 = paging_query(pa, &qp, &qf);
+        int q2 = paging_query(pa + 0x128, &qp, &qf);
+        aklog_hex("AHCI: ABAR pa=0x", pa, "");
+        aklog_hex("AHCI: GHC pg phys=0x", q1 == 0 ? qp : 0, q1 == 0 ? " ok" : " UNMAPPED");
+        aklog_hex("AHCI: SSTS pg phys=0x", q2 == 0 ? qp : 0, q2 == 0 ? " ok" : " UNMAPPED");
+        aklog_hex("AHCI: reread CAP=0x", ar(GHC_CAP), "");
+        aklog_hex("AHCI: SIG@0x124=0x", ar(0x124), "");
+        aklog_hex("AHCI: SSTS@0x128=0x", ar(0x128), "");
+    }
+
+    /* 4) BIOS/OS 所有权交接（BIOS 从 SATA 启动时 BOS 恒为 1，真机必踩）。
+     *    正确序列（规范 10.6）：置 OOS 请求 → 等 OOS 读回 1 且 BOS 读回 0
+     *    （BB 清 0 表示 BIOS 清理完毕）。拿不到就带日志继续——让后面的
+     *    端口探测去暴露状态，比死在握手上好。 */
+    uint32_t bohc = ar(GHC_BOQC);
+    if (bohc & BOHC_BOS) {
+        aklog_hex("AHCI: BIOS holds controller (BOHC=0x", bohc, "), requesting");
+        aw(GHC_BOQC, bohc | BOHC_OOS);
+        /* 用 g_pit_ticks 计时，不用迭代次数。固定 20万次空转的墙钟时间
+         * 取决于 CPU 频率、cache 状态、是否被中断打断 —— 同一个数在
+         * 一台机器上可能是 2ms 也可能是 200ms，不能当超时用。
+         * 这也是本文件头的自订原则：等硬件一律用真实时间基准。 */
+        uint32_t bt0 = g_pit_ticks;
+        for (;;) {
+            uint32_t b = ar(GHC_BOQC);
+            if ((b & BOHC_OOS) && !(b & BOHC_BOS)) {
+                aklog("AHCI: OS ownership acquired");
+                break;
+            }
+            if ((uint32_t)(g_pit_ticks - bt0) >= AHCI_BOQC_HANDSHAKE_MS) {
+                /* 有些 BIOS 不响应 OOS。带值打日志：真机 bring-up 时这行
+                 * 直接说明"所有权没拿到"，比沉默继续有价值。 */
+                aklog_hex("AHCI: BOQC handoff timeout, BOHC=0x", b, "");
+                break;
+            }
+        }
+    }
+
+    /* 5) AHCI Enable + HBA Reset */
+    if (!(ar(GHC_GHC) & GHC_AE)) {
+        aw(GHC_GHC, ar(GHC_GHC) | GHC_AE);
+    }
+    if (!(ar(GHC_GHC) & GHC_AE)) {
+        aklog("AHCI: cannot set AE (AHCI Enable), abort");
+        return -1;
+    }
+#if 0
+    aw(GHC_GHC, ar(GHC_GHC) | GHC_HR);
+    for (uint32_t t = 0; t < 1000000u; t++)
+        if (!(ar(GHC_GHC) & GHC_HR)) break;
+    if (ar(GHC_GHC) & GHC_HR) {
+        aklog("AHCI: HBA reset timeout, abort");
+        return -1;
+    }
+    aw(GHC_GHC, ar(GHC_GHC) | GHC_AE);   /* reset 后 AE 可能被清，重设 */
+#endif
+
+    /* 诊断：HBA reset + AE 之后，端口寄存器区是否仍可访问 */
+    {
+        aklog_hex("AHCI: post-reset SIG@0x124=0x", ar(0x124), "");
+        aklog_hex("AHCI: post-reset PXCMD@0x118=0x", ar(0x118), "");
+        aklog_hex("AHCI: post-reset SSTS@0x128=0x", ar(0x128), "");
+    }
+
+    /* 6) 统计端口并打印控制器信息 */
+    uint32_t cap = ar(GHC_CAP);
+    uint32_t vs  = ar(GHC_VS);
+    uint32_t pi  = ar(GHC_PI);
+    uint32_t nports = (cap & 0x1Fu) + 1u;     /* CAP.NP = 端口数-1 */
+    if (nports > 32u) nports = 32u;
+    uint32_t implemented = 0;
+    for (uint32_t p = 0; p < nports; p++)
+        if (pi & (1u << p)) implemented++;
+
+    aklog_hex("AHCI: CAP=0x", cap, "");
+    aklog_hex("AHCI: PI =0x", pi, "");
+    aklog_dec("AHCI: nports=", nports, "");
+
+    {
+        char line[64];
+        int li = 0;
+        const char *p = "AHCI: controller ";
+        while (*p && li < 17) line[li++] = *p++;
+        char vid[9]; int vi = 0;  /* four vendor digits, colon, four device digits */
+        uint16_t v = dev->vendor_id, dd = dev->device_id;
+        /* 简单十六进制 */
+        static const char hx[] = "0123456789ABCDEF";
+        vid[vi++] = hx[(v >> 12) & 0xF]; vid[vi++] = hx[(v >> 8) & 0xF];
+        vid[vi++] = hx[(v >> 4) & 0xF]; vid[vi++] = hx[v & 0xF];
+        vid[vi++] = ':';
+        vid[vi++] = hx[(dd >> 12) & 0xF]; vid[vi++] = hx[(dd >> 8) & 0xF];
+        vid[vi++] = hx[(dd >> 4) & 0xF]; vid[vi++] = hx[dd & 0xF];
+        for (int k = 0; k < vi && li < 28; k++) line[li++] = vid[k];
+        p = " ver ";
+        while (*p && li < 36) line[li++] = *p++;
+        line[li++] = (char)('0' + ((vs >> 16) & 0xF));
+        line[li++] = '.';
+        line[li++] = (char)('0' + ((vs >> 12) & 0xF));
+        line[li++] = (char)('0' + ((vs >> 8) & 0xF));
+        p = " ports=";
+        while (*p && li < 50) line[li++] = *p++;
+        line[li++] = (char)('0' + (nports % 10));
+        p = " impl=";
+        while (*p && li < 60) line[li++] = *p++;
+        line[li++] = (char)('0' + (implemented % 10));
+        line[li] = 0;
+        dmesg_write(line);
+    }
+
+    /* 7) 逐端口探测 */
+    g_port_count = 0;
+    for (uint8_t port = 0; port < (uint8_t)nports && port < AHCI_MAX_PORTS; port++) {
+        if (!(pi & (1u << port))) continue;
+        aklog_dec("AHCI: enter probe port ", port, " (PI set)");
+        if (ahci_probe_port(port)) g_port_count++;
+    }
+
+    aklog_dec("AHCI: ", (uint32_t)g_port_count, " port(s) online");
+    return g_port_count > 0 ? 1 : 0;
+}

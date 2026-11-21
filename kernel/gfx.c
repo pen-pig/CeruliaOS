@@ -1,0 +1,1141 @@
+#include "gfx.h"
+#include "cjk.h"
+#include "port.h"
+#include "dmesg.h"
+#include "types.h"
+#include "tty.h"
+#include "keyboard.h"
+#include "fs.h"
+#include "gfxwin.h"
+#include "shell.h"
+#include "vga_font.h"
+#include "bios_thunk.h"
+#include "paging.h"
+
+/* U3 additions for 32bpp UEFI GOP (see gfx.h): scanline stride, direct-color
+ * LUT and channel order. Defaults keep the legacy 16bpp/8bpp behavior. */
+int gfx_stride = 320;                  /* scanline stride in pixels (VBE path = width; GOP may exceed) */
+uint32_t gfx_palette32[256];           /* 32bpp LUT: index -> 0xAARRGGBB, channel order per gfx_fmt */
+int gfx_fmt = 1;                       /* 32bpp order: 1=BGRA (GOP fmt=1, QEMU), 0=RGBA (GOP fmt=0) */
+
+/* runtime resolution & framebuffer (declared in gfx.h; boot.asm stores VBE LFB at 0x5000) */
+int GFX_W = 320;
+int GFX_H = 200;
+uint8_t *gfx_fb = (uint8_t*)0xA0000;
+int gfx_bpp = 1;                      /* 1=VGA 0x13, 2=VBE 16bpp */
+uint16_t gfx_palette16[256];          /* 调色板索引 -> RGB565（VBE 16bpp 用） */
+
+/* 见 gfx.h：置 1 强制走 bios_thunk 实模式回切（VMware/真机路径的 QEMU 测试入口） */
+int gfx_skip_dispi = 0;
+
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+static inline void io_wait(void) {
+    outb(0x80, 0);
+}
+
+/* VGA 8x16 文本字体放在 plane 2，切进 GUI 图形模式后会被覆盖，所以必须先存起来 */
+static void gfx_save_font(void);
+static void gfx_restore_font(void);
+
+static uint8_t font8x8[256][8];
+// 内置 8x8 字体（空格、大小写字母、数字和常用符号）
+static const uint8_t builtin_font[][8] = {
+    [0x20] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // space
+    [0x21] = {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, // !
+    [0x22] = {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, // "
+    [0x23] = {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00}, // #
+    [0x24] = {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, // $
+    [0x25] = {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00}, // %
+    [0x26] = {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, // &
+    [0x27] = {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, // '
+    [0x28] = {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, // (
+    [0x29] = {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00}, // )
+    [0x2A] = {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, // *
+    [0x2B] = {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00}, // +
+    [0x2C] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, // ,
+    [0x2D] = {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00}, // -
+    [0x2E] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, // .
+    [0x2F] = {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00}, // /
+    [0x30] = {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, // 0
+    [0x31] = {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00}, // 1
+    [0x32] = {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, // 2
+    [0x33] = {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00}, // 3
+    [0x34] = {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, // 4
+    [0x35] = {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00}, // 5
+    [0x36] = {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, // 6
+    [0x37] = {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00}, // 7
+    [0x38] = {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, // 8
+    [0x39] = {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00}, // 9
+    [0x3A] = {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, // :
+    [0x3B] = {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06}, // ;
+    [0x3C] = {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, // <
+    [0x3D] = {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00}, // =
+    [0x3E] = {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, // >
+    [0x3F] = {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00}, // ?
+    [0x40] = {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, // @
+    [0x41] = {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00}, // A
+    [0x42] = {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, // B
+    [0x43] = {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00}, // C
+    [0x44] = {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, // D
+    [0x45] = {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00}, // E
+    [0x46] = {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00}, // F
+    [0x47] = {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00}, // G
+    [0x48] = {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, // H
+    [0x49] = {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // I
+    [0x4A] = {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, // J
+    [0x4B] = {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00}, // K
+    [0x4C] = {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00}, // L
+    [0x4D] = {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00}, // M
+    [0x4E] = {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, // N
+    [0x4F] = {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00}, // O
+    [0x50] = {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00}, // P
+    [0x51] = {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00}, // Q
+    [0x52] = {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, // R
+    [0x53] = {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00}, // S
+    [0x54] = {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // T
+    [0x55] = {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00}, // U
+    [0x56] = {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, // V
+    [0x57] = {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00}, // W
+    [0x58] = {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, // X
+    [0x59] = {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00}, // Y
+    [0x5A] = {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00}, // Z
+    [0x5B] = {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00}, // [
+    [0x5C] = {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00}, // backslash
+    [0x5D] = {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00}, // ]
+    [0x5E] = {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00}, // ^
+    [0x5F] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF}, // _
+    [0x60] = {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00}, // `
+    [0x61] = {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00}, // a
+    [0x62] = {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00}, // b
+    [0x63] = {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00}, // c
+    [0x64] = {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00}, // d
+    [0x65] = {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00}, // e
+    [0x66] = {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00}, // f
+    [0x67] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F}, // g
+    [0x68] = {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00}, // h
+    [0x69] = {0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00}, // i
+    [0x6A] = {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E}, // j
+    [0x6B] = {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00}, // k
+    [0x6C] = {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // l
+    [0x6D] = {0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00}, // m
+    [0x6E] = {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00}, // n
+    [0x6F] = {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00}, // o
+    [0x70] = {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F}, // p
+    [0x71] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78}, // q
+    [0x72] = {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00}, // r
+    [0x73] = {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00}, // s
+    [0x74] = {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00}, // t
+    [0x75] = {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00}, // u
+    [0x76] = {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00}, // v
+    [0x77] = {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00}, // w
+    [0x78] = {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00}, // x
+    [0x79] = {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F}, // y
+    [0x7A] = {0x00,0x00,0x3F,0x18,0x0C,0x06,0x3F,0x00}, // z
+    [0x7B] = {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00}, // {
+    [0x7C] = {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, // |
+    [0x7D] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, // }
+    [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
+};// 切换到 320x200x256 图形模式（VGA 模式 0x13）
+void gfx_init(void) {
+    terminal_suspend_gop();
+    gfx_save_font();   /* 切 VBE 之前先存下文本模式的 8x16 字体（plane 2），由 gfx_restore_text 还原 */
+    /* boot.asm 在实模式下做完 VBE 线性帧缓冲探测，结果写进 0x5000 的结构：
+     *   0x5000: dword LFB 物理地址（0 = 没有可用图形模式，回退 VGA 0x13）
+     *   0x5004: word  XRES
+     *   0x5006: word  YRES
+     *   0x5008: byte  BPP（16 = 16bpp RGB565）
+     * 这里不再按 hypervisor 猜：QEMU TCG、Microsoft Hv 等环境下
+     * -vga std 实际都支持 Bochs VBE，boot.asm 的探测结果可信。
+     * 兜底路径：读 VBE_DISPI ID，ID 不是 0xB0C0 就回退 VGA 0x13。 */
+    uint32_t lfb  = *(volatile uint32_t*)0x5000;
+    uint16_t vxr  = *(volatile uint16_t*)0x5004;
+    uint16_t vyr  = *(volatile uint16_t*)0x5006;
+    uint8_t  vbpp = *(volatile uint8_t*)0x5008;
+
+    /* U3: UEFI boot path (loader wrote params @0x5000 + magic @0x5010).
+     * Takes priority over legacy VBE probing. When bochs-vbe is present
+     * (QEMU: same PCI VGA as GOP) reprogram the same resolution via DISPI
+     * so text<->graphics switching keeps working; on real firmware without
+     * bochs-vbe, trust the GOP mode set by the loader and touch no register. */
+    if (*(volatile uint32_t*)0x5010 == 0x55454649u
+        && paging_lfb_ready()
+        && lfb >= 0x00100000u && lfb < 0xFFF00000u
+        && vxr >= 320 && vyr >= 200 && (vbpp == 16 || vbpp == 32)) {
+        uint32_t gstride = *(volatile uint32_t*)0x500C;
+        int dispi_ok = 0;
+        outw(0x1CE, 0x00);
+        {
+            uint16_t _vbepid = inw(0x1CF);
+            if ((_vbepid & 0xFFF0u) == 0xB0C0u) {
+                /* bochs-vbe: reprogram same res/bpp, then READ BACK and
+                 * compare. QEMU's cirrus also answers the DISPI ID but
+                 * silently ignores the mode set - without this check the
+                 * kernel would paint a 1280x1024 desktop into an LFB the
+                 * display never scans at that geometry (vertical-stripe
+                 * garbage + every mouse hit-test off, 2026-10-18 measured). */
+                outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
+                outw(0x1CE, 0x01); outw(0x1CF, vxr);   /* XRES */
+                outw(0x1CE, 0x02); outw(0x1CF, vyr);   /* YRES */
+                outw(0x1CE, 0x03); outw(0x1CF, vbpp);  /* BPP = 16 or 32 */
+                outw(0x1CE, 0x04); outw(0x1CF, 0x01);  /* VBE_DISPI_ENABLE = 1 */
+                {
+                    uint16_t rx = 0, ry = 0, rb = 0, re = 0;
+                    outw(0x1CE, 0x01); rx = inw(0x1CF);
+                    outw(0x1CE, 0x02); ry = inw(0x1CF);
+                    outw(0x1CE, 0x03); rb = inw(0x1CF);
+                    outw(0x1CE, 0x04); re = inw(0x1CF);
+                    if (rx == vxr && ry == vyr && rb == vbpp && (re & 1u))
+                        dispi_ok = 1;
+                    else
+                        dmesg_write("VBE: DISPI set failed readback, keeping GOP mode\n");
+                }
+            }
+        }
+        gfx_fmt = (*(volatile uint8_t*)0x5009 == 0) ? 0 : 1;
+        GFX_W = vxr;
+        GFX_H = vyr;
+        gfx_fb = (uint8_t*)(uint32_t)lfb;
+        gfx_bpp = (vbpp == 32) ? 4 : 2;
+        /* bochs-vbe reprogrammed: hardware stride becomes XRES and the GOP
+         * PixelsPerScanLine no longer applies. Real firmware: keep the
+         * loader-reported PixelsPerScanLine (may exceed width). */
+        gfx_stride = dispi_ok ? (int)vxr
+                              : ((gstride >= (uint32_t)vxr) ? (int)gstride : (int)vxr);
+        gfx_set_palette();                     /* build gfx_palette32 / gfx_palette16 */
+        gfx_load_font();
+        return;
+    }
+
+    /* Probe VBE_DISPI ID (bochs-vbe only). If absent (e.g. real HW without
+     * Bochs VBE), force VGA 0x13 fallback - writing to the LFB would be
+     * invisible. */
+    uint16_t _vbepid;
+    outw(0x1CE, 0x00);                  /* VBE_DISPI_INDEX_ID */
+    {
+        _vbepid = inw(0x1CF);
+        if (!gfx_skip_dispi
+            && (_vbepid & 0xFFF0u) == 0xB0C0u
+            && lfb >= 0x00100000u && lfb < 0xFFF00000u
+            && vxr >= 320 && vyr >= 200 && vbpp == 16) {
+            /* VBE LFB: use boot-probed resolution, 16bpp RGB565 (gfx_bpp=2).
+             * QEMU std (Bochs VBE) shows vertical-stripe corruption in 8bpp
+             * indexed mode, but 16bpp is stable. gfx_putpixel maps the 8-bit
+             * logical color through gfx_palette16 (set by gfx_set_palette). */
+            GFX_W = vxr;
+            GFX_H = vyr;
+            gfx_fb = (uint8_t*)(uint32_t)lfb;
+            gfx_bpp = 2;
+            gfx_stride = vxr;          /* U3: VBE dispi hardware stride = XRES */
+            /* activate via VBE_DISPI registers (bochs-vbe/QEMU).
+             * Index map: 0=ID 1=XRES 2=YRES 3=BPP 4=ENABLE. Sequence: disable,
+             * program XRES/YRES/BPP, then enable. */
+            outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
+            outw(0x1CE, 0x01); outw(0x1CF, vxr);   /* XRES */
+            outw(0x1CE, 0x02); outw(0x1CF, vyr);   /* YRES */
+            outw(0x1CE, 0x03); outw(0x1CF, 16);    /* BPP = 16 (RGB565) */
+            outw(0x1CE, 0x04); outw(0x1CF, 0x01);  /* VBE_DISPI_ENABLE = 1 */
+            /* 读回验证（fail closed）：写进去的不算数，读回来比对过才算。
+             * QEMU cirrus 应答 DISPI ID 但模式切换静默失败——不验的话内核
+             * 按 1280x1024 往 LFB 画，显示停在别的几何，竖条花屏 + 鼠标
+             * 命中全错位（2026-10-18 实测）。验不过就不认这块 LFB，落到
+             * 下面的 VGA 0x13 回退，绝不画没人看的内容。 */
+            {
+                uint16_t rx = 0, ry = 0, rb = 0, re = 0;
+                outw(0x1CE, 0x01); rx = inw(0x1CF);
+                outw(0x1CE, 0x02); ry = inw(0x1CF);
+                outw(0x1CE, 0x03); rb = inw(0x1CF);
+                outw(0x1CE, 0x04); re = inw(0x1CF);
+                if (rx == vxr && ry == vyr && rb == 16 && (re & 1u)) {
+                    gfx_set_palette();             /* build RGB565 lookup table */
+                    gfx_load_font();
+                    return;
+                }
+                dmesg_write("VBE: DISPI set failed readback, using VGA 0x13 fallback\n");
+            }
+        } else if (lfb >= 0x00100000u && lfb < 0xFFF00000u
+                   && vxr >= 320 && vyr >= 200 && vbpp == 16) {
+            /* 探测到了可用的 VBE LFB，但没有 Bochs DISPI——VMware SVGA /
+             * 真机 VESA BIOS 就是这样。没有 I/O 端口能在保护模式下切 VESA
+             * 模式，但可以实模式回切调 INT 10h 0x4F02（bios_thunk）：
+             * boot.asm 探测时把选中的模式号留在了 0x500A。
+             * fail closed：BIOS 不应答 0x004F、或读回的 mode info 与 boot
+             * 探测结果（几何/BPP/LFB 地址）有任何不一致，都落 VGA 0x13，
+             * 绝不画没人看的内容。 */
+            uint16_t vbe_mode = *(volatile uint16_t*)0x500A;
+            int set_ax = vbe_mode
+                ? bios_int10(0x4F02, (uint16_t)(vbe_mode | 0x4000u), 0, 0)
+                : -1;
+            if (set_ax == 0x004F) {
+                /* 读回 mode info（ES:DI = 0:BT_SCRATCH），逐字段比对 */
+                (void)bios_int10(0x4F01, 0, vbe_mode,
+                                 (uint16_t)(BT_SCRATCH & 0xFFFFu));
+                uint16_t xr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_XRES);
+                uint16_t yr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_YRES);
+                uint8_t  bpp = *(volatile uint8_t *)(BT_SCRATCH + VBE_MI_BPP);
+                uint32_t pb  = *(volatile uint32_t*)(BT_SCRATCH + VBE_MI_PHYS);
+                uint16_t bps = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_BPS);
+                if (xr == vxr && yr == vyr && bpp == vbpp && pb == lfb) {
+                    GFX_W = vxr;
+                    GFX_H = vyr;
+                    gfx_fb = (uint8_t*)(uint32_t)lfb;
+                    gfx_bpp = 2;
+                    /* BytesPerScanLine 是字节数；stride 以像素计。
+                     * 探测没给（0）时按宽度兜底——两种 VBE 模式都成立 */
+                    gfx_stride = bps ? (int)(bps / 2) : (int)vxr;
+                    gfx_set_palette();
+                    gfx_load_font();
+                    dmesg_write("VBE: mode set via INT 10h thunk, readback verified\n");
+                    return;
+                }
+                dmesg_write("VBE: thunk set mode but readback mismatch, VGA 0x13 fallback\n");
+            } else {
+                dmesg_write("VBE: no DISPI and INT 10h thunk failed, VGA 0x13 fallback\n");
+            }
+        }
+    }
+    /* Fallback: VGA mode 0x13 320x200x256（标准寄存器组）。
+     * 只有真机/VMware 这类没有 Bochs VBE_DISPI 的环境会走到这里——
+     * 寄存器值全部按 OSDev "Sample Register Settings" 的 mode 13h 标准表，
+     * 一个都不能错：
+     *   SR4 必须 0x06（odd/even 关）——0x0E 会把打包像素拆进 4 个平面 → 花屏
+     *   AC 恒等调色板 0x00-0x0F + AR12=0x0F 必须写——AR12=0 关掉所有颜色平面 → 黑屏
+     *   CR11 末位必须 0x0E 且 bit7=0——结尾写 0xAC 会把 CRTC 锁死，时序不生效
+     *   CR06/07/10/12/15/16/17 一整套垂直时序错 → 画面撕裂/闪烁/错位
+     * 另外：若 Bochs DISPI 仍 enabled（boot.asm 激活过 1280x1024），必须先
+     * DISPI disable 再写标准寄存器——cirrus/bochs 显示引擎在 DISPI enabled
+     * 时按 DISPI 几何扫描，标准 VGA 模式寄存器写了也不显示（2026-10-18
+     * QEMU 实测：SR/CRTC/GR/AR 全部回读正确，屏幕停在文本画面不动，
+     * 内核却按 320x200 往 0xA0000 画 → 桌面全不可见 + 鼠标命中全错位）。
+     * 真机无 DISPI（ID 不是 0xB0C0）时这段跳过，不碰未定义端口。 */
+    if ((_vbepid & 0xFFF0u) == 0xB0C0u) {
+        outw(0x1CE, 0x04); outw(0x1CF, 0x00);   /* VBE_DISPI_ENABLE = 0 */
+    }
+    dmesg_write("GFX: no VBE, VGA mode 0x13 320x200x256 fallback\n");
+    GFX_W = 320;
+    GFX_H = 200;
+    gfx_fb = (uint8_t*)0xA0000;
+    gfx_bpp = 1;
+    gfx_stride = 320;
+
+    /* 1) Miscellaneous Output: color mode, 25.175MHz, 400-line */
+    outb(0x3C2, 0x63);
+
+    /* 2) Sequencer: 先进 sync reset，写完放行 */
+    outb(0x3C4, 0x00); outb(0x3C5, 0x01);   /* SR0: sync reset */
+    outb(0x3C4, 0x01); outb(0x3C5, 0x01);   /* SR1: 8-dot chars */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);   /* SR2: all planes */
+    outb(0x3C4, 0x03); outb(0x3C5, 0x00);   /* SR3: char map A */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);   /* SR4: odd/even OFF + extended mem */
+    outb(0x3C4, 0x00); outb(0x3C5, 0x03);   /* SR0: resume */
+    io_wait();
+
+    /* 3) CRTC: 先解保护（CR11 bit7=0），写完保持解锁 */
+    outb(0x3D4, 0x11); outb(0x3D5, 0x00);
+    {
+        static const uint8_t crtc13[25] = {
+            0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, /* CR00-CR05 */
+            0xBF, 0x1F, 0x00, 0x41, 0x00, 0x00, /* CR06-CR0B */
+            0x00, 0x00, 0x00, 0x00,             /* CR0C-CR0F */
+            0x9C, 0x0E, 0x8F, 0x28,             /* CR10-CR13 */
+            0x00, 0x96, 0xB9, 0xA3              /* CR14-CR17 */
+        };
+        for (int i = 0; i < 25; i++) {
+            outb(0x3D4, (uint8_t)i);
+            outb(0x3D5, crtc13[i]);
+        }
+        /* CR11 单独收尾：0x0E = 垂直回扫结束，bit7=0 保持 CRTC 解锁 */
+        outb(0x3D4, 0x11); outb(0x3D5, 0x0E);
+    }
+    io_wait();
+
+    // Graphics Controller
+    outb(0x3CE, 0x00); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x01); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x02); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x03); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x05); outb(0x3CF, 0x40);
+    outb(0x3CE, 0x06); outb(0x3CF, 0x05);
+    outb(0x3CE, 0x07); outb(0x3CF, 0x0F);
+    outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
+
+    /* 5) Attribute Controller: 先读 0x3DA 复位 flip-flop，再写 0x00-0x14，最后 0x20 使能 */
+    (void)inb(0x3DA);
+    for (int i = 0; i < 16; i++) {
+        outb(0x3C0, (uint8_t)i);
+        outb(0x3C0, (uint8_t)i);               /* identity palette */
+    }
+    outb(0x3C0, 0x10); outb(0x3C0, 0x41);      /* mode control: 8-bit color */
+    outb(0x3C0, 0x11); outb(0x3C0, 0x00);      /* overscan */
+    outb(0x3C0, 0x12); outb(0x3C0, 0x0F);      /* color plane enable */
+    outb(0x3C0, 0x13); outb(0x3C0, 0x00);      /* horizontal pixel pan */
+    outb(0x3C0, 0x14); outb(0x3C0, 0x00);      /* color select */
+    outb(0x3C0, 0x20);                          /* enable video output */
+
+    /* 6) DAC 调色板 + 字体（与 VBE 路径一致，GUI 才能拿到 Win10 配色） */
+    gfx_set_palette();
+    gfx_load_font();
+}
+
+
+/* 进图形模式之前先备份 VGA 8x16 文本字体（plane 2，SeaBIOS 已经把它加载进显存）。
+ * GUI 期间 0xA0000 平面被 LFB/bank 映射覆盖，不备份的话退出图形模式就还原不出文本了。 */
+static uint8_t g_vga_font[256 * 16];
+static int g_vga_font_saved = 0;
+
+static void gfx_save_font(void) {
+    if (g_vga_font_saved) return;
+    /* Use the built-in 8x16 font instead of reading plane 2 back:
+     * while the sequencer is still in odd/even (text) mode, CPU reads
+     * from 0xA0000 interleave plane 0 (char codes) with plane 2 (font),
+     * producing garbage. Program the known-good font on restore. */
+    for (int i = 0; i < 256 * 16; i++)
+        g_vga_font[i] = vga_font_8x16[i];
+    g_vga_font_saved = 1;
+}
+
+/* 文本模式恢复时调用：把备份的 8x16 字体写回 plane 2（写入的参数与图形阶段相反）。 */
+static void gfx_restore_font(void) {
+    if (!g_vga_font_saved) return;
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);  /* SC4: odd/even off + extended memory */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* SC2: map mask plane 2 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: write mode 0 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: 图形模式平面写 */
+    {
+        volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
+        int n, j;
+        for (n = 0; n < 256; n++)
+            for (j = 0; j < 16; j++)
+                fp[n * 32 + j] = g_vga_font[n * 16 + j];
+    }
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* GC4: read map plane 0 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: 文本模式 */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* SC2: mask plane 0/1 only - protect font plane 2 */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even（文本模式） */
+}
+
+/* Load the built-in 8x16 font into VGA plane 2 at boot, before any text
+ * output. SeaBIOS's default ROM font differs from vga_font_8x16 on several
+ * glyphs (f/t/0/F/T...), which made text-mode rendering inconsistent with
+ * both the GUI font and the E2E test OCR table. Programming our font from
+ * the start keeps text mode, GUI rendering and the OCR font identical. */
+void gfx_text_font_init(void) {
+    gfx_save_font();
+    gfx_restore_font();
+}
+
+void gfx_restore_text(void) {
+    /* U3: UEFI boots on firmware without bochs-vbe (real GOP hardware) have
+     * no VGA text mode to restore; terminal_initialize() reuses GOP. */
+    uint32_t magic = *(volatile uint32_t*)0x5010;
+    outw(0x1CE, 0x00);
+    uint16_t vbepid = inw(0x1CF);
+    if (gfx_skip_dispi || (vbepid & 0xFFF0u) != 0xB0C0u) {
+        if (magic == 0x55454649u) return;   /* UEFI 真机 GOP：无文本模式可回 */
+        /* BIOS + 无 DISPI（VMware/真机），或强制旁路（QEMU 测同一条路）：
+         * VBE 模式是 INT 10h 设的，标准 VGA 寄存器序列切不回去（SVGA 停在
+         * VESA 几何，屏幕不动）——与 gfx_init 同路回切实模式调 mode 3。
+         * 调用方随后都会 terminal_initialize()，清屏无副作用。 */
+        bios_int10(0x0003, 0, 0, 0);
+        gfx_save_font();   /* idempotent：为下次进图形备好字体 */
+        return;
+    }
+    gfx_save_font();   /* U3: stage builtin font if gfx_init never ran (idempotent) */
+    /* disable VBE (bochs-vbe) first so VGA register sequence restores text mode */
+    outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
+    // Misc Output: enable color, 25.175MHz, 400-line
+    outb(0x3C2, 0x67);
+
+    // Sequencer: sync reset first, then text values, then resume
+    outb(0x3C4, 0x00); outb(0x3C5, 0x01);
+    outb(0x3C4, 0x01); outb(0x3C5, 0x00);
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);
+    outb(0x3C4, 0x03); outb(0x3C5, 0x00);
+    outb(0x3C4, 0x04); outb(0x3C5, 0x03);
+    outb(0x3C4, 0x00); outb(0x3C5, 0x03);
+
+    // CRTC (mode 03h full table, SeaBIOS values)
+    outb(0x3D4, 0x11); outb(0x3D5, 0x0C);  // clear CRTC write-protect
+    outb(0x3D4, 0x00); outb(0x3D5, 0x5F);
+    outb(0x3D4, 0x01); outb(0x3D5, 0x4F);
+    outb(0x3D4, 0x02); outb(0x3D5, 0x50);
+    outb(0x3D4, 0x03); outb(0x3D5, 0x82);
+    outb(0x3D4, 0x04); outb(0x3D5, 0x55);
+    outb(0x3D4, 0x05); outb(0x3D5, 0x81);
+    outb(0x3D4, 0x06); outb(0x3D5, 0xBF);   /* V Total = 191（400 行文本） */
+    outb(0x3D4, 0x07); outb(0x3D5, 0x1F);   /* Overflow（文本模式） */
+    outb(0x3D4, 0x08); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x09); outb(0x3D5, 0x4F);
+    outb(0x3D4, 0x0A); outb(0x3D5, 0x0D);
+    outb(0x3D4, 0x0B); outb(0x3D5, 0x0E);
+    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);   /* start_addr = 0x0000：文本模式显存从 0xB8000 起 */
+    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);   /* 以 0xC000 为界分 32KB 页（0x8000），相当于把显示
+                                               指针挪到 VRAM/图形缓冲区之外，免得文本模式读到花屏 */
+    outb(0x3D4, 0x0E); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x0F); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x10); outb(0x3D5, 0x9C);
+    outb(0x3D4, 0x11); outb(0x3D5, 0x8E);   /* V Retrace End（文本模式） */
+    outb(0x3D4, 0x12); outb(0x3D5, 0x8F);
+    outb(0x3D4, 0x13); outb(0x3D5, 0x28);
+    outb(0x3D4, 0x14); outb(0x3D5, 0x1F);  /* CR14: underline location (mode 3 value) */
+    outb(0x3D4, 0x15); outb(0x3D5, 0x96);
+    outb(0x3D4, 0x16); outb(0x3D5, 0xB9);
+    outb(0x3D4, 0x17); outb(0x3D5, 0xA3);   /* Mode Control（文本模式） */
+
+    // Graphics Controller (mode 03h)
+    outb(0x3CE, 0x00); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x01); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x02); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x03); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x05); outb(0x3CF, 0x10);
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);
+    outb(0x3CE, 0x07); outb(0x3CF, 0x0F);
+    outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
+
+    // Attribute Controller: standard index write (no 0x20 bit)
+    inb(0x3DA);
+    outb(0x3C0, 0x00); outb(0x3C0, 0x00);
+    outb(0x3C0, 0x01); outb(0x3C0, 0x01);
+    outb(0x3C0, 0x02); outb(0x3C0, 0x02);
+    outb(0x3C0, 0x03); outb(0x3C0, 0x03);
+    outb(0x3C0, 0x04); outb(0x3C0, 0x04);
+    outb(0x3C0, 0x05); outb(0x3C0, 0x05);
+    outb(0x3C0, 0x06); outb(0x3C0, 0x06);
+    outb(0x3C0, 0x07); outb(0x3C0, 0x07);
+    outb(0x3C0, 0x08); outb(0x3C0, 0x08);
+    outb(0x3C0, 0x09); outb(0x3C0, 0x09);
+    outb(0x3C0, 0x0A); outb(0x3C0, 0x0A);
+    outb(0x3C0, 0x0B); outb(0x3C0, 0x0B);
+    outb(0x3C0, 0x0C); outb(0x3C0, 0x0C);
+    outb(0x3C0, 0x0D); outb(0x3C0, 0x0D);
+    outb(0x3C0, 0x0E); outb(0x3C0, 0x0E);
+    outb(0x3C0, 0x0F); outb(0x3C0, 0x0F);
+    outb(0x3C0, 0x10); outb(0x3C0, 0x0C);  // Mode Control: text + line-graphics + blink
+    outb(0x3C0, 0x11); outb(0x3C0, 0x00);  // Overscan: black
+    outb(0x3C0, 0x12); outb(0x3C0, 0x0F);  // Color Plane Enable
+    outb(0x3C0, 0x13); outb(0x3C0, 0x00);  // PEL Panning
+    outb(0x3C0, 0x14); outb(0x3C0, 0x00);  // Color Select
+    outb(0x3C0, 0x20);                      // back to index mode
+
+    // clear text screen (80x25) to avoid stale framebuffer
+    {
+        volatile uint16_t* vm = (volatile uint16_t*)0xB8000;
+        int i;
+        for (i = 0; i < 80 * 25; i++) vm[i] = 0x0720;
+    }
+
+    // restore DAC palette to VGA standard 16 colors (GUI may have
+    // remapped 0xF0-0xFF entries via gw_win10_palette / gfx_set_palette)
+    {
+        static const uint8_t std_r[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
+        static const uint8_t std_g[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
+        static const uint8_t std_b[16] = {0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255};
+        outb(0x3C8, 0);
+        for (int j = 0; j < 256; j++) {
+            uint8_t idx = (uint8_t)(j & 0x0F);
+            outb(0x3C9, std_r[idx]); outb(0x3C9, std_g[idx]); outb(0x3C9, std_b[idx]);
+        }
+    }
+
+    /* Reload saved VGA 8x16 font into plane 2 so text mode shows clean glyphs
+     * after VBE LFB mapped over the 0xA0000 planes (removes the EXPERIMENT5
+     * 0x20=0xFF debug fill that produced colored blocks). */
+    gfx_restore_font();
+}
+
+void gfx_set_palette(void) {
+    static const uint8_t std_r[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
+    static const uint8_t std_g[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
+    static const uint8_t std_b[16] = {0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255};
+    if (gfx_bpp == 4) {
+        /* U3: 32bpp direct color LUT. gfx_fmt 1=BGRA (QEMU GOP fmt=1, byte
+         * order B,G,R,X - channel layout matches 0x00RRGGBB), 0=RGBA. */
+        for (int i = 0; i < 256; i++) {
+            uint8_t r, g, b;
+            if (i < 16) {
+                r = std_r[i]; g = std_g[i]; b = std_b[i];
+            } else if (i >= 0xF0 && i <= 0xF7) {
+                /* Win10 palette (gfxwin convention) */
+                static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
+                static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
+                static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
+                r = wr[i-0xF0]; g = wg[i-0xF0]; b = wb[i-0xF0];
+            } else if (i == 0xF8) { r=0x20; g=0x20; b=0x20; }  /* taskbar */
+            else if (i == 0xF9) { r=0x40; g=0x40; b=0x40; }  /* taskbar hover */
+            else {
+                r = (uint8_t)((i * 3) & 0x3F);
+                g = (uint8_t)((i * 5) & 0x3F);
+                b = (uint8_t)((i * 7) & 0x3F);
+            }
+            if (gfx_fmt == 1)
+                gfx_palette32[i] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | 0xFF000000u;
+            else
+                gfx_palette32[i] = (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
+        }
+        return;
+    }
+    if (gfx_bpp == 2) {
+        /* VBE 16bpp：调色板索引按 RGB565 展开成 16 位色 */
+        for (int i = 0; i < 256; i++) {
+            uint8_t r, g, b;
+            if (i < 16) {
+                r = std_r[i]; g = std_g[i]; b = std_b[i];
+            } else if (i >= 0xF0 && i <= 0xF7) {
+                /* Win10 palette（gfxwin 约定） */
+                static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
+                static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
+                static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
+                r = wr[i-0xF0]; g = wg[i-0xF0]; b = wb[i-0xF0];
+            } else if (i == 0xF8) { r=0x20; g=0x20; b=0x20; }  /* taskbar */
+            else if (i == 0xF9) { r=0x40; g=0x40; b=0x40; }  /* taskbar hover */
+            else {
+                r = (uint8_t)((i * 3) & 0x3F);
+                g = (uint8_t)((i * 5) & 0x3F);
+                b = (uint8_t)((i * 7) & 0x3F);
+            }
+            gfx_palette16[i] = rgb565(r, g, b);
+        }
+        return;
+    }
+    outb(0x3C8, 0);
+    for (int i = 0; i < 256; i++) {
+        uint8_t r, g, b;
+        if (i < 16) {
+            r = std_r[i]; g = std_g[i]; b = std_b[i];
+        } else if (i >= 0xF0 && i <= 0xF7) {
+            /* Win10 palette（gfxwin 约定） */
+            static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
+            static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
+            static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
+            r = wr[i-0xF0]; g = wg[i-0xF0]; b = wb[i-0xF0];
+        } else if (i == 0xF8) { r=0x20; g=0x20; b=0x20; }  /* taskbar */
+        else if (i == 0xF9) { r=0x40; g=0x40; b=0x40; }  /* taskbar hover */
+        else {
+            r = (uint8_t)((i * 3) & 0x3F);
+            g = (uint8_t)((i * 5) & 0x3F);
+            b = (uint8_t)((i * 7) & 0x3F);
+        }
+        outb(0x3C9, r); outb(0x3C9, g); outb(0x3C9, b);
+    }
+}
+
+/* 单个调色板槽位按当前 bpp 写入（16bpp=RGB565，32bpp=0xAARRGGBB 且
+ * 通道序随 gfx_fmt；8bpp 由调用方走 DAC） */
+static void gfx_pal_slot(int i, uint32_t rgb)
+{
+    uint8_t r = (uint8_t)(rgb >> 16), g = (uint8_t)(rgb >> 8), b = (uint8_t)rgb;
+    if (gfx_bpp == 2) {
+        gfx_palette16[i] = rgb565(r, g, b);
+    } else if (gfx_bpp == 4) {
+        if (gfx_fmt == 1)
+            gfx_palette32[i] = (uint32_t)b | ((uint32_t)g << 8) |
+                               ((uint32_t)r << 16) | 0xFF000000u;
+        else
+            gfx_palette32[i] = (uint32_t)r | ((uint32_t)g << 8) |
+                               ((uint32_t)b << 16) | 0xFF000000u;
+    }
+}
+
+void gfx_theme_accent(uint32_t accent)
+{
+    uint32_t d = (accent * 3) / 4;                  /* 暗一档 */
+    uint32_t l = accent + (0xFFFFFFu - accent) / 3; /* 亮一档 */
+    if (gfx_bpp != 2 && gfx_bpp != 4) {
+        /* 8bpp：DAC（6 位）——与 gfxwin 旧的 gw_set_theme 内联块一致 */
+        outb(0x3C8, 0xF0);
+        outb(0x3C9, (uint8_t)((accent >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((accent >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(accent & 0xFF) >> 2);
+        outb(0x3C8, 0xF1);
+        outb(0x3C9, (uint8_t)((d >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((d >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(d & 0xFF) >> 2);
+        outb(0x3C8, 0xF2);
+        outb(0x3C9, (uint8_t)((l >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((l >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(l & 0xFF) >> 2);
+        return;
+    }
+    /* 16/32bpp：putpixel 走 LUT，不刷新则标题文字背景（GW_C_BLUE_DARK）
+     * 永远是 gfx_set_palette 写死的默认蓝，与主题 accent 脱钩 */
+    gfx_pal_slot(0xF0, accent);
+    gfx_pal_slot(0xF1, d);
+    gfx_pal_slot(0xF2, l);
+}
+
+// ---- 从 VGA 字体 ROM 读 8x8 字体（旧实现，先留着） ----
+//void gfx_load_font(void) {
+//    outb(0x3CE, 0x04); outb(0x3CF, 0x02);
+//    outb(0x3CE, 0x05); outb(0x3CF, 0x00);
+//    outb(0x3CE, 0x06); outb(0x3CF, 0x04);
+//    uint8_t *font = (uint8_t*)0xC0000 + 0x1F * 8192;
+//    for (int i = 0; i < 256 * 8; i++) {
+//        font8x8[i / 8][i % 8] = font[i];
+//    }
+//    outb(0x3CE, 0x04); outb(0x3CF, 0x00);
+//    outb(0x3CE, 0x05); outb(0x3CF, 0x10);
+//    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);
+//}
+void gfx_load_font(void) {
+        // Use built-in font (space, digits 0-9, A-Z, a-z, . - = *); no ROM read
+    int n = (int)(sizeof(builtin_font) / sizeof(builtin_font[0]));
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 8; j++) {
+            font8x8[i][j] = builtin_font[i][j];
+        }
+    }
+    // 128..255 用内置表补齐
+    for (int i = 128; i < 256; i++) {
+        for (int j = 0; j < 8; j++) {
+            font8x8[i][j] = 0;
+        }
+    }
+}
+/* 裁剪矩形：所有绘制都过 gfx_putpixel / gfx_fill_rect，所以裁剪只需要在
+ * 这两处生效（浏览器滚动页面时必需 —— 否则文字会画到窗口边框外面）。
+ * clip_w <= 0 表示不裁剪。 */
+static int clip_x, clip_y, clip_w, clip_h;
+
+void gfx_set_clip(int x, int y, int w, int h) {
+    clip_x = x; clip_y = y; clip_w = w; clip_h = h;
+}
+
+void gfx_get_clip(int *x, int *y, int *w, int *h) {
+    if (x) *x = clip_x;
+    if (y) *y = clip_y;
+    if (w) *w = clip_w;
+    if (h) *h = clip_h;
+}
+
+void gfx_putpixel(int x, int y, uint8_t color) {
+    if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) return;
+    if (clip_w > 0) {
+        if (x < clip_x || x >= clip_x + clip_w) return;
+        if (y < clip_y || y >= clip_y + clip_h) return;
+    }
+    if (gfx_bpp == 4) {
+        /* U3: 32bpp direct color, scanline stride aware */
+        ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gfx_palette32[color];
+    } else if (gfx_bpp == 2) {
+        ((uint16_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gfx_palette16[color];
+    } else {
+        gfx_fb[(uint32_t)y * gfx_stride + x] = color;
+    }
+}
+
+/* 8bpp 下按行整段写：fill_rect 是最热的绘制调用（浏览器刷背景、窗口
+ * 边框、桌面全屏都走它），逐像素 putpixel 在 TCG 下慢一个数量级。 */
+void gfx_fill_rect(int x, int y, int w, int h, uint8_t color) {
+    if (clip_w > 0) {
+        if (x < clip_x) { w += x - clip_x; x = clip_x; }
+        if (y < clip_y) { h += y - clip_y; y = clip_y; }
+        if (x + w > clip_x + clip_w) w = clip_x + clip_w - x;
+        if (y + h > clip_y + clip_h) h = clip_y + clip_h - y;
+    }
+    if (w <= 0 || h <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+
+    for (int j = 0; j < h; j++) {
+        if (gfx_bpp == 4) {
+            uint32_t *row = (uint32_t*)gfx_fb + (uint32_t)(y + j) * gfx_stride;
+            uint32_t c32 = gfx_palette32[color];
+            for (int i = 0; i < w; i++) row[x + i] = c32;
+        } else if (gfx_bpp == 2) {
+            uint16_t *row = (uint16_t*)gfx_fb + (uint32_t)(y + j) * gfx_stride;
+            uint16_t c16 = gfx_palette16[color];
+            for (int i = 0; i < w; i++) row[x + i] = c16;
+        } else {
+            uint8_t *row = gfx_fb + (uint32_t)(y + j) * gfx_stride;
+            for (int i = 0; i < w; i++) row[x + i] = color;
+        }
+    }
+}
+
+void gfx_draw_rect(int x, int y, int w, int h, uint8_t color) {
+    for (int i = 0; i < w; i++) {
+        gfx_putpixel(x + i, y, color);
+        gfx_putpixel(x + i, y + h - 1, color);
+    }
+    for (int j = 0; j < h; j++) {
+        gfx_putpixel(x, y + j, color);
+        gfx_putpixel(x + w - 1, y + j, color);
+    }
+}
+
+void gfx_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg) {
+    uint8_t ch = (uint8_t)c;
+    for (int row = 0; row < 8; row++) {
+        uint8_t line = font8x8[ch][row];
+        for (int col = 0; col < 8; col++) {
+            gfx_putpixel(x + col, y + row, (line & (0x01 << col)) ? fg : bg);
+        }
+    }
+}
+
+void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
+    while (*s) {
+        gfx_draw_char(x, y, *s, fg, bg);
+        x += 8;
+        s++;
+    }
+}
+
+/* ---- UTF-8 文本 ----
+ *
+ * 内置 8x8 字模（VGA ROM 8x8 / builtin_font）只有 ASCII，非 ASCII 位置在
+ * gfx_load_font 里被清零。网页正文绝大多数是非 ASCII（中文网页全是中文），
+ * 直接当字节画会得到一串"什么都看不见的空白"——用户看到的是**页面加载了
+ * 但整页空白**，完全无法与"网络没通"区分。
+ *
+ * 所以这里把每个非 ASCII 码点画成一个 5x5 的空心方块（豆腐块），宽度仍
+ * 按 8px 算：至少能看出"这里有个字，排版没崩"。真要显示汉字需要嵌入
+ * 16x16 点阵字库，那是另一个量级的工作（字库本身几百 KB）。
+ */
+static void gfx_draw_tofu(int x, int y, uint8_t fg, uint8_t bg) {
+    /* 背景：只填字模那 8x8 的框，避免破坏裁剪外的相邻内容 */
+    gfx_fill_rect(x, y, 8, 8, bg);
+    for (int i = 1; i < 6; i++) {
+        gfx_putpixel(x + i, y + 1, fg);
+        gfx_putpixel(x + i, y + 6, fg);
+        gfx_putpixel(x + 1, y + i, fg);
+        gfx_putpixel(x + 6, y + i, fg);
+    }
+}
+
+/* 与 Rust 的 utf8_seq_len 保持一致（非法首字节按 1 走，画成豆腐块） */
+static uint32_t gfx_seq_len(const uint8_t *s, uint32_t i, uint32_t n) {
+    uint8_t b = s[i];
+    if (b < 0x80) return 1;
+    if (b == 0xC0 || b == 0xC1 || b >= 0xF5) return 1;
+    uint32_t l = (b & 0xE0) == 0xC0 ? 2u : (b & 0xF0) == 0xE0 ? 3u : 4u;
+    if (i + l > n) return 1;
+    for (uint32_t k = 1; k < l; k++)
+        if ((s[i + k] & 0xC0) != 0x80) return 1;
+    return l;
+}
+
+int gfx_text_width_utf8(const char *sp, uint32_t n) {
+    const uint8_t *s = (const uint8_t *)sp;
+    uint32_t i = 0;
+    int w = 0;
+    while (i < n) {
+        uint32_t l = gfx_seq_len(s, i, n);
+        if (l == 1) {
+            w += 8;
+        } else {
+            /* 与 gfx_draw_text_utf8 的步进一致：有字形 16px，否则 tofu 8px */
+            uint32_t adv = 0;
+            uint32_t cp = cjk_utf8_decode(sp + i, n - i, &adv);
+            w += (cp && cjk_lookup(cp)) ? cjk_glyph_width() : 8;
+        }
+        i += l;
+    }
+    return w;
+}
+
+int gfx_draw_text_utf8(int x, int y, const char *sp, uint32_t n,
+                       uint8_t fg, uint8_t bg) {
+    const uint8_t *s = (const uint8_t *)sp;
+    uint32_t i = 0;
+    while (i < n) {
+        uint32_t l = gfx_seq_len(s, i, n);
+        if (l == 1) {
+            if (s[i] >= 0x20 && s[i] < 0x7F) gfx_draw_char(x, y, (char)s[i], fg, bg);
+            else gfx_draw_tofu(x, y, fg, bg);   /* 控制字符也不该画出字形 */
+            x += 8;
+        } else {
+            /* 多字节序列：有字形画汉字（16px 宽），没有才退回豆腐块。
+             * 2026-10-18 前这里一律 tofu——中文网页整页空白。 */
+            uint32_t adv = 0;
+            uint32_t cp = cjk_utf8_decode((const char *)(s + i), n - i, &adv);
+            if (cp && cjk_draw_glyph(x, y, cp, fg, bg)) {
+                x += cjk_glyph_width();
+            } else {
+                gfx_draw_tofu(x, y, fg, bg);
+                x += 8;
+            }
+        }
+        i += l;
+    }
+    return x;
+}
+
+/* 按字符画点阵：每个 8x8 字形按 scale 倍放大画出（scale>=1）。
+ * 低分辨率（320x200）下用它放大文本/图形，2x 就是 16px 高。 */
+void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int scale) {
+    if (scale < 1) scale = 1;
+    while (*s) {
+        uint8_t ch = (uint8_t)*s;
+        for (int row = 0; row < 8; row++) {
+            uint8_t line = font8x8[ch][row];
+            for (int col = 0; col < 8; col++) {
+                if (line & (0x01 << col)) {
+                    /* 前景色 */
+                    for (int dy = 0; dy < scale; dy++) {
+                        for (int dx = 0; dx < scale; dx++) {
+                            gfx_putpixel(x + col * scale + dx, y + row * scale + dy, fg);
+                        }
+                    }
+                } else if (bg >= 0) {
+                    /* 填充背景色：bg < 0 表示透明（保留原有像素） */
+                    for (int dy = 0; dy < scale; dy++) {
+                        for (int dx = 0; dx < scale; dx++) {
+                            gfx_putpixel(x + col * scale + dx, y + row * scale + dy, (uint8_t)bg);
+                        }
+                    }
+                }
+            }
+        }
+        x += 8 * scale;
+        s++;
+    }
+}
+
+void gfx_clear(uint8_t color) {
+    gfx_fill_rect(0, 0, GFX_W, GFX_H, color);
+}
+// ---- 图形 UI（VGA 320x200x256）----
+
+// 简易表达式求值：支持 + - * / % 与括号
+static int gfx_expr_pos;
+static int gfx_expr_err;
+static const char *gfx_expr_str;
+
+static int gfx_expr_parse_expr(void);
+
+static int gfx_expr_parse_factor(void) {
+    int v;
+    if (gfx_expr_str[gfx_expr_pos] == '(') {
+        gfx_expr_pos++;
+        v = gfx_expr_parse_expr();
+        if (gfx_expr_str[gfx_expr_pos] == ')') gfx_expr_pos++;
+        return v;
+    }
+    v = 0;
+    while (gfx_expr_str[gfx_expr_pos] >= '0' && gfx_expr_str[gfx_expr_pos] <= '9') {
+        v = v * 10 + (gfx_expr_str[gfx_expr_pos] - '0');
+        gfx_expr_pos++;
+    }
+    return v;
+}
+
+static int gfx_expr_parse_term(void) {
+    int v = gfx_expr_parse_factor();
+    while (1) {
+        char c = gfx_expr_str[gfx_expr_pos];
+        if (c == '*') { gfx_expr_pos++; v *= gfx_expr_parse_factor(); }
+        else if (c == '/') { gfx_expr_pos++; int d = gfx_expr_parse_factor(); if (d != 0) v /= d; else gfx_expr_err = 1; }
+        else if (c == '%') { gfx_expr_pos++; int d = gfx_expr_parse_factor(); if (d != 0) v %= d; else gfx_expr_err = 1; }
+        else break;
+    }
+    return v;
+}
+
+static int gfx_expr_parse_expr(void) {
+    int v = gfx_expr_parse_term();
+    while (1) {
+        char c = gfx_expr_str[gfx_expr_pos];
+        if (c == '+') { gfx_expr_pos++; v += gfx_expr_parse_term(); }
+        else if (c == '-') { gfx_expr_pos++; v -= gfx_expr_parse_term(); }
+        else break;
+    }
+    return v;
+}
+
+int gfx_eval(const char *s, int *ok) {
+    gfx_expr_pos = 0;
+    gfx_expr_err = 0;
+    gfx_expr_str = s;
+    int v = gfx_expr_parse_expr();
+    while (gfx_expr_str[gfx_expr_pos] == ' ') gfx_expr_pos++;
+    *ok = (gfx_expr_str[gfx_expr_pos] == '\0') && !gfx_expr_err;
+    return v;
+}
+
+void gfx_menu(void) {
+    gfx_init();
+    gfx_set_palette();
+    gfx_load_font();
+
+    static const char *keys[] = {
+        "7","8","9","/",
+        "4","5","6","*",
+        "1","2","3","-",
+        "0","(",")","+",
+        "C","=","%"," "
+    };
+
+    int running = 1;
+    int page = 0;        // 0=menu 1=calc 2=viewer 3=about
+    int menu_sel = 0;
+    int calc_buf[32];
+    int calc_len = 0;
+    int calc_sel = 0;
+    int calc_result = 0;
+    int calc_has_result = 0;
+    int calc_err = 0;
+
+    while (running) {
+        gfx_clear(0x00);
+
+        if (page == 0) {
+            gfx_draw_text(20, 8, "Cerulia GUI", 0x0F, 0x00);
+            gfx_draw_text(20, 20, "v0.3-gui", 0x0A, 0x00);
+            gfx_draw_text(20, 36, "Select an app:", 0x07, 0x00);
+            const char *items[] = { "Calculator", "Hex", "Rand", "Guess", "TicTacToe", "Snake", "Windows", "Viewer", "About", "Exit" };
+            for (int i = 0; i < 10; i++) {
+                int my = 48 + i * ((GFX_H >= 400) ? 22 : 15);
+                if (i == menu_sel) {
+                    gfx_fill_rect(20, my, (GFX_W >= 600) ? 300 : 200, 13, 0x1F);
+                    gfx_draw_text(24, my + 2, items[i], 0x0F, 0x1F);
+                } else {
+                    gfx_draw_text(24, my + 2, items[i], 0x07, 0x00);
+                }
+            }
+            gfx_draw_text(20, GFX_H - 10, "[W/S] move [Enter] open [Esc] quit", 0x08, 0x00);
+        } else if (page == 1) {
+            gfx_draw_text(20, 16, "Calculator", 0x0F, 0x00);
+            gfx_draw_text(20, 32, "expr: 1+2*3  ( ) + - * / %", 0x07, 0x00);
+            gfx_fill_rect(20, 48, 280, 18, 0x1F);
+            gfx_draw_text(24, 50, "> ", 0x0F, 0x1F);
+            for (int i = 0; i < calc_len; i++) {
+                char ch[2] = { (char)calc_buf[i], '\0' };
+                gfx_draw_text(24 + (i % 30) * 8, 50, ch, 0x0F, 0x1F);
+            }
+            if (calc_has_result) {
+                char res[40];
+                int rl = 0;
+                int rv = calc_result;
+                if (rv == 0) { res[rl++] = '0'; }
+                else {
+                    char tmp[16];
+                    int tl = 0;
+                    int neg = 0;
+                    uint32_t u = (rv < 0) ? (uint32_t)(-(rv + 1)) + 1u : (uint32_t)rv;
+                    if (rv < 0) neg = 1;
+                    while (u > 0) { tmp[tl++] = (char)('0' + (int)(u % 10)); u /= 10; }
+                    if (neg) res[rl++] = '-';
+                    while (tl > 0) res[rl++] = tmp[--tl];
+                }
+                res[rl] = '\0';
+                gfx_draw_text(24, 74, "= ", 0x0A, 0x00);
+                gfx_draw_text(40, 74, res, 0x0A, 0x00);
+            } else if (calc_err) {
+                gfx_draw_text(24, 74, "= ERROR", 0x0C, 0x00);
+            }
+            for (int i = 0; i < 20; i++) {
+                int bx = 20 + (i % 4) * 72;
+                int by = 96 + (i / 4) * 18;
+                if (i == calc_sel) {
+                    gfx_fill_rect(bx, by, 68, 16, 0x1F);
+                    gfx_draw_text(bx + 4, by + 2, keys[i], 0x0F, 0x1F);
+                } else {
+                    gfx_draw_rect(bx, by, 68, 16, 0x07);
+                    gfx_draw_text(bx + 4, by + 2, keys[i], 0x07, 0x00);
+                }
+            }
+            gfx_draw_text(20, GFX_H - 12, "[arrows] move  [Enter] press  [Esc] back", 0x08, 0x00);
+        } else if (page == 2) {
+            gfx_draw_text(20, 16, "Viewer", 0x0F, 0x00);
+            gfx_draw_text(20, 32, "Shows README.TXT content:", 0x07, 0x00);
+            static uint8_t vbuf[512];
+            int vn = fs_read_file("README.TXT", vbuf, 512);
+            if (vn > 0) {
+                int line = 0;
+                int col = 0;
+                for (int i = 0; i < vn && line < 8; i++) {
+                    if (vbuf[i] == '\n') { line++; col = 0; }
+                    else if (col < ((GFX_W >= 600) ? 60 : 30)) {
+                        char ch[2] = { (char)vbuf[i], '\0' };
+                        gfx_draw_text(20 + col * 8, 56 + line * 12, ch, 0x07, 0x00);
+                        col++;
+                    }
+                }
+            } else {
+                gfx_draw_text(20, 56, "(no README.TXT)", 0x08, 0x00);
+            }
+            gfx_draw_text(20, GFX_H - 12, "[Esc] back", 0x08, 0x00);
+        } else if (page == 3) {
+            gfx_draw_text(20, 16, "Cerulia GUI", 0x0F, 0x00);
+            gfx_draw_text(20, 32, "v0.3-gui", 0x0A, 0x00);
+            gfx_draw_text(20, 56, "A tiny graphical UI", 0x07, 0x00);
+            gfx_draw_text(20, 72, "for Cerulia kernel.", 0x07, 0x00);
+            gfx_draw_text(20, 96, "Apps: Calculator, Viewer", 0x07, 0x00);
+            gfx_draw_text(20, GFX_H - 12, "[Esc] back", 0x08, 0x00);
+        }
+
+        int c = 0;
+        while (c == 0) c = keyboard_getchar();
+
+        if (page == 0) {
+            if (c == 'w' || c == KEY_UP) { if (menu_sel > 0) menu_sel--; }
+            else if (c == 's' || c == KEY_DOWN) { if (menu_sel < 9) menu_sel++; }
+            else if (c == '\n') {
+                if (menu_sel == 0) { page = 1; calc_len = 0; calc_sel = 0; calc_has_result = 0; calc_err = 0; }
+                else if (menu_sel == 1) { gfx_restore_text(); terminal_initialize(); cmd_hex("255"); goto gfx_back; }
+                else if (menu_sel == 2) { gfx_restore_text(); terminal_initialize(); cmd_rand(""); goto gfx_back; }
+                else if (menu_sel == 3) { gfx_restore_text(); terminal_initialize(); cmd_guess(""); goto gfx_back; }
+                else if (menu_sel == 4) { gfx_restore_text(); terminal_initialize(); cmd_tictactoe(""); goto gfx_back; }
+                else if (menu_sel == 5) { gfx_restore_text(); terminal_initialize(); cmd_snake(""); goto gfx_back; }
+                else if (menu_sel == 6) { gw_demo(); goto gfx_back; }
+                else if (menu_sel == 7) { page = 2; }
+                else if (menu_sel == 8) { page = 3; }
+                else { running = 0; }
+            }
+            else if (c == 27) { running = 0; }
+        } else if (page == 1) {
+            if (c == 27) { page = 0; }
+            else if (c == KEY_UP) { if (calc_sel > 0) calc_sel--; }
+            else if (c == KEY_DOWN) { if (calc_sel < 19) calc_sel++; }
+            else if (c == KEY_LEFT) { if (calc_sel % 4 > 0) calc_sel--; }
+            else if (c == KEY_RIGHT) { if (calc_sel % 4 < 3) calc_sel++; }
+            else if (c == '\n') {
+                const char *k = keys[calc_sel];
+                if (k[0] == 'C') {
+                    calc_len = 0; calc_has_result = 0; calc_err = 0;
+                } else if (k[0] == '=') {
+                    if (calc_len > 0) {
+                        char expr[40];
+                        for (int i = 0; i < calc_len; i++) expr[i] = (char)calc_buf[i];
+                        expr[calc_len] = '\0';
+                        int ok = 0;
+                        calc_result = gfx_eval(expr, &ok);
+                        calc_has_result = ok;
+                        calc_err = !ok;
+                    }
+                } else if (k[0] != ' ') {
+                    if (calc_len < 32) {
+                        calc_buf[calc_len++] = k[0];
+                        calc_has_result = 0;
+                        calc_err = 0;
+                    }
+                }
+            }
+        } else if (page == 2) {
+            if (c == 27) { page = 0; }
+        } else if (page == 3) {
+            if (c == 27) { page = 0; }
+        }
+
+        continue;
+    gfx_back:
+        terminal_writestring("\n[Press any key to return to GUI]");
+        while (keyboard_getchar() == 0) {}
+        gfx_init();
+        gfx_set_palette();
+        gfx_load_font();
+    }
+
+    gfx_restore_text();
+    terminal_initialize();   // 退出图形模式后重建文本终端
+}
+

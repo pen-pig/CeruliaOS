@@ -1,0 +1,344 @@
+# -*- coding: utf-8 -*-
+"""test_netapp.py - 网络上层演示（ping + httpd）E2E
+
+  [ping]  guest 跑 `ping 10.0.2.2`：用 `-netdev socket` 直连 Python 对端
+          （绕过 slirp，完全掌控 ICMP），对端应答 ARP 并对每个 echo request
+          回一个同 id/seq 的 echo reply；断言收到 4 个 request 且 guest 屏幕
+          上打出 ≥3 条 reply（rtt 有效）、无 timeout、无 panic
+  [httpd] guest 跑 `httpd`（slirp + hostfwd 8080→80）：宿主连上去发 GET，
+          断言 200 响应含 EZOS 页面，guest 主动 FIN；屏幕出现 "served"
+
+端口：ping netdev 4477 / monitor 4479；httpd hostfwd 8080 / monitor 4480。
+注意别用 5xxxx 高位端口：Windows 会把动态段划成 excludedportrange
+（本机实测 55669-55768 被预留，绑定直接 WinError 10013），换机器症状还会变。
+用法：python tests/test_netapp.py    （退出码 0 = 全部通过）
+"""
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ezocr  # noqa: E402
+
+QEMU = qemu_exe()
+BOOT_WAIT_S = 10.0
+
+GUEST_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
+GUEST_IP = bytes([10, 0, 2, 15])
+HOST_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x02])
+HOST_IP = bytes([10, 0, 2, 2])
+
+FIN, SYN, RST, PSH, ACK = 0x01, 0x02, 0x04, 0x08, 0x10
+
+
+def key_name(ch):
+    if ch == " ":
+        return "spc"
+    if ch == ".":
+        return "dot"
+    if ch == "/":
+        return "slash"
+    if ch.isdigit():
+        return ch
+    if ch.isupper():
+        return "shift-" + ch.lower()
+    return ch
+
+
+class Guest(object):
+    """QEMU 实例：monitor 键入 + 可选 netdev socket / hostfwd"""
+
+    def __init__(self, net_port=None, mon_port=None, extra_net=()):
+        self.net_port = net_port
+        self.mon_port = mon_port
+        self.extra_net = list(extra_net)
+        self.proc = None
+        self.mon = None
+        self.net = None
+        self.buf = b""
+
+    def start(self):
+        argv = [QEMU, "-icount", "shift=auto", "-display", "none",
+                "-drive", "format=raw,file=os-image.bin",
+                "-drive", "format=raw,file=disk.vhd"] + self.extra_net
+        if self.net_port is not None:
+            argv += ["-netdev", "socket,id=n0,listen=127.0.0.1:%d" % self.net_port,
+                     "-device", "rtl8139,netdev=n0"]
+        argv += ["-monitor", "tcp:127.0.0.1:%d,server,nowait" % self.mon_port]
+        self.proc = subprocess.Popen(argv, cwd=ROOT,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+        dl = time.time() + 15
+        while True:
+            try:
+                self.mon = socket.create_connection(("127.0.0.1", self.mon_port), timeout=2)
+                break
+            except OSError:
+                if time.time() > dl:
+                    self.quit()
+                    raise AssertionError("monitor did not come up")
+                time.sleep(0.2)
+        self.mon.settimeout(0.05)
+        self._drain()
+        if self.net_port is not None:
+            dl = time.time() + 15
+            while True:
+                try:
+                    self.net = socket.create_connection(("127.0.0.1", self.net_port), timeout=2)
+                    break
+                except OSError:
+                    if time.time() > dl:
+                        self.quit()
+                        raise AssertionError("netdev socket did not accept")
+                    time.sleep(0.2)
+            self.net.settimeout(0.2)
+
+    def _drain(self):
+        try:
+            while True:
+                if not self.mon.recv(4096):
+                    break
+        except socket.timeout:
+            pass
+
+    def mon_cmd(self, cmd):
+        self.mon.sendall((cmd + "\n").encode())
+        time.sleep(0.02)
+        self._drain()
+
+    def type_line(self, line):
+        for ch in line:
+            self.mon_cmd("sendkey " + key_name(ch))
+        self.mon_cmd("sendkey ret")
+
+    def screen_text(self, shot):
+        self.mon_cmd("screendump " + shot)
+        time.sleep(0.8)
+        with open(os.path.join(ROOT, shot), "rb") as f:
+            head = f.read(64).split(b"\n", 2)[1].decode()
+        if head != "720 400":
+            return ""
+        return ezocr.ocr_text(os.path.join(ROOT, shot), os.path.join(ROOT, "kernel"))
+
+    def send_frame(self, frame):
+        if len(frame) < 60:                    # 以太网最小帧长，runt 会被丢
+            frame = frame + b"\x00" * (60 - len(frame))
+        self.net.sendall(struct.pack(">I", len(frame)) + frame)
+
+    def recv_frame(self, timeout=0.4):
+        self.net.settimeout(timeout)
+        while True:
+            if len(self.buf) >= 4:
+                n = struct.unpack(">I", self.buf[:4])[0]
+                if 14 <= n <= 65535:
+                    if len(self.buf) >= 4 + n:
+                        frame = self.buf[4:4 + n]
+                        self.buf = self.buf[4 + n:]
+                        return frame
+                else:                          # 裸帧模式兜底
+                    frame = self.buf
+                    self.buf = b""
+                    return frame
+            try:
+                chunk = self.net.recv(65536)
+                if not chunk:
+                    return None
+                self.buf += chunk
+            except socket.timeout:
+                return None
+
+    def quit(self):
+        try:
+            if self.mon:
+                self.mon_cmd("quit")
+        except OSError:
+            pass
+        for s in (self.net, self.mon):
+            try:
+                if s:
+                    s.close()
+            except OSError:
+                pass
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+
+
+def cksum(data):
+    s = 0
+    for i in range(0, len(data) - 1, 2):
+        s += (data[i] << 8) | data[i + 1]
+    if len(data) & 1:
+        s += data[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def arp_reply():
+    a = struct.pack(">HHBBH", 1, 0x0800, 6, 4, 2)
+    return GUEST_MAC + HOST_MAC + b"\x08\x06" + a + HOST_MAC + HOST_IP + \
+           GUEST_MAC + GUEST_IP
+
+
+def icmp_reply(req_ip, req_ic):
+    """从 echo request 构造 reply：换类型、换 IP 方向、重算两个校验和。
+    注意 IP 总长 = 本包自己的头(20) + ICMP 长度——最初写成
+    len(req_ip)+len(ic)（把请求的载荷算了两遍），guest 按总长校验直接丢帧。"""
+    ic = bytes([0, 0]) + req_ic[2:]                       # type 0, 其余原样
+    ic = ic[:2] + struct.pack(">H", cksum(ic)) + ic[4:]
+    total = 20 + len(ic)
+    ip = struct.pack(">BBHHHBBH", 0x45, 0, total, 0x4001, 0, 64, 1, 0) + \
+         HOST_IP + GUEST_IP
+    ip = ip[:10] + struct.pack(">H", cksum(ip)) + ip[12:]
+    return GUEST_MAC + HOST_MAC + b"\x08\x00" + ip + ic
+
+
+# ==================== phase ping ====================
+
+def phase_ping():
+    print("== phase ping: guest `ping 10.0.2.2` ==")
+    g = Guest(net_port=4477, mon_port=4479)
+    g.start()
+    try:
+        time.sleep(BOOT_WAIT_S)
+        g.type_line("ping 10.0.2.2")
+        t0 = time.time()
+        nreq = 0
+        arp_done = False
+        while time.time() - t0 < 20:
+            f = g.recv_frame(0.4)
+            if f is None:
+                continue
+            if len(f) < 34:
+                continue
+            et = struct.unpack(">H", f[12:14])[0]
+            if et == 0x0806:
+                a = f[14:]
+                if len(a) >= 28 and struct.unpack(">H", a[6:8])[0] == 1 \
+                        and a[24:28] == HOST_IP:
+                    g.send_frame(arp_reply())
+                    arp_done = True
+                continue
+            if et != 0x0800:
+                continue
+            ip = f[14:]
+            if len(ip) < 20 or ip[9] != 1:
+                continue
+            ihl = (ip[0] & 0x0F) * 4
+            ic = ip[ihl:]
+            if len(ic) >= 8 and ic[0] == 8 and ic[1] == 0:
+                g.send_frame(icmp_reply(ip, ic))
+                nreq += 1
+        assert arp_done, "guest never ARP-requested the peer"
+        assert nreq >= 4, "expected 4 echo requests, got %d" % nreq
+        print("  [OK] answered ARP + %d ICMP echo requests" % nreq)
+        time.sleep(1.5)
+        txt = g.screen_text("temp/netapp_ping.ppm").lower()
+        assert "panic" not in txt, "kernel panic on screen"
+        replies = txt.count("reply from")
+        assert replies >= 3, "expected >=3 reply lines on screen, got %d:\n%s" % (replies, txt)
+        assert "request timeout" not in txt, "guest printed timeout despite replies"
+        print("  [OK] guest printed %d replies (ICMP round-trip works)" % replies)
+    finally:
+        g.quit()
+
+
+# ==================== phase httpd ====================
+
+def _free_port(start):
+    """从 start 起找一个真正没人监听的本地端口。
+
+    8080 常被本机别的服务占着（占着时连上去拿到的是那个服务的页面，看起来
+    像"guest 页面内容不对"，其实是连错了地方——曾因此误判内核 httpd 有 bug）。
+    与其让人手工传环境变量，不如自己避开。
+    """
+    import socket as _s
+    for p in range(start, start + 200):
+        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as sk:
+            sk.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+            try:
+                sk.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+        return p
+    raise RuntimeError("no free port found from %d" % start)
+
+
+def phase_httpd():
+    print("== phase httpd: guest `httpd` + host GET ==")
+    # 端口必须选**没人监听的**：被别的服务占着时，hostfwd 转发不出去，
+    # 请求会落到那个服务上（拿到它的 HTML），症状极像 guest 页面不对。
+    # 仍可用 EZOS_HTTPD_PORT 指定起点。
+    port = _free_port(int(os.environ.get("EZOS_HTTPD_PORT", "18080")))
+    print("   hostfwd 127.0.0.1:%d -> guest:80" % port)
+    g = Guest(mon_port=4480,
+              extra_net=["-netdev", "user,id=n0,hostfwd=tcp::%d-:80" % port,
+                         "-device", "rtl8139,netdev=n0"])
+    g.start()
+    try:
+        time.sleep(BOOT_WAIT_S)
+        g.type_line("httpd")
+        s = None
+        last = None
+        for _ in range(12):                 # guest 进 accept 需要几秒
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=3)
+                break
+            except OSError as e:
+                last = e
+                time.sleep(1.0)
+        assert s is not None, "cannot connect guest httpd: %s" % last
+        print("  [OK] connected (slirp -> guest:80)")
+        s.settimeout(10)
+        s.sendall(b"GET / HTTP/1.0\r\nHost: ezos\r\n\r\n")
+        data = b""
+        while len(data) < 4096:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        assert data.startswith(b"HTTP/1.0 200 OK"), \
+            "bad response head: %r" % data[:40]
+        body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
+        assert b"<h1>" in body and b"i686" in body, "unexpected body: %r" % body[:120]
+        print("  [OK] HTTP 200 + system page (%d bytes)" % len(data))
+        time.sleep(1.5)                     # 给 guest 时间处理我方 ACK/FIN
+        txt = g.screen_text("temp/netapp_httpd.ppm").lower()
+        assert "panic" not in txt, "kernel panic on screen"
+        assert "served" in txt, "guest did not print 'served':\n%s" % txt
+        print("  [OK] guest printed 'served'")
+        s.close()
+    finally:
+        g.quit()
+
+
+def main():
+    for pre in ("os-image.bin", "disk.vhd"):
+        assert os.path.isfile(os.path.join(ROOT, pre)), pre + " missing - run ninja"
+    assert os.path.isfile(QEMU), "QEMU not found"
+    phase_ping()
+    phase_httpd()
+    print("PASS: net app E2E (ping + httpd)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

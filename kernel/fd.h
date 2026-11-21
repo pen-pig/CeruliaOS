@@ -1,0 +1,121 @@
+/*
+ * fd.h - 文件描述符（步骤 6b）
+ *
+ * 每个任务（task_t）持有一张 fd 表，条目分两类：
+ *   - 标准流（0/1/2 = stdin/stdout/stderr），不进文件系统
+ *   - 文件句柄（open 得到）：整文件读入内核堆内存，带当前偏移 offset；
+ *     write 在内存里改，close 时若被写过（dirty）则整文件落盘
+ *
+ * 为什么不直接读盘而是整文件进内存：现阶段 fs 层只有"整文件读"和
+ * "整文件写"两个原语（fs_read_file / fs_create_file），没有"按偏移读扇区"
+ * 的流式句柄。教学定位下，文件都很小，内存映射式句柄足够演示
+ * open/read/write/lseek/close 的完整语义，代价是单文件 ≤ MAX_FD_FILE。
+ *
+ * fd 表挂在 task_t 上（见 task.h），为步骤 6c 的多用户进程做准备——
+ * 届时每个进程有自己的 fd 表、自己的 cwd。当前只有 shell（task 0）一个
+ * 用户上下文，exec 的用户程序继承它的 fd 表。
+ */
+#ifndef FD_H
+#define FD_H
+
+#include "types.h"
+
+#define MAX_OPEN_FDS   16u             /* 每任务最多同时打开的文件 */
+#define MAX_FD_FILE    65536u          /* 单文件上限 64KB（内存句柄） */
+#define FD_MAX_NAME    64u             /* open 系统调用接收的路径长度上限 */
+
+/* open 的 flags：与 Linux i386 的 fcntl.h 取值一致。
+ *
+ * 低 2 位是访问模式（O_ACCMODE 掩码取出）：0=只读 1=只写 2=读写。
+ * 其余是可组合的创建/截断/追加位——这些语义**必须显式给出**：以前
+ * O_WRONLY 一个人兼管"不存在就建 + 打开就截断"，既不是 POSIX 语义
+ * （POSIX 里创建是 O_CREAT、截断是 O_TRUNC），也让调用方无法表达
+ * "只写但别截断"。现在按标准拆开。
+ *
+ * 与用户态共用同一组常量：user/libc.h 里的定义必须与这里逐位相同，
+ * 否则 ring3 传进来的 flags 会被内核判成未知位而 fail closed。 */
+#define O_RDONLY  0
+#define O_WRONLY  1
+#define O_RDWR    2
+#define O_ACCMODE 3u          /* 访问模式掩码 */
+#define O_CREAT   0x40u       /* 不存在则创建 */
+#define O_EXCL    0x80u       /* 与 O_CREAT 同用时：已存在则失败 */
+#define O_TRUNC   0x200u      /* 可写打开时把长度截为 0 */
+#define O_APPEND  0x400u      /* 每次 write 前把偏移移到文件末尾 */
+
+/* lseek 的 whence */
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
+
+/* 标准流 fd（每个任务默认开好） */
+#define FD_STDIN   0u
+#define FD_STDOUT  1u
+#define FD_STDERR  2u
+
+/* 条目类型（fd_entry_t.type 的取值）。
+ * 注意与 fd 号宏区分：fd 号 0/1/2 是标准流的索引，而这里的 FD_TYPE_STDIN
+ * 等是"这个条目是什么"的类型标记——fd_table_init 会把 0 号条目的 type 设成
+ * FD_TYPE_STDIN，两者在语义上分离，避免同名枚举值/宏互相替换。 */
+typedef enum {
+    FD_TYPE_FREE = 0,
+    FD_TYPE_STDIN,
+    FD_TYPE_STDOUT,
+    FD_TYPE_STDERR,
+    FD_TYPE_FILE,
+    FD_TYPE_PIPE            /* 匿名管道端（读/写端同类型，方向由 writable 字段区分） */
+} fd_type_t;
+
+typedef struct {
+    uint8_t  type;              /* FD_* */
+    uint8_t  writable;          /* 打开时带写权限（O_WRONLY/O_RDWR） */
+    uint8_t  dirty;             /* 被 write 过，close 时需落盘 */
+    uint8_t  append;            /* O_APPEND：每次 write 先移到文件末尾 */
+    uint32_t size;              /* 文件字节数 */
+    uint32_t offset;            /* 当前读写偏移 */
+    uint8_t *data;              /* 文件内容缓冲（FD_FILE；空文件可为 NULL） */
+    uint32_t mount_generation;  /* 打开时的挂载代数；切盘后禁止写回 */
+    char     name[256];         /* 打开时的绝对路径，close 不再依赖 cwd */
+} fd_entry_t;
+
+typedef struct {
+    fd_entry_t fds[MAX_OPEN_FDS];
+} fd_table_t;
+
+/* 初始化一张空 fd 表：开好 0/1/2 标准流 */
+void fd_table_init(fd_table_t *t);
+
+/*
+ * 系统调用实现。参数指针已由 syscall.c 做过 user_range_ok 校验，
+ * 这里不再重复校验用户地址，但会做 fd 有效性 / 权限 / 越界等内核侧检查。
+ * 返回值语义与 POSIX 对齐：成功返回字节数 / 新 fd / 新偏移，失败 -1。
+ */
+int fd_open(fd_table_t *t, const char *name, int flags);
+int fd_close(fd_table_t *t, int fd);
+void fd_discard(fd_table_t *t, int fd);  /* 释放异常退出进程的句柄，不提交缓冲 */
+int fd_read(fd_table_t *t, int fd, uint8_t *buf, uint32_t n);
+int fd_write(fd_table_t *t, int fd, const uint8_t *buf, uint32_t n);
+int fd_lseek(fd_table_t *t, int fd, int32_t offset, int whence);
+
+/* 创建一对管道 fd：u_fds[0]=只读端，u_fds[1]=只写端（u_fds 已由 syscall.c
+ * 用 user_range_ok 校验可写）。成功返回 0，池耗尽/无空 fd 返回 -1。 */
+int fd_pipe(fd_table_t *t, int *u_fds);
+
+/*
+ * 复制一张 fd 表（fork 用）：dst 先整体清为空白表，再逐条复制 src 的条目。
+ *   - 标准流：直接浅拷贝（无共享可变状态）；
+ *   - 普通文件：data 缓冲**深拷贝**（各自独立 kmalloc，避免两边 close 导致
+ *     double free 或互相串改）；
+ *   - pipe：与父共享同一个 pipe_t 对象，但必须递增对应端的引用计数
+ *     （ref_r / ref_w）——否则父进程关闭写端后子进程会提前看到 EOF、或把
+ *     pipe 对象释放掉。调用方应已持有 task_lock（cli），本函数内部只做 cli
+ *     不再 sti，避免提前开中断。
+ * 返回 0 成功。文件 data 深拷贝若 kmalloc 失败，该 fd 退化为空缓冲（继续推进），
+ * 不整体失败——fork 的失败判定以地址空间复制为准。
+ */
+int fd_table_dup(fd_table_t *dst, const fd_table_t *src);
+
+/* 自检：open/read/lseek/write/close 走真实文件系统跑一遍 */
+int fd_selftest(void (*out)(const char *));
+
+#endif

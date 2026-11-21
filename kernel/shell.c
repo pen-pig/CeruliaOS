@@ -1,0 +1,3966 @@
+﻿#include "shell.h"
+#include "rust_bridge.h" /* levenshtein_active：命令拼写建议 */
+#include "shell_extra.h"
+#include "tty.h"
+#include "keyboard.h"
+#include "types.h"
+#include "stack.h"
+#include "port.h"
+#include "acpi.h"
+#include "ata.h"
+#include "ahci.h"
+#include "fs.h"
+#include "user.h"
+#include "trash.h"
+#include "reg.h"
+#include "sysvol.h"
+#include "gui.h"
+#include "mouse.h"
+#include "gfx.h"
+#include "gfxwin.h"
+#include "games.h"
+#include "bios_thunk.h"
+#include "isr.h"
+#include "panic.h"
+#include "task.h"
+#include "exec.h"
+#include "syscall.h"
+
+/* shell.c 用到 shell_extra.c 中定义的终端数字打印器（无头文件声明） */
+extern void ezos_console_print_dec(uint32_t num);
+
+#define CMD_BUFFER_SIZE 1024
+#define HISTORY_SIZE 8
+
+/* 文件读写共享缓冲。历史：cat/grep/wc/head/tail/cp/mv/vi 各自持有一份
+ * 4KB static，共 44KB BSS，且任何超过 4KB 的文档都被静默截断——vi 打开
+ * 大文件只读前 4KB、存盘也只存前 4KB，日用编辑直接撞墙。统一成一份 64KB
+ * 共享缓冲（这些命令互斥运行，不存在并发），单一上限 FILE_BUF_SIZE。
+ * 按纪律 ≥4KB 的缓冲必须 static —— 它在文件作用域，天然 .bss。 */
+#define FILE_BUF_SIZE 65536u
+static uint8_t g_file_buf[FILE_BUF_SIZE];
+
+static char cmd_buffer[CMD_BUFFER_SIZE];
+static int cmd_pos = 0;
+static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
+static int history_count = 0;
+static int session_composed;
+static int shell_in_desktop_terminal;
+
+static int history_index = -1;      // 当前浏览的历史位置（-1 表示正在编辑新行）
+static size_t cursor = 0;           // 光标在当前输入行里的位置
+static size_t current_row = 0;
+/* 输入行折行后实际占了几行（重绘时决定要清几行）。
+ * 以前只清 current_row 一行：输入一折行，第二行的内容就再也擦不掉，
+ * 越输越乱（旧字残留在下面，光标还停在第一行）。 */
+static int input_rows_used = 1;      // 当前显示的输入行占了几行
+/* 调试用：shell 循环每轮采样一次 EFLAGS 放全局，便于 QEMU monitor 直接查内存验证 */
+volatile uint32_t dbg_shell_eflags = 0;
+
+// 字符串工具
+static size_t my_strlen(const char *s) {
+    size_t len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
+// 不区分大小写比较
+static int my_tolower(char c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+
+static int my_strcasecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = my_tolower(*a);
+        char cb = my_tolower(*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return *a - *b;
+}
+
+// 简易 atoi
+static int my_atoi(const char *s) {
+    int result = 0;
+    while (*s >= '0' && *s <= '9') {
+        int d = *s - '0';
+        if (result > (2147483647 - d) / 10) return 2147483647;  /* 溢出钳制 */
+        result = result * 10 + d;
+        s++;
+    }
+    return result;
+}
+
+// 十六进制字符转数值
+static int hex_char_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// 十六进制字符串转数值
+static uint32_t my_htoi(const char *s) {
+    uint32_t result = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    while (*s) {
+        int v = hex_char_val(*s);
+        if (v < 0) break;
+        result = (result << 4) | v;
+        s++;
+    }
+    return result;
+}
+
+// 64 位 / 32 位无符号除法：内核里没有 libgcc 的 __udivdi3
+// 把 hi:lo 拼成的 64 位数除以 d（d 必须是非零除数）
+static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
+    if (d == 0) return 0;
+    if (hi >= d) return 0xFFFFFFFF;   // 商溢出
+    uint64_t rem = hi;
+    uint32_t q = 0;
+    for (int i = 31; i >= 0; i--) {
+        rem = (rem << 1) | ((lo >> i) & 1);
+        if (rem >= d) {
+            rem -= d;
+            q |= (1u << i);
+        }
+    }
+    return q;
+}
+
+// 打印十进制
+static void print_dec(uint32_t num) {
+    char buf[16];
+    int len = 0;
+    if (num == 0) {
+        terminal_putchar('0');
+        return;
+    }
+    while (num > 0) {
+        buf[len++] = '0' + (num % 10);
+        num /= 10;
+    }
+    while (len > 0) terminal_putchar(buf[--len]);
+}
+
+// 打印十六进制字节
+static void print_hex_byte(uint8_t val) {
+    char hex[] = "0123456789ABCDEF";
+    terminal_putchar(hex[val >> 4]);
+    terminal_putchar(hex[val & 0x0F]);
+}
+
+// 打印 32 位十六进制
+static void print_hex32(uint32_t val) {
+    print_hex_byte((val >> 24) & 0xFF);
+    print_hex_byte((val >> 16) & 0xFF);
+    print_hex_byte((val >> 8) & 0xFF);
+    print_hex_byte(val & 0xFF);
+}
+
+// CMOS 读一个字节
+static uint8_t cmos_read(uint8_t reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+/* 命令实现 */
+static void cmd_help(const char *args);
+static void cmd_clear(const char *args);
+static void cmd_exit(const char *args);
+static void cmd_echo(const char *args);
+static void cmd_version(const char *args);
+static void cmd_time(const char *args);
+static void cmd_date(const char *args);
+static void cmd_reboot(const char *args);
+
+/* crash：可控触发 CPU 异常，验证 panic 屏（不恢复，测试用） */
+static void cmd_crash(const char *args);
+static const char *parse_token(const char *args, char *out, int max);
+static void cmd_shutdown(const char *args);
+static void cmd_meminfo(const char *args);
+static void cmd_stack(const char *args);
+static void cmd_cpuid(const char *args);
+static void cmd_readdisk(const char *args);
+static void cmd_hexdump(const char *args);
+static void cmd_beep(const char *args);
+static void cmd_about(const char *args);
+static void cmd_history(const char *args);
+static void cmd_setcolor(const char *args);
+static void cmd_ls(const char *args);
+static void cmd_cat(const char *args);
+static void cmd_write(const char *args);
+static void cmd_rm(const char *args);
+/* P2 权限体系：用户库 + chmod/chown */
+static void cmd_login(const char *args);
+static void cmd_su(const char *args);
+static void cmd_whoami(const char *args);
+static void cmd_useradd(const char *args);
+static void cmd_admin(const char *args);
+static void cmd_users(const char *args);
+static void cmd_setupusers(const char *args);
+static void cmd_passwd(const char *args);
+static void cmd_logout(const char *args);
+static void cmd_chmod(const char *args);
+/* P3 Win 系特性：回收站 + 注册表 kv */
+static void cmd_trash(const char *args);
+static void cmd_restore(const char *args);
+static void cmd_purge(const char *args);
+static void cmd_reg(const char *args);
+static void cmd_chown(const char *args);
+/* 删除空目录。与 rm 职责分离：rm 只收文件，rmdir 只收目录。
+ * 非空 / 不是目录 / 不存在 一律失败，且失败时不释放任何簇。 */
+static void cmd_rmdir(const char *args);
+
+static void cmd_format(const char *args);
+static void cmd_setdrive(const char *args);
+static void cmd_grep(const char *args);
+static void cmd_wc(const char *args);
+static void cmd_head(const char *args);
+static void cmd_tail(const char *args);
+static void cmd_touch(const char *args);
+static void cmd_cp(const char *args);
+static void cmd_mv(const char *args);
+static void cmd_cd(const char *args);
+static void cmd_mkdir(const char *args);
+static void cmd_pwd(const char *args);
+static void cmd_gui(const char *args);
+static void cmd_desktop(const char *args);
+static void cmd_vbetest(const char *args);
+static void cmd_theme(const char *args);
+static void cmd_uname(const char *args);
+static void cmd_vi(const char *args);
+static void cmd_df(const char *args);
+static void cmd_du(const char *args);
+static void cmd_icalc(const char *args);
+void cmd_hex(const char *args);
+void cmd_rand(const char *args);
+void cmd_guess(const char *args);
+void cmd_tictactoe(const char *args);
+void cmd_snake(const char *args);
+void cmd_games(const char *args);
+
+typedef struct {
+    const char *name;
+    void (*func)(const char *args);
+} command_t;
+
+/* ============ 后台任务（job control，用户态生态第③步）============
+ * `cmd &` 把用户 ELF 放到后台跑，shell 立即回提示符并打印 `[n] pid`；
+ * `jobs` 列出后台任务（号 / PID / RUNNING|DONE）；每次显示提示符前
+ * 用非阻塞方式（WNOHANG）收割已退出的后台子进程，打印 `[n] done`。
+ * 这样 ZOMBIE 不会长期占用 MAX_TASKS=8 的进程槽。
+ * 后台任务数受 MAX_TASKS 约束：超限时 shell 侧报错而不是 panic。
+ */
+#define MAX_BG_JOBS 8
+typedef struct {
+    int  used;        /* 槽位占用 */
+    int  job_id;      /* 用户可见任务号，从 1 递增 */
+    int  pid;         /* 子进程 pid（退出并被收割后仍为展示用，不强制清零） */
+    int  reaped;      /* 已被 shell 非阻塞收割（打印过 done） */
+    char name[64];    /* 启动文件名 */
+} bg_job_t;
+static bg_job_t g_bg_jobs[MAX_BG_JOBS];
+static int g_bg_next_id = 1;
+
+/* 统计当前仍在跑（未收割）的后台任务数 */
+static int shell_bg_count_live(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_BG_JOBS; i++)
+        if (g_bg_jobs[i].used && !g_bg_jobs[i].reaped) n++;
+    return n;
+}
+
+/* 选一个可复用的槽位：优先空闲槽，其次已被收割（DONE）的旧槽 */
+static int shell_bg_alloc_slot(void) {
+    int free_slot = -1, reaped_slot = -1;
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        if (!g_bg_jobs[i].used) { free_slot = i; break; }
+        if (g_bg_jobs[i].reaped && reaped_slot < 0) reaped_slot = i;
+    }
+    if (free_slot >= 0) return free_slot;
+    return reaped_slot;
+}
+
+/* 登记一个刚后台启动的任务，并打印 `[n] pid` */
+static void shell_bg_register(const char *name, int pid) {
+    int slot = shell_bg_alloc_slot();
+    if (slot < 0) return;                 /* 不该发生：调用方已先判上限 */
+    bg_job_t *j = &g_bg_jobs[slot];
+    j->used   = 1;
+    j->reaped = 0;
+    j->job_id = g_bg_next_id++;
+    j->pid    = pid;
+    for (int k = 0; k < 63 && name[k]; k++) j->name[k] = name[k];
+    j->name[63] = '\0';
+
+    terminal_writestring("[");
+    ezos_console_print_dec((uint32_t)j->job_id);
+    terminal_writestring("] ");
+    ezos_console_print_dec((uint32_t)pid);
+    terminal_writestring("\n");
+}
+
+/* 非阻塞收割：遍历后台任务，已退出的用 WNOHANG 收走并打印 `[n] done`。
+ * 在每次打印提示符前调用，保证 ZOMBIE 不长期占用进程槽。 */
+static void shell_reap_bg(void) {
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        bg_job_t *j = &g_bg_jobs[i];
+        if (!j->used || j->reaped) continue;
+        int code = task_wait_pid_opt(j->pid, WNOHANG);
+        if (code >= 0) {                  /* 已退出（>=0 为退出码），成功收割 */
+            terminal_writestring("[");
+            ezos_console_print_dec((uint32_t)j->job_id);
+            terminal_writestring("] done\n");
+            j->reaped = 1;
+        }
+        /* code == -2 仍在运行；-1 表示该 pid 已由别处收走（理论上不会，
+         * 因为后台子进程只由本函数收割），这里忽略即可。 */
+    }
+}
+
+/* `jobs` 内置命令：列出后台任务 */
+static void cmd_jobs(const char *args) {
+    (void)args;
+    int any = 0;
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        bg_job_t *j = &g_bg_jobs[i];
+        if (!j->used) continue;
+        any = 1;
+        const char *state = j->reaped ? "DONE" : "RUNNING";
+        terminal_writestring("[");
+        ezos_console_print_dec((uint32_t)j->job_id);
+        terminal_writestring("] ");
+        ezos_console_print_dec((uint32_t)j->pid);
+        terminal_writestring(" ");
+        terminal_writestring(state);
+        terminal_writestring(" ");
+        terminal_writestring(j->name);
+        terminal_writestring("\n");
+    }
+    if (!any)
+        terminal_writestring("no background jobs\n");
+}
+
+/* 去掉行尾 `&`（后台标记），命中返回 1 并从 cmd 中删除。
+ * 仅当 `&` 是最后一个 token（其后只有空白）、且不在引号内时生效。 */
+static int shell_strip_bg(char *cmd) {
+    int len = (int)my_strlen(cmd);
+    int end = len - 1;
+    while (end >= 0 && cmd[end] == ' ') end--;
+    if (end < 0 || cmd[end] != '&') return 0;
+    int q = 0;
+    for (int i = 0; i < end; i++)
+        if (cmd[i] == '"') q = !q;
+    if (q) return 0;
+    cmd[end] = '\0';
+    int p = end - 1;
+    while (p >= 0 && cmd[p] == ' ') p--;
+    cmd[p + 1] = '\0';
+    return 1;
+}
+
+/* 尝试把 cmd 当作磁盘上的可执行文件（.ELF/.COM/.BIN）直接运行。
+ * 命中返回 1（已处理，调用方不要再走 Unknown command）；未命中返回 0。 */
+static int shell_try_exec_file(const char *cmd, char *args, int bg) {
+    size_t n = my_strlen(cmd);
+    if (n < 4) return 0;
+    const char *ext = cmd + n - 4;
+    int is_exe = (my_strcasecmp(ext, ".ELF") == 0) ||
+                 (my_strcasecmp(ext, ".COM") == 0) ||
+                 (my_strcasecmp(ext, ".BIN") == 0);
+    if (!is_exe) return 0;
+    /* exFAT 文件名查找大小写敏感（盘上为大写），这里统一转大写再查 */
+    char fname[64];
+    int i;
+    for (i = 0; cmd[i] && i < 63; i++) {
+        char c = cmd[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
+        fname[i] = c;
+    }
+    fname[i] = '\0';
+
+    /* 系统卷优先：/bin 里的程序不依赖任何盘，format 之后也必须能跑
+     * （用户程序早就从数据盘根目录搬到系统卷了，盘上已无副本）。
+     * sysvol_resolve_bin 大小写不敏感，且会补 /bin/ 前缀。 */
+    char svpath[64];
+    int from_sysvol = (sysvol_resolve_bin(fname, svpath, sizeof(svpath)) == 0);
+    if (!from_sysvol) {
+        if (!fs_ready()) return 0;
+        if (fs_get_file_size(fname) == 0) return 0;   /* 盘上也无此文件 */
+    }
+    const char *target = from_sysvol ? svpath : fname;
+
+    if (bg) {
+        /* 上限保护：并发后台任务数受 MAX_TASKS=8 约束，超限报错不 panic */
+        if (shell_bg_count_live() >= 7) {
+            terminal_writestring("background job limit reached\n");
+            return 1;
+        }
+        int pid = 0;
+        int rc = exec_file_bg(target, args, &pid);
+        if (rc < 0) {
+            terminal_writestring("background launch failed: ");
+            terminal_writestring(target);
+            terminal_writestring("\n");
+            return 1;
+        }
+        shell_bg_register(fname, pid);
+    } else {
+        const char *why = 0;
+        int rc = exec_file(target, args, &why);
+        if (rc < 0) {
+            terminal_writestring("exec: ");
+            terminal_writestring(target);
+            terminal_writestring(": ");
+            terminal_writestring(why ? why : "failed");
+            terminal_writestring("\n");
+            return 1;
+        }
+    }
+    return 1;
+}
+
+static const command_t commands[] = {
+    {"help",     cmd_help},
+    {"exit",     cmd_exit},
+    {"clear",    cmd_clear},
+    {"cls",      cmd_clear},
+    {"echo",     cmd_echo},
+    {"version",  cmd_version},
+    {"time",     cmd_time},
+    {"date",     cmd_date},
+    {"reboot",   cmd_reboot},
+    {"shutdown", cmd_shutdown},
+    {"crash",    cmd_crash},
+    {"meminfo",  cmd_meminfo},
+    {"cpuid",    cmd_cpuid},
+    {"readdisk", cmd_readdisk},
+    {"hexdump",  cmd_hexdump},
+    {"beep",     cmd_beep},
+    {"about",    cmd_about},
+    {"history",  cmd_history},
+    {"setcolor", cmd_setcolor},
+    {"ls",       cmd_ls},
+    {"cat",      cmd_cat},
+    {"write",    cmd_write},
+    {"rm",       cmd_rm},
+    {"format",   cmd_format},
+    {"setdrive", cmd_setdrive},
+    {"grep",     cmd_grep},
+    {"wc",       cmd_wc},
+    {"head",     cmd_head},
+    {"tail",     cmd_tail},
+    {"touch",    cmd_touch},
+    {"cp",       cmd_cp},
+    {"mv",       cmd_mv},
+    {"cd",       cmd_cd},
+    {"mkdir",    cmd_mkdir},
+    {"rmdir",    cmd_rmdir},
+    {"pwd",      cmd_pwd},
+    {"gui",      cmd_gui},
+    {"desktop",  cmd_desktop},
+    {"vbetest",  cmd_vbetest},
+    {"theme",    cmd_theme},
+    {"uname",    cmd_uname},
+    {"vi",       cmd_vi},
+    {"df",       cmd_df},
+    {"du",       cmd_du},
+    {"icalc",    cmd_icalc},
+    {"hex",      cmd_hex},
+    {"rand",     cmd_rand},
+    {"guess",    cmd_guess},
+    {"tictactoe",cmd_tictactoe},
+    {"snake",    cmd_snake},
+    {"games",    cmd_games},
+    /* 以下是 shell_extra.c 实现的命令（MikanOS 那批扩展命令） */
+    {"ver",      cmd_ver},
+    {"sysinfo",  cmd_sysinfo},
+    {"type",     cmd_type},
+    {"which",    cmd_which},
+    {"alias",    cmd_alias},
+    {"unalias",  cmd_unalias},
+    {"sleep",    cmd_sleep},
+    {"uptime",   cmd_uptime},
+    {"mem",      cmd_mem},
+    {"stack",    cmd_stack},
+    {"md5",      cmd_md5},
+    {"crc32",    cmd_crc},
+    {"crc16",    cmd_crc16},
+    {"crc32c",   cmd_crc32c},
+    {"dmesg",    cmd_dmesg},
+    {"fsck",     cmd_fsck},
+    {"login",    cmd_login},
+    {"su",       cmd_su},
+    {"whoami",   cmd_whoami},
+    {"useradd",  cmd_useradd},
+    {"admin",    cmd_admin},
+    {"users",    cmd_users},
+    {"setupusers", cmd_setupusers},
+    {"passwd",   cmd_passwd},
+    {"logout",   cmd_logout},
+    {"chmod",    cmd_chmod},
+    {"chown",    cmd_chown},
+    {"trash",    cmd_trash},
+    {"restore",  cmd_restore},
+    {"purge",    cmd_purge},
+    {"reg",      cmd_reg},
+    {"kmtest",   cmd_kmtest},
+    {"rstest",   cmd_rstest},
+    {"pagetest", cmd_pagetest},
+    {"utest",    cmd_utest},
+    {"pmmtest",  cmd_pmmtest},
+    {"elftest",  cmd_elftest},
+    {"exec",     cmd_exec},
+    {"jobs",     cmd_jobs},
+    {"calc",     cmd_calc},
+    {"selftest", cmd_selftest},
+    {"mouseproto", cmd_mouseproto},
+    {"ktask",     cmd_ktask},
+    {"ps",        cmd_ps},
+    {"stackchk",  cmd_stackchk},
+    {"systest",   cmd_systest},
+    {"oomtest",   cmd_oomtest},
+    {"pci",       cmd_pci},
+    {"nic",       cmd_nic},
+    {"ping",      cmd_ping},
+    {"httpd",     cmd_httpd},
+    {"dhcp",      cmd_dhcp},
+    {"ntp",       cmd_ntp},
+    {"lookup",    cmd_lookup},
+    {"dns",       cmd_dns},
+    {"fetch",     cmd_fetch},
+    {"wget",      cmd_fetch},
+    {"htmltest",  cmd_htmltest},
+    {"cjk",       cmd_cjk},
+    {0, 0}
+};
+
+/* ===== 管道与重定向支持 ===== */
+#define PIPE_BUF_SIZE 4096
+static char pipe_buffer[PIPE_BUF_SIZE];
+static int pipe_len = 0;
+
+/* ===== 终端颜色：直接复用 tty 的 vga_color 枚举值（tty.c 里是 static，shell.c 自己调 terminal_setcolor）===== */
+#define CLR_WHITE     15
+#define CLR_LIGHT_GREY  7
+#define CLR_DARK_GREY   8
+#define CLR_LIGHT_BLUE  9
+#define CLR_LIGHT_GREEN 10
+#define CLR_LIGHT_CYAN  11
+#define CLR_LIGHT_RED   12
+#define CLR_BLACK       0
+
+static void shell_fg(uint8_t fg) { terminal_setcolor((uint8_t)(fg | (0 << 4))); }
+static void shell_color_default(void) { shell_fg(CLR_LIGHT_GREY); }
+
+/* ===== zsh 风格语义色：在 CLR_* 之上做语义别名，方便后来人复用 ===== */
+#define CLR_ERROR    12   /* 亮红：失败 / 错误 / Usage */
+#define CLR_SUCCESS  10   /* 亮绿：成功确认 */
+#define CLR_DIR      9    /* 亮蓝：目录 */
+#define CLR_EXE      10   /* 亮绿：可执行文件 */
+#define CLR_HEADER   11   /* 亮青：表头 / 强调（命令名、提示符）*/
+#define CLR_INFO     8    /* 深灰：次要信息（说明文字）*/
+#define CLR_WARNING  14   /* 黄：警告 */
+
+/* 用指定前景色打印整串，打印完自动还原默认色（绝不改动任何文本字符）*/
+static void puts_c(const char *s, uint8_t fg) {
+    shell_fg(fg);
+    terminal_writestring(s);
+    shell_color_default();
+}
+
+/* 打印缓冲区区间 [start,end)，将 pattern 命中处用高亮色，其余保持默认（文本字符不变）*/
+static void print_highlighted(const char *buf, int start, int end, const char *pattern, int plen) {
+    int i = start;
+    while (i < end) {
+        if (i + plen <= end) {
+            int k = 0;
+            while (k < plen && buf[i + k] == pattern[k]) k++;
+            if (k == plen) {
+                shell_fg(CLR_ERROR);
+                for (int t = 0; t < plen; t++) terminal_putchar(buf[i + t]);
+                shell_color_default();
+                i += plen;
+                continue;
+            }
+        }
+        terminal_putchar(buf[i]);
+        i++;
+    }
+}
+
+/* help 列表行：命令名列（" - " 之前）用强调色，其后说明用次要色；无 " - " 的整行作表头色 */
+/* 删除空目录。与 rm 职责分离：rm 只收文件，rmdir 只收目录。
+ * 非空 / 不是目录 / 不存在 一律失败，且失败时不释放任何簇。
+ * 定义在着色 helper 之后：成败提示要走 puts_c 的语义色。 */
+static void cmd_rmdir(const char *args) {
+    if (fs_rmdir(args) != 0) {
+        puts_c("Failed to remove directory.\n", CLR_ERROR);
+        return;
+    }
+    puts_c("Directory removed.\n", CLR_SUCCESS);
+}
+
+static void help_line(const char *s) {
+    const char *sep = NULL;
+    for (const char *p = s; p[0] && p[1] && p[2]; p++) {
+        if (p[0] == ' ' && p[1] == '-' && p[2] == ' ') { sep = p; break; }
+    }
+    if (sep == NULL) {
+        shell_fg(CLR_HEADER);
+        terminal_writestring(s);
+        shell_color_default();
+        return;
+    }
+    shell_fg(CLR_HEADER);
+    for (const char *p = s; p < sep; p++) terminal_putchar(*p);
+    shell_fg(CLR_INFO);
+    for (const char *p = sep; *p; p++) terminal_putchar(*p);
+    shell_color_default();
+}
+
+/* 判断扩展名是不是可执行文件 */
+static int is_exe_name(const char *name) {
+    int len = 0; while (name[len]) len++;
+    if (len < 4) return 0;
+    return (name[len-4]=='.' && (name[len-3]=='e'||name[len-3]=='E') && (name[len-2]=='x'||name[len-2]=='X') && (name[len-1]=='e'||name[len-1]=='E'))
+        || (name[len-4]=='.' && (name[len-3]=='c'||name[len-3]=='C') && (name[len-2]=='o'||name[len-2]=='O') && (name[len-1]=='m'||name[len-1]=='M'))
+        || (name[len-4]=='.' && (name[len-3]=='b'||name[len-3]=='B') && (name[len-2]=='i'||name[len-2]=='I') && (name[len-1]=='n'||name[len-1]=='N'));
+}
+
+/* 执行原始命令（重定向/管道已经预处理过） */
+static void shell_execute_raw(char *cmd, int bg);
+
+/* 命令拼写建议：找不到命令时给出最接近的内建命令。定义在下面
+ * shell_execute_raw 之后（它要用 commands[] 表），C99 隐式声明在
+ * -Werror 下直接报错，所以这里前置声明一次。 */
+static const char *shell_closest_command(const char *name);
+
+/* shell 模式：1=用户 shell（GUI Terminal / User Shell），0=内核 shell */
+
+/* 执行带重定向/管道的命令 */
+static void shell_execute(char *cmd) {
+    if (history_count < HISTORY_SIZE) {
+        for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
+            history[history_count][i] = cmd[i];
+            if (cmd[i] == '\0') break;
+        }
+        history_count++;
+    }
+    while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') return;
+
+    /* 解析后台执行标记 `&`：去掉行尾的 `&`，记录到 bg 标志 */
+    int bg = shell_strip_bg(cmd);
+    if (*cmd == '\0') return;
+
+    /* 扫描重定向 > >> 与管道 |：出现在引号里的这些符号不算 */
+    int in_quote = 0;
+    char *gt = NULL, *pipe = NULL;
+    for (char *p = cmd; *p; p++) {
+        if (*p == '"') in_quote = !in_quote;
+        if (in_quote) continue;
+        if (*p == '|') { pipe = p; break; }
+        if (*p == '>') { gt = p; break; }
+    }
+
+    if (gt) {
+        session_composed++;
+        /* cmd > file 或 cmd >> file */
+        int append = (gt[0] != '\0' && gt[1] == '>');
+        *gt = '\0';
+        char *fname = gt + 1 + (append ? 1 : 0);
+        while (*fname == ' ') fname++;
+        if (append) {
+            /* >> 追加：先读回原文件再合并 */
+            /* 追加上限从 8KB 提到 128KB：原 old[4096]+merged[8192] 使
+             * "cmd >> file" 对超过 8KB 的文档静默截断，与 cat/vi 同病。 */
+            static uint8_t merged[131072];
+            int mn = 0;
+            if (fs_init() == 0) {
+                int on = fs_read_file(fname, g_file_buf, FILE_BUF_SIZE);
+                if (on > 0) for (int i = 0; i < on && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = g_file_buf[i];
+            }
+            static char cap[PIPE_BUF_SIZE];
+            terminal_begin_capture(cap, PIPE_BUF_SIZE);
+            shell_execute_raw(cmd, 0);
+            int n = terminal_end_capture();
+            for (int i = 0; i < n && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = (uint8_t)cap[i];
+            if (mn > 0 && fs_init() == 0) {
+                fs_create_file(fname, merged, mn);
+            }
+        } else {
+            static char cap[PIPE_BUF_SIZE];
+            terminal_begin_capture(cap, PIPE_BUF_SIZE);
+            shell_execute_raw(cmd, 0);
+            int n = terminal_end_capture();
+            if (n > 0 && fs_init() == 0) {
+                fs_create_file(fname, (const uint8_t*)cap, n);
+            }
+        }
+        session_composed--;
+        return;
+    }
+
+    if (pipe) {
+        session_composed++;
+        /* cmd1 | cmd2 */
+        *pipe = '\0';
+        char *left = cmd;
+        char *right = pipe + 1;
+        while (*right == ' ') right++;
+        static char pbuf[PIPE_BUF_SIZE];
+        terminal_begin_capture(pbuf, PIPE_BUF_SIZE);
+        shell_execute_raw(left, 0);
+        pipe_len = terminal_end_capture();
+        if (pipe_len > PIPE_BUF_SIZE) pipe_len = PIPE_BUF_SIZE - 1;
+        for (int i = 0; i < pipe_len; i++) pipe_buffer[i] = pbuf[i];
+        shell_execute_raw(right, 0);
+        pipe_len = 0;
+        session_composed--;
+        return;
+    }
+
+    shell_execute_raw(cmd, bg);
+}
+
+static int account_command(const char *cmd) {
+    static const char *const names[] = {"login", "su", "setupusers", "useradd", "admin",
+                                         "passwd", "logout", "exit", 0};
+    for (int i = 0; names[i]; i++)
+        if (my_strcasecmp(cmd, names[i]) == 0) return 1;
+    return 0;
+}
+
+static const char *const personal_commands[] = {
+    "help", "exit", "clear", "cls", "echo", "version", "time", "date", "about",
+    "history", "ls", "pwd", "cd", "cat", "write", "rm", "grep", "wc", "head",
+    "tail", "touch", "cp", "mv", "mkdir", "rmdir", "vi", "exec", "jobs",
+    "whoami", "users", "login", "su", "passwd", "logout", "desktop", "chmod", 0
+};
+
+static int personal_command(const char *cmd) {
+    for (int i = 0; personal_commands[i]; i++)
+        if (my_strcasecmp(cmd, personal_commands[i]) == 0) return 1;
+    return 0;
+}
+
+static void shell_execute_raw(char *cmd, int bg) {
+    while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') return;
+
+    char *space = cmd;
+    while (*space && *space != ' ') space++;
+    if (*space == ' ') {
+        *space = '\0';
+        space++;
+    } else {
+        space = cmd + my_strlen(cmd);
+    }
+
+    if (account_command(cmd) && (bg || session_composed)) {
+        terminal_writestring("Account commands require the interactive console.\n");
+        return;
+    }
+    if (shell_in_desktop_terminal &&
+        (account_command(cmd) || my_strcasecmp(cmd, "desktop") == 0 ||
+         my_strcasecmp(cmd, "gui") == 0 || my_strcasecmp(cmd, "vbetest") == 0)) {
+        terminal_writestring("Use the Start menu for Lock or Switch User; use Back to Terminal for other console commands.\n");
+        return;
+    }
+    if (user_confined() && !personal_command(cmd)) {
+        terminal_writestring("Command unavailable in a standard account.\n");
+        return;
+    }
+    /* Standard accounts only reach the audited builtins above. No alias or
+     * implicit fallback can turn an unknown name into an admin operation. */
+    for (int i = 0; commands[i].name != 0; i++) {
+        if (my_strcasecmp(cmd, commands[i].name) == 0) {
+            commands[i].func(space);
+            return;
+        }
+    }
+
+    /* 别名展开（POSIX shell 那种）：alias name=cmd 的替换在这里做 */
+    const char *alias_exp = shell_extra_lookup_alias(cmd);
+    if (alias_exp) {
+        static int alias_depth = 0;
+        if (alias_depth < 4) {
+            char expanded[CMD_BUFFER_SIZE];
+            int n = 0;
+            while (alias_exp[n] && n < CMD_BUFFER_SIZE - 1) {
+                expanded[n] = alias_exp[n];
+                n++;
+            }
+            /* 保留原命令后面带的参数：alias ll=ls 时，ll subdir 应该执行 ls subdir */
+            if (*space && n < CMD_BUFFER_SIZE - 1) {
+                expanded[n++] = ' ';
+                while (*space && n < CMD_BUFFER_SIZE - 1) {
+                    expanded[n] = *space;
+                    n++;
+                    space++;
+                }
+            }
+            expanded[n] = '\0';
+            alias_depth++;
+            shell_execute(expanded);
+            alias_depth--;
+            return;
+        }
+        terminal_writestring("alias: recursion too deep: ");
+        terminal_writestring(cmd);
+        terminal_writestring("\n");
+        return;
+    }
+
+    /* 不是内建命令、也不是别名：尝试当作磁盘上的可执行文件（.ELF/.COM/.BIN）
+     * 直接运行。命中则已处理并返回；否则才报 Unknown command。 */
+    if (shell_try_exec_file(cmd, space, bg))
+        return;
+
+    terminal_writestring("Unknown command: ");
+    terminal_writestring(cmd);
+    /* 给个最接近的内建命令。只在"足够接近"时才提示——距离太远（比如
+     * 用户输了个完全不相干的词）报出来反而是噪声。阈值取 max(2, len/3)：
+     * len=3 时容 2 个字符的错（"lst" -> "ls" 差 1、"sl" 差 1 都够），
+     * len=12 时容 4（"shel" -> "shell" 差 1、"desktop" -> "deskto" 差 1）。
+     * 纯 UX，零风险：只是多打一行字，不改变任何执行语义。 */
+    const char *guess = shell_closest_command(cmd);
+    if (guess != 0) {
+        terminal_writestring("\ndid you mean: ");
+        terminal_writestring(guess);
+    }
+    terminal_writestring("\n");
+    terminal_writestring("type 'help' for the command list\n");
+}
+
+/* 在内建命令表里找与 name 编辑距离最小的那个。距离算法在 Rust 侧
+ * （rust/ezos_rs/src/lib.rs 的 levenshtein_rs，C 参考实现见 textenc.c，
+ * Zig 版见 ezos_zig.zig，三方由 rstest 对拍）。
+ *
+ * 阈值 max(2, len/3)：容得下"手滑打错一两个字母"，又不至于把明显不相干的
+ * 输入也硬凑一个建议出来。多个命令同距时取**表里靠前**的那个——
+ * commands[] 的顺序是按功能分组排的，靠前的更可能是用户想用的。 */
+static const char *shell_closest_command(const char *name) {
+    uint32_t len = 0;
+    while (name[len] && len < 64) len++;
+    if (len == 0) return 0;
+    uint32_t thresh = len / 3;
+    if (thresh < 2) thresh = 2;
+    const char *best = 0;
+    uint32_t best_d = thresh + 1;
+    for (int i = 0; commands[i].name != 0; i++) {
+        uint32_t d = levenshtein_active((const uint8_t *)name,
+                                        (const uint8_t *)commands[i].name,
+                                        24);
+        if (d < best_d) {
+            best_d = d;
+            best = commands[i].name;
+        }
+    }
+    return best;
+}
+
+/* 供 shell_extra.c 的 type/which 查询某个名字是不是内建命令 */
+int shell_is_builtin(const char *name) {
+    for (int i = 0; commands[i].name != 0; i++) {
+        if (my_strcasecmp(name, commands[i].name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* 命令名前缀补全：prefix 按大小写无关前缀匹配内建命令表。
+ * 唯一匹配 -> 把完整命令名拷进 out，返回 1；
+ * 多个匹配 -> 各命令名指针写入 matches[]（最多 max_matches 个），返回匹配总数；
+ * 无匹配   -> 返回 0。内核 shell 与 GUI 终端的 Tab 补全共用。 */
+int shell_complete_command(const char *prefix, char *out, int outsz,
+                           const char *matches[], int max_matches) {
+    int plen = 0;
+    while (prefix[plen]) plen++;
+    if (plen == 0 || out == NULL || outsz <= 0) return 0;
+    int count = 0;
+    const char *first = NULL;
+    for (int i = 0; commands[i].name != 0; i++) {
+        const char *name = commands[i].name;
+        int nlen = 0;
+        while (name[nlen]) nlen++;
+        if (nlen < plen) continue;
+        /* 前缀大小写不敏感比较 */
+        int ok = 1;
+        for (int j = 0; j < plen; j++) {
+            if (my_tolower(prefix[j]) != my_tolower(name[j])) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        if (count == 0) first = name;
+        if (matches != NULL && count < max_matches) matches[count] = name;
+        count++;
+    }
+    if (count == 1 && first != NULL) {
+        int i = 0;
+        for (; first[i] && i < outsz - 1; i++) out[i] = first[i];
+        out[i] = '\0';
+        return 1;
+    }
+    return count;
+}
+
+// 保存当前目录（真正的 cwd 在 fs 层，见下面注释）
+/* cd /bin | cd /system 之后的当前目录**不在 shell 里**：它下沉到了 fs 层
+ * （fs.c 的 g_sysvol_cwd），这样 cat / write / rm / mkdir 等所有 fs_* 入口
+ * 都能把相对路径解析成 /bin/xxx、/system/xxx——只在呈现层记 cwd 的话，
+ * `cd /system` 后 `cat version` 会报 no such file（只有绝对路径能用）。
+ * shell 只读它：fs_sysvol_cwd() 返回 "" 或 "/bin"、"/system"。 */
+
+/* 提示符：把当前路径打进 "[path] > "，cd 到哪一眼可见。
+ * 返回提示符的字符宽度——重绘输入行时要据此算光标列，写死 2 会错位。
+ * 结尾仍是 "> "：E2E 靠 '>' 切分"最近一条命令的输出"，不能改掉。 */
+static int shell_prompt(void) {
+    int n = 1;                      /* '[' */
+    shell_fg(CLR_HEADER);
+    terminal_putchar('[');
+    {
+        const char *p = fs_cwd_path();      /* 已含 "/bin"、"/system" */
+        if (user_managed()) {
+            const char *name = user_current_name();
+            terminal_writestring(name);
+            terminal_putchar(':');
+            n += (int)my_strlen(name) + 1;
+        }
+        terminal_writestring(p);
+        n += (int)my_strlen(p);
+    }
+    terminal_writestring("] > ");
+    n += 4;
+    shell_color_default();
+    return n;
+}
+
+/* 提示符宽度（只算不打）。折行重绘必须先知道"提示符 + 内容一共多宽"才能
+ * 算出占几行；靠"打印完再看光标在哪"会晚一步——那时清屏已经做完了。 */
+static int shell_prompt_width(void) {
+    return 1 + (int)my_strlen(fs_cwd_path()) + 4 +
+           (user_managed() ? (int)my_strlen(user_current_name()) + 1 : 0);
+}
+
+/* 还能再输入几个字符 = 缓冲区还剩多少。
+ *
+ * 曾经把这改成"屏幕放得下"（到屏底还剩几列），想避免滚屏打乱 current_row。
+ * 结果是**超长的按键被静默丢弃**——在屏幕底部敲一条长命令，敲到行尾之后
+ * 字符就不再出现，看着就是"明明超长了却不换行"。假省事比真麻烦糟糕：
+ * 折行+滚屏才是终端该有的行为，现在由 shell_redraw_line 负责滚屏。 */
+static int shell_input_capacity(void) { return CMD_BUFFER_SIZE - 1; }
+
+static void shell_redraw_line(void) {
+    int cap = shell_input_capacity();
+    if (cmd_pos > cap) {                 /* 历史回填 / 补全可能超长：截断 */
+        cmd_pos = cap;
+        cmd_buffer[cmd_pos] = '\0';
+        if ((int)cursor > cmd_pos) cursor = (size_t)cmd_pos;
+    }
+    int plen = shell_prompt_width();
+    int total = plen + cmd_pos;
+    int rows = total / TERM_WIDTH + 1;
+    if (rows < 1) rows = 1;
+    if (rows > TERM_HEIGHT) rows = TERM_HEIGHT;
+
+    /* 清"上次占的行"与"这次要占的行"的并集，否则输入变短会留下残字 */
+    int clear_n = (input_rows_used > rows) ? input_rows_used : rows;
+
+    /* 输入折行折到屏幕底部：像真实终端那样把屏幕上滚，而不是拒绝输入。
+     * 滚完必须把 current_row 和 tty 的内部行游标一起上移——只搬显存不动
+     * terminal_row 的话，接下来 putchar 会画到已经被滚走的行号上。 */
+    if ((int)current_row + clear_n > TERM_HEIGHT) {
+        int sc = (int)current_row + clear_n - TERM_HEIGHT;
+        if (sc > TERM_HEIGHT) sc = TERM_HEIGHT;
+        terminal_scroll_n((uint32_t)sc);
+        current_row = (size_t)((int)current_row - sc);
+    }
+    terminal_set_row(current_row);
+    for (int i = 0; i < clear_n; i++)
+        terminal_clear_line((size_t)((int)current_row + i));
+    terminal_set_cursor(current_row, 0);
+    shell_prompt();
+    for (int i = 0; i < cmd_pos; i++) {
+        terminal_putchar(cmd_buffer[i]);
+    }
+    int abs = plen + (int)cursor;
+    size_t row = (size_t)((int)current_row + abs / TERM_WIDTH);
+    size_t col = (size_t)(abs % TERM_WIDTH);
+    if (row >= TERM_HEIGHT) { row = TERM_HEIGHT - 1; col = TERM_WIDTH - 1; }
+    terminal_set_cursor(row, col);
+    input_rows_used = rows;
+}
+
+/* 开场横幅。抽成函数是因为它有两个调用点：shell 启动，以及从图形
+ * 桌面退回文本模式（cmd_desktop -> gw_start 返回后）。后者不能只是
+ * 清屏 —— 满屏图形忽然变空、只剩一个提示符，用户没法确认自己到底是
+ * 回到了 shell 还是界面崩了。 */
+static void shell_banner(void)
+{
+    if (user_confined())
+        terminal_writestring("Cerulia Shell - Standard account. Type 'help' or 'logout'.\n");
+    else
+        terminal_writestring("Cerulia Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
+}
+
+static int console_line(char *out, uint32_t max, int echo) {
+    uint32_t used = 0, excess = 0;
+    for (;;) {
+        int c = keyboard_getchar();
+        if (c == 0) { asm volatile("sti; hlt"); continue; }
+        if (c == 27 || c == 3) {
+            auth_wipe(out, max + 1);
+            terminal_putchar('\n');
+            return -1;
+        }
+        if (c == '\n') {
+            out[used] = 0;
+            terminal_putchar('\n');
+            return excess ? -1 : (int)used;
+        }
+        if (c == '\b') {
+            if (excess) excess--;
+            else if (used) {
+                out[--used] = 0;
+                if (echo) terminal_putchar('\b');
+            }
+        } else if (c >= 32 && c <= 126) {
+            if (used < max) {
+                out[used++] = (char)c;
+                if (echo) terminal_putchar((char)c);
+            } else if (excess != 0xffffffffu) excess++;
+        }
+    }
+}
+
+static int password_prompt(const char *label, char out[AUTH_MAX_PASSWORD + 1]) {
+    keyboard_set_private_input(1);
+    terminal_writestring(label);
+    int n = console_line(out, AUTH_MAX_PASSWORD, 0);
+    /* Discard any queued keys from the password line before resuming echo. */
+    keyboard_discard_boot_input();
+    keyboard_set_private_input(0);
+    return n;
+}
+
+void shell_forget_session(void) {
+    auth_wipe(history, sizeof(history));
+    auth_wipe(cmd_buffer, sizeof(cmd_buffer));
+    auth_wipe(g_file_buf, sizeof(g_file_buf));
+    auth_wipe(g_bg_jobs, sizeof(g_bg_jobs));
+    history_count = 0;
+    pipe_len = 0;
+    gw_forget_session();
+    keyboard_discard_boot_input();
+}
+
+static void shell_reset_session(void) {
+    shell_forget_session();
+    terminal_reset_session();
+}
+
+static void login_delay(void) {
+    uint32_t start = g_pit_ticks;
+    while ((uint32_t)(g_pit_ticks - start) < 750u) asm volatile("sti; hlt");
+}
+
+static int shell_authenticate(const char *name) {
+    char password[AUTH_MAX_PASSWORD + 1];
+    int len = user_password_required(name) ? password_prompt("Password: ", password) : 0;
+    int rc = len < 0 ? -1 : user_auth_login(name, password, (uint32_t)len);
+    auth_wipe(password, sizeof(password));
+    if (rc == 0) {
+        shell_reset_session();
+        shell_banner();
+        return 1;
+    }
+    terminal_writestring("Login failed.\n");
+    login_delay();
+    return 0;
+}
+
+static void shell_login_screen(void) {
+    if (user_accounts_broken()) {
+        terminal_writestring("Account database is missing or damaged. Restore /etc/accounts.db from backup.\n");
+        for (;;) asm volatile("sti; hlt");
+    }
+    terminal_writestring("Cerulia - Local sign-in\n");
+    cmd_users("");
+    while (!user_signed_in()) {
+        char name[USER_NAME_MAX + 1];
+        terminal_writestring("Login: ");
+        int n = console_line(name, USER_NAME_MAX, 1);
+        if (n > 0) shell_authenticate(name);
+    }
+}
+
+void shell_run(void) {
+    user_load_accounts();
+    if (!user_signed_in()) shell_login_screen();
+    else shell_banner();
+    shell_prompt();
+
+    cmd_pos = 0;
+    cursor = 0;
+    history_index = -1;
+    current_row = terminal_get_row();
+
+    while (1) {
+        asm volatile("sti; nop; nop; nop; nop; nop");   /* 确保中断开着：STI 之后要隔几条指令才生效 */
+        { uint32_t fl; asm volatile("pushfl; popl %0" : "=r"(fl)); dbg_shell_eflags = fl; }
+        int c = keyboard_getchar();
+        if (c == 0) continue;
+
+        if (c == KEY_PGUP) {
+            terminal_scroll_up();
+            continue;
+        }
+        if (c == KEY_PGDN) {
+            terminal_scroll_down();
+            continue;
+        }
+        if (terminal_in_scrollback()) {
+            terminal_scroll_reset();
+            shell_redraw_line();
+        }
+
+        if (c == '\t') {
+            /* Tab 补全：只有光标停在第一个词（命令名）里时才补 */
+            int word_len = 0;
+            while (word_len < cmd_pos && cmd_buffer[word_len] != ' ') word_len++;
+            if (word_len > 0 && cmd_pos == word_len) {
+                char word[CMD_BUFFER_SIZE];
+                for (int i = 0; i < word_len; i++) word[i] = cmd_buffer[i];
+                word[word_len] = '\0';
+                char full[CMD_BUFFER_SIZE];
+                const char *matches[12];
+                int r = shell_complete_command(word, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    for (int i = 0; full[i]; i++) cmd_buffer[i] = full[i];
+                    cmd_pos = (int)my_strlen(full);
+                    if (cmd_pos > shell_input_capacity())
+                        cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
+                    cursor = cmd_pos;
+                    shell_redraw_line();
+                } else if (r >= 2) {
+                    /* 多个匹配：换行列出候选，再重绘提示符 */
+                    terminal_putchar('\n');
+                    for (int i = 0; i < r && i < 12; i++) {
+                        terminal_writestring(matches[i]);
+                        terminal_putchar(' ');
+                    }
+                    terminal_putchar('\n');
+                    current_row = terminal_get_row();
+                    shell_redraw_line();
+                }
+                /* r == 0 无匹配：什么都不做 */
+            }
+        } else if (c == '\n') {
+            terminal_putchar('\n');
+            cmd_buffer[cmd_pos] = '\0';
+            shell_execute(cmd_buffer);
+            if (!user_signed_in()) shell_login_screen();
+            cmd_pos = 0;
+            cursor = 0;
+            history_index = -1;
+            shell_reap_bg();              /* 回提示符前非阻塞收割已退出的后台任务 */
+            /* 命令输出不以换行结尾时（被截断的输出、printf 类），提示符会
+             * 接在同一行的尾巴上。补一个换行，提示符才总在行首。 */
+            if (terminal_get_column() != 0) terminal_putchar('\n');
+            shell_prompt();
+            current_row = terminal_get_row();
+            input_rows_used = 1;
+        } else if (c == '\b') {
+            if (cursor > 0) {
+                // 删除光标前的那个字符
+                for (int i = cursor - 1; i < cmd_pos - 1; i++) {
+                    cmd_buffer[i] = cmd_buffer[i + 1];
+                }
+                cmd_pos--;
+                cursor--;
+                shell_redraw_line();
+            }
+        } else if (c == KEY_LEFT) {
+            if (cursor > 0) {
+                cursor--;
+                shell_redraw_line();
+            }
+        } else if (c == KEY_RIGHT) {
+            if (cursor < (size_t)cmd_pos) {
+                cursor++;
+                shell_redraw_line();
+            }
+        } else if (c == KEY_UP) {
+            if (history_count > 0 && history_index < history_count - 1) {
+                history_index++;
+                int hist_pos = history_count - 1 - history_index;
+                for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
+                    cmd_buffer[i] = history[hist_pos][i];
+                    if (cmd_buffer[i] == '\0') break;
+                }
+                cmd_pos = my_strlen(cmd_buffer);
+                if (cmd_pos > shell_input_capacity()) {
+                    cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
+                }
+                cursor = cmd_pos;
+                shell_redraw_line();
+            }
+        } else if (c == KEY_DOWN) {
+            if (history_index > 0) {
+                history_index--;
+                int hist_pos = history_count - 1 - history_index;
+                for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
+                    cmd_buffer[i] = history[hist_pos][i];
+                    if (cmd_buffer[i] == '\0') break;
+                }
+                cmd_pos = my_strlen(cmd_buffer);
+                if (cmd_pos > shell_input_capacity()) {
+                    cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
+                }
+                cursor = cmd_pos;
+                shell_redraw_line();
+            } else if (history_index == 0) {
+                history_index = -1;
+                cmd_pos = 0;
+                cursor = 0;
+                shell_redraw_line();
+            }
+        } else if (c >= 32 && c <= 126) {
+            if (cmd_pos < CMD_BUFFER_SIZE - 1 && cmd_pos < shell_input_capacity()) {
+                // 在 cursor 位置插入字符
+                for (int i = cmd_pos; i > (int)cursor; i--) {
+                    cmd_buffer[i] = cmd_buffer[i - 1];
+                }
+                cmd_buffer[cursor] = (char)c;
+                cmd_pos++;
+                cursor++;
+                shell_redraw_line();
+            }
+        }
+    }
+}
+
+/* help 命令的实现 */
+static void cmd_help(const char *args) {
+    if (user_confined() && !personal_command(args)) {
+        terminal_writestring("Standard account commands:\n");
+        for (int i = 0; personal_commands[i]; i++) {
+            terminal_writestring(personal_commands[i]);
+            terminal_putchar((i % 8 == 7 || !personal_commands[i+1]) ? '\n' : ' ');
+        }
+        terminal_writestring("You can use your home directory and the read-only /bin and /system.\n");
+        return;
+    }
+    if (*args != '\0') {
+        const char *detail = shell_extra_help(args);
+        if (detail) {
+            terminal_writestring(detail);
+            terminal_putchar('\n');
+            return;
+        }
+        terminal_writestring("No detailed help for '");
+        terminal_writestring(args);
+        terminal_writestring("'. Use 'help' for the full command list.\n");
+        return;
+    }
+    help_line("Available commands:\n");
+    help_line("  help       - show this help\n");
+    help_line("  clear/cls  - clear screen\n");
+    help_line("  echo <txt> - print text\n");
+    help_line("  version    - show version\n");
+    help_line("  time       - show current time\n");
+    help_line("  date       - show current date\n");
+    help_line("  reboot     - reboot system\n");
+    help_line("  shutdown   - shutdown (QEMU exits)\n");
+    help_line("  meminfo    - show memory info\n");
+    help_line("  cpuid      - show CPU vendor\n");
+    help_line("  readdisk [drive] <lba> - read and hexdump disk sector\n");
+    help_line("  hexdump <hexaddr> - dump memory\n");
+    help_line("  beep       - make a beep sound\n");
+    help_line("  about      - about this OS\n");
+    help_line("  history    - show command history\n");
+    help_line("  setcolor <fg> [bg] - set text color (0-15)\n");
+    help_line("  setdrive <0-11> - set filesystem drive (4-11 = AHCI ports)\n");
+    help_line("  ls         - list root directory (exFAT)\n");
+    help_line("  cat <file> - read file content (exFAT)\n");
+    help_line("  write <file> <content> - create file with content\n");
+    help_line("  rm <file>  - delete file\n");
+    help_line("  format [fs] - format slave disk: exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs\n");
+    help_line("  grep <pattern> <file> - print lines containing pattern\n");
+    help_line("  wc <file>  - count lines/words/characters\n");
+    help_line("  head <file> [n] - show first n lines (default 10)\n");
+    help_line("  tail <file> [n] - show last n lines (default 10)\n");
+    help_line("  touch <file> - create empty file\n");
+    help_line("  cp <src> <dst> - copy file (64 KiB max; overwrite on exFAT only)\n");
+    help_line("  mv <src> <dst> - move file (64 KiB max; target must not exist)\n");
+    help_line("  cd <dir>   - change directory\n");
+    help_line("  mkdir <dir> - create directory\n");
+    help_line("  rmdir <dir> - remove empty directory\n");
+    help_line("  pwd        - print working directory\n");
+    help_line("  desktop    - launch graphical desktop\n");
+    help_line("  gui        - launch text-mode GUI\n");
+    help_line("  exit       - leave the shell (disabled: console cannot be left)\n");
+    help_line("  theme [n]  - list/switch GUI theme\n");
+    help_line("  uname      - print system information\n");
+    help_line("  vi <file>  - edit a text file\n");
+    help_line("  df         - show disk space usage\n");
+    help_line("  du [name]  - show disk usage of current dir or file\n");
+    help_line("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
+    help_line("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
+    help_line("  rand [max] - generate a random number (default 0-99)\n");
+    help_line("  guess      - guess-the-number game\n");
+    help_line("  tictactoe  - play tic-tac-toe vs AI\n");
+    help_line("  snake      - play snake game (arrows, P pause, Esc quit)\n");
+    help_line("  games      - list/launch games\n");
+    help_line("  ver        - show kernel version\n");
+    help_line("  sysinfo    - show system summary (CPU/memory/time)\n");
+    help_line("  type <cmd> - show command type (builtin/alias/file)\n");
+    help_line("  which <cmd> - locate a command\n");
+    help_line("  alias [name=cmd] - list or define command aliases\n");
+    help_line("  unalias <name> - remove a command alias\n");
+    help_line("  sleep <ms> - busy-wait delay (approx)\n");
+    help_line("  mem <hexaddr> [len] - dump physical memory\n");
+    help_line("  dmesg [n] - show last n buffered kernel log lines\n");
+    help_line("  kmtest - kernel heap self-test\n");
+    help_line("  stack      - main stack high-water mark\n");
+    help_line("  rstest - cross-check C/Rust/Zig checksum+namehash\n");
+    help_line("  pagetest - paging self-test (identity/map/unmap)\n");
+    help_line("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
+    help_line("  pmmtest - physical page frame allocator self-test\n");
+    help_line("  elftest - ELF32 loader self-test (validate/load/W^X/unload)\n");
+    help_line("  exec <file> [args] - load & run an ELF32 user program in ring3\n");
+    help_line("  calc <expr> - floating point calculator (sqrt sin cos pi e ...)\n");
+    help_line("  selftest - run ALL subsystem self-tests at once\n");
+    help_line("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
+    help_line("  ps - list tasks (pid/state/switches)\n");
+    help_line("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
+    help_line("  fetch <url> [file] - HTTP GET (wget is an alias)\n");
+    help_line("  htmltest [url] - parse a page and print the layout to serial\n");
+    help_line("  cjk - GB2312 Chinese glyph demo in graphics mode (any key exits)\n");
+    help_line("  help <cmd> - detailed help for a command\n");
+    help_line("  users, useradd <name>, admin <name> <on|off> - local accounts\n");
+    help_line("  login <name>, passwd, logout, whoami\n");
+}
+
+static void cmd_clear(const char *args) {
+    (void)args;
+    terminal_initialize();
+}
+
+static void cmd_exit(const char *args) {
+    if (user_managed()) { cmd_logout(args); return; }
+    (void)args;
+    /* exit 不再切到图形桌面：桌面只能由 'desktop' 命令显式启动
+     * （cmd_desktop -> gw_start）。shell 是系统控制台，退出它就没有
+     * 任何人机界面了，所以这里只打印提示，不做任何切换。 */
+    terminal_writestring("exit: this shell is the system console, it cannot be left.\n");
+    terminal_writestring("      use 'desktop' for the graphical desktop, 'shutdown' to power off.\n");
+}
+
+static void cmd_echo(const char *args) {
+    int no_newline = 0;
+    if (args[0] == '-' && args[1] == 'n' && (args[2] == ' ' || args[2] == '\0')) {
+        no_newline = 1;
+        args += 2;
+        while (*args == ' ') args++;
+    }
+    while (*args) {
+        if (*args == '\\' && args[1]) {
+            args++;
+            if (*args == 'n') {
+                terminal_putchar('\n');
+            } else if (*args == 't') {
+                terminal_putchar('\t');
+            } else if (*args == '\\') {
+                terminal_putchar('\\');
+            } else {
+                terminal_putchar('\\');
+                terminal_putchar(*args);
+            }
+            args++;
+        } else {
+            terminal_putchar(*args);
+            args++;
+        }
+    }
+    if (!no_newline) terminal_putchar('\n');
+}
+
+static void cmd_version(const char *args) {
+    (void)args;
+    terminal_writestring("Cerulia v0.3-gui\n");
+}
+
+static void cmd_time(const char *args) {
+    (void)args;
+    uint8_t hour = cmos_read(0x04);
+    uint8_t minute = cmos_read(0x02);
+    uint8_t second = cmos_read(0x00);
+    hour = ((hour & 0x0F) + ((hour >> 4) * 10));
+    minute = ((minute & 0x0F) + ((minute >> 4) * 10));
+    second = ((second & 0x0F) + ((second >> 4) * 10));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+    terminal_writestring("Current time: ");
+    print_dec(hour);
+    terminal_putchar(':');
+    if (minute < 10) terminal_putchar('0');
+    print_dec(minute);
+    terminal_putchar(':');
+    if (second < 10) terminal_putchar('0');
+    print_dec(second);
+    terminal_putchar('\n');
+}
+
+static void cmd_date(const char *args) {
+    (void)args;
+    uint8_t year = cmos_read(0x09);
+    uint8_t month = cmos_read(0x08);
+    uint8_t day = cmos_read(0x07);
+    year = ((year & 0x0F) + ((year >> 4) * 10));
+    month = ((month & 0x0F) + ((month >> 4) * 10));
+    day = ((day & 0x0F) + ((day >> 4) * 10));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
+    terminal_writestring("Current date: ");
+    print_dec(year + 2000);
+    terminal_putchar('-');
+    if (month < 10) terminal_putchar('0');
+    print_dec(month);
+    terminal_putchar('-');
+    if (day < 10) terminal_putchar('0');
+    print_dec(day);
+    terminal_putchar('\n');
+}
+
+static void cmd_reboot(const char *args) {
+    (void)args;
+    system_reboot();
+}
+
+/* crash [gp|pf|ud|div]：主动触发异常验证 panic 屏。
+ * 无参数默认 gp。触发后停在蓝屏（by design），QEMU 重启即恢复。 */
+static void cmd_crash(const char *args) {
+    char kind[8];
+    parse_token(args, kind, sizeof(kind));
+    if (kind[0] == 'p') {          /* pf：读未映射地址 -> #PF（CR2 = 该地址） */
+        panic_set_context("shell:crash(pf)");
+        terminal_writestring("triggering #PF at 0x04000000...\n");
+        /* 0x04000000（64MB）在 identity 区（0-32MB）之外且未映射：
+         * 无论物理 RAM 是否存在都会 #PF（缺页只看页表）。 */
+        volatile uint32_t *bad = (volatile uint32_t *)0x04000000u;
+        (void)*bad;
+    } else if (kind[0] == 'u') {   /* ud：执行非法指令字节 */
+        panic_set_context("shell:crash(ud)");
+        terminal_writestring("triggering #UD...\n");
+        /* 只用 ud2（0F 0B）：SDM 明确保证 #UD。
+         * 早期版本前面还放了 .byte 0xF1（ICEBP/INT1）——它在执行时就已经
+         * 抛异常，ud2 永远不可达；且 ICEBP 行为随 CPU/虚拟化实现而异
+         * （可能 #UD 也可能 #DB），用作测试触发点不可靠。 */
+        asm volatile("ud2");
+    } else if (kind[0] == 'd') {   /* div：除零 -> #DE */
+        panic_set_context("shell:crash(div)");
+        terminal_writestring("triggering #DE...\n");
+        volatile uint32_t z = 0;
+        volatile uint32_t r = 1 / z;
+        (void)r;
+    } else {                       /* gp：段级非法操作 -> #GP */
+        panic_set_context("shell:crash(gp)");
+        terminal_writestring("triggering #GP...\n");
+        asm volatile("mov $0xFFFFFFFF, %eax; mov %eax, %ds");
+    }
+    /* pf/gp/pf 若硬件未按预期触发（如 QEMU 差异），落到这里给提示 */
+    terminal_writestring("no fault raised?\n");
+}
+
+void system_reboot(void) {
+    terminal_writestring("Rebooting...\n");
+    for (int i = 0; i < 100000; i++) asm volatile("nop");
+    outb(0x64, 0xFE);
+    asm volatile("int3");
+}
+
+void system_shutdown(void) {
+    terminal_writestring("Shutting down...\n");
+    acpi_shutdown();   /* ACPI ready 走真实 PM1a_CNT；否则回退 QEMU 0x604 */
+}
+
+static void cmd_shutdown(const char *args) {
+    (void)args;
+    system_shutdown();
+}
+
+static void cmd_meminfo(const char *args) {
+    (void)args;
+    uint8_t low = cmos_read(0x15);
+    uint8_t high = cmos_read(0x16);
+    uint16_t mem_kb = (uint16_t)((high << 8) | low);
+    terminal_writestring("Base memory: ");
+    print_dec(mem_kb);
+    terminal_writestring(" KB\n");
+
+    uint8_t ext_low = cmos_read(0x17);
+    uint8_t ext_high = cmos_read(0x18);
+    uint16_t ext_kb = (uint16_t)((ext_high << 8) | ext_low);
+    terminal_writestring("Extended memory: ");
+    print_dec(ext_kb);
+    terminal_writestring(" KB\n");
+    terminal_writestring("Total memory: ");
+    print_dec(mem_kb + ext_kb);
+    terminal_writestring(" KB\n");
+}
+
+/* 主栈水位：启动时 kernel.c 把空闲栈涂成 0xA5，这里读"第一个不是 0xA5 的
+ * 字节"反推历史最低 esp。看的是**调用链叠加起来**的真实峰值——
+ * tools/check_stack.py 只能看单帧，看不见链的深度，两者互补。 */
+static void cmd_stack(const char *args) {
+    (void)args;
+    uint32_t used = stack_high_water();
+    uint32_t total = stack_total();
+    if (total == 0) { terminal_writestring("stack: not instrumented\n"); return; }
+    uint32_t pct = (uint32_t)(((uint64_t)used * 100u) / total);
+    terminal_writestring("main stack: ");
+    print_dec(used);
+    terminal_writestring(" / ");
+    print_dec(total);
+    terminal_writestring(" B used (");
+    print_dec(pct);
+    terminal_writestring("%)");
+    if (pct >= 75u) terminal_writestring("  <-- DANGER: 快踩到 .data 了");
+    terminal_writestring("\n");
+}
+
+static void cmd_cpuid(const char *args) {
+    (void)args;
+    uint32_t eax, ebx, ecx, edx;
+    char vendor[13];
+    asm volatile("cpuid"
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(0));
+    ((uint32_t*)vendor)[0] = ebx;
+    ((uint32_t*)vendor)[1] = edx;
+    ((uint32_t*)vendor)[2] = ecx;
+    vendor[12] = '\0';
+    terminal_writestring("CPU Vendor: ");
+    terminal_writestring(vendor);
+    terminal_putchar('\n');
+}
+
+static void cmd_readdisk(const char *args) {
+    int drive = 0;
+    int lba = 0;
+
+    int first = my_atoi(args);
+    const char *p = args;
+    while (*p >= '0' && *p <= '9') p++;
+    while (*p == ' ') p++;
+
+    if (*p == '\0') {
+        lba = first;
+    } else {
+        drive = first;
+        lba = my_atoi(p);
+    }
+
+    if (drive < 0 || drive > 1) {
+        terminal_writestring("Usage: readdisk [drive 0|1] <lba>\n");
+        return;
+    }
+
+    uint8_t buffer[512];
+    if (ata_read_sector((uint8_t)drive, (uint32_t)lba, buffer) != 0) {
+        terminal_writestring("Disk read error!\n");
+        return;
+    }
+    terminal_writestring("Sector ");
+    print_dec(lba);
+    terminal_writestring(" (512 bytes, drive ");
+    print_dec(drive);
+    terminal_writestring("):\n");
+    for (int i = 0; i < 512; i += 16) {
+        print_hex32(i);
+        terminal_writestring("  ");
+        for (int j = 0; j < 16; j++) {
+            print_hex_byte(buffer[i + j]);
+            terminal_putchar(' ');
+        }
+        terminal_putchar(' ');
+        for (int j = 0; j < 16; j++) {
+            char c = buffer[i + j];
+            if (c >= 32 && c <= 126) terminal_putchar(c);
+            else terminal_putchar('.');
+        }
+        terminal_putchar('\n');
+    }
+}
+
+static void cmd_hexdump(const char *args) {
+    uint32_t addr = my_htoi(args);
+    int len = 64;
+    /* 可选的字节数参数：hexdump <addr> [len]，上限 1024 */
+    const char *p = args;
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    if (*p) {
+        len = my_atoi(p);
+        if (len <= 0) len = 64;
+        if (len > 1024) len = 1024;
+    }
+    /* 与 `mem` 同理：不校验就在 ring0 解引用用户给的地址，
+     * 一条 `hexdump 0xFFFFFFFF` 足以让整个内核缺页停机。 */
+    if (!mem_range_mapped(addr, (uint32_t)len)) {
+        terminal_writestring("error: that address range is not mapped "
+                             "(dumping it would fault the kernel)\n");
+        return;
+    }
+    terminal_writestring("Hexdump at 0x");
+    print_hex32(addr);
+    terminal_writestring(":\n");
+    for (int i = 0; i < len; i++) {
+        if (i % 16 == 0) {
+            print_hex32(addr + i);
+            terminal_writestring("  ");
+        }
+        uint8_t val = *(volatile uint8_t *)(addr + i);
+        print_hex_byte(val);
+        terminal_putchar(' ');
+        if (i % 16 == 15) terminal_putchar('\n');
+    }
+    if (len % 16 != 0) terminal_putchar('\n');
+}
+
+/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）。
+ * shell 的 beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 就直接返回。 */
+void beep(uint32_t freq, uint32_t ms) {
+    if (freq < 20 || freq > 20000 || ms == 0) return;
+    outb(0x43, 0xB6);                       /* ch2: lobyte/hibyte, square wave */
+    uint16_t div = (uint16_t)(1193180 / freq);
+    if (div == 0) div = 1;
+    outb(0x42, (uint8_t)(div & 0xFF));
+    outb(0x42, (uint8_t)(div >> 8));
+    uint8_t tmp = inb(0x61);
+    outb(0x61, tmp | 3);                    /* gate+speaker on */
+    uint32_t until = g_pit_ticks + ms;      /* PIT ch0 已是 1000Hz，tick=1ms */
+    while ((int32_t)(g_pit_ticks - until) < 0) { asm volatile("pause"); }
+    tmp = inb(0x61) & 0xFC;
+    outb(0x61, tmp);                        /* gate+speaker off */
+}
+
+static void cmd_beep(const char *args) {
+    (void)args;
+    beep(1000, 300);
+}
+
+static void cmd_about(const char *args) {
+    (void)args;
+    terminal_writestring("Cerulia v0.3-gui - A hobby operating system\n");
+    terminal_writestring("Written in C and Assembly\n");
+}
+
+static void cmd_history(const char *args) {
+    if (args[0] == '-' && args[1] == 'c') {
+        history_count = 0;
+        terminal_writestring("History cleared.\n");
+        return;
+    }
+    for (int i = 0; i < history_count; i++) {
+        print_dec(i + 1);
+        terminal_writestring(": ");
+        terminal_writestring(history[i]);
+        terminal_putchar('\n');
+    }
+}
+
+static void cmd_setcolor(const char *args) {
+    int fg = -1, bg = -1;
+    if (*args) {
+        fg = my_atoi(args);
+        while (*args && *args != ' ') args++;
+        if (*args == ' ') {
+            args++;
+            bg = my_atoi(args);
+        }
+    }
+    if (fg < 0 || fg > 15 || bg < 0 || bg > 15) {
+        terminal_writestring("Usage: setcolor <fg 0-15> [bg 0-15]\n");
+        return;
+    }
+    terminal_setcolor((uint8_t)(fg | (bg << 4)));
+    terminal_writestring("Color set.\n");
+}
+
+static void cmd_ls(const char *args) {
+    int verbose = 0;
+    const char *p = args;
+    while (*p == ' ') p++;
+    if (p[0] == '-' && p[1] == 'l') { verbose = 1; p += 2; while (*p == ' ') p++; }
+
+    /* 取第一个参数。/bin 与 /system 走内核内置只读系统卷——它不需要
+     * 任何盘，所以这一支不能先要求 fs_init() 成功。 */
+    char target[64];
+    int t = 0;
+    while (*p && *p != ' ' && t < 63) target[t++] = *p++;
+    target[t] = 0;
+
+    /* 16.9KB（64 x 264B）。**绝不能放栈上**：任务内核栈 TASK_KSIZE 只有
+     * 16KB，放栈上会让 ls 一进来就越界写穿相邻数据（实测：ro_cwd 被目录项
+     * 名字覆盖，提示符变成 [A.TXT]，随后的 cat/write 全部失败）。
+     * static 落 .bss（19MB 区），ls 不重入，安全。
+     * （主栈 2026-10 起已扩到 1MB，但任务栈仍只有 16KB，这条约束不变。） */
+    static fs_dir_entry_t entries[64];
+    int n;
+    const char *title;
+    if (t > 0 && sysvol_is_path(target)) {
+        n = fs_read_dir_path(target, entries, 64);
+        title = target;
+    } else if (t == 0 && fs_sysvol_cwd()[0] != 0) {
+        /* cd /bin 之后的 ls：列系统卷当前目录 */
+        n = fs_read_dir_path(fs_sysvol_cwd(), entries, 64);
+        title = fs_sysvol_cwd();
+    } else {
+        /* 根目录 = 系统卷挂载点（bin/ system/）在前 + 数据盘内容在后。
+         * 系统卷不依赖任何盘：数据盘没格式化时挂载点也必须可见——
+         * 否则用户从 shell 根本看不出 /bin /system 存在。 */
+        const char *cwd = fs_cwd_path();
+        int at_root = (cwd[0] == '/' && cwd[1] == 0);
+        int want_root = (t == 0 && at_root) ||
+                        (t > 0 && target[0] == '/' && target[1] == 0);
+        if (want_root) {
+            n = sysvol_list("/", entries, 62);
+            if (n < 0) n = 0;
+            if (fs_init() == 0) {
+                int m = fs_read_dir(&entries[n], 62 - n);
+                if (m > 0) n += m;
+            }
+            title = (t > 0) ? target : cwd;
+        } else {
+            if (fs_init() != 0) {
+                terminal_writestring("FS init failed. Is disk formatted?\n");
+                return;
+            }
+            if (t > 0) {
+                /* 给了路径参数就列那个目录（`ls SD`、`ls SD/sub`）。
+                 * 以前这里一律列 cwd，参数被静默忽略。 */
+                n = fs_read_dir_path(target, entries, 64);
+                title = target;
+            } else {
+                n = fs_read_dir(entries, 64);
+                title = fs_cwd_path();
+            }
+        }
+    }
+    if (n < 0) {
+        terminal_writestring("read dir failed\n");
+        return;
+    }
+    terminal_writestring(title);
+    terminal_writestring(":\n");
+    if (verbose) {
+        /* -l 详细模式：类型 + rwx 权限位 + 属主 + 大小（P2 权限体系）。
+         * 权限查询的路径前缀：ls SD 时条目名要拼成 SD/<name>，否则查错对象 */
+        char pq[288];
+        uint32_t plen = 0, pre_len;
+        int at_root = (title[0] == '/' && title[1] == 0) || title[0] == 0;
+        if (!at_root) {
+            while (title[plen] && plen < 200) { pq[plen] = title[plen]; plen++; }
+            if (plen > 0 && pq[plen - 1] != '/') pq[plen++] = '/';
+        }
+        pre_len = plen;
+        for (int i = 0; i < n; i++) {
+            if (entries[i].is_dir) shell_fg(CLR_LIGHT_BLUE);
+            else if (is_exe_name(entries[i].name)) shell_fg(CLR_LIGHT_GREEN);
+            else shell_fg(CLR_LIGHT_GREY);
+            terminal_putchar(entries[i].is_dir ? 'd' : '-');
+            /* 权限位：ext4 卷上是真实 mode；FAT/系统卷全权限 0777 */
+            uint16_t mode = 0;
+            uint16_t fuid = 0, fgid = 0;
+            plen = pre_len;
+            for (int k = 0; entries[i].name[k] && plen < 280; k++)
+                pq[plen++] = entries[i].name[k];
+            pq[plen] = 0;
+            int have_perm = (fs_get_perm(pq, &mode, &fuid, &fgid) == 0);
+            static const char rwx[8][4] = {
+                "---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"
+            };
+            if (!have_perm) mode = 0;
+            uint32_t obits = have_perm ? ((mode >> 6) & 7u) : 8u;
+            uint32_t gbits = have_perm ? ((mode >> 3) & 7u) : 8u;
+            uint32_t ubits = have_perm ? (mode & 7u) : 8u;
+            if (entries[i].is_dir && !have_perm) { obits = gbits = ubits = 7u; }
+            terminal_writestring(rwx[obits & 7u]);
+            terminal_writestring(rwx[gbits & 7u]);
+            terminal_writestring(rwx[ubits & 7u]);
+            terminal_putchar(' ');
+            /* 属主：uid -> /etc/passwd 用户名，查不到显示数字 */
+            const char *owner = have_perm ? user_name_of(fuid) : 0;
+            if (owner) {
+                terminal_writestring(owner);
+            } else if (have_perm) {
+                char ob[12];
+                int on = 0;
+                uint32_t uv = fuid;
+                if (uv == 0) ob[on++] = '0';
+                while (uv > 0) { ob[on++] = (char)('0' + uv % 10u); uv /= 10u; }
+                for (int pad = on; pad < 8; pad++) terminal_putchar(' ');
+                while (on > 0) terminal_putchar(ob[--on]);
+            } else {
+                terminal_writestring("-");
+            }
+            terminal_putchar(' ');
+            uint32_t sz = entries[i].size;
+            char buf[16];
+            int blen = 0;
+            if (sz == 0) buf[blen++] = '0';
+            while (sz > 0) { buf[blen++] = '0' + (sz % 10); sz /= 10; }
+            shell_fg(CLR_LIGHT_GREY);
+            for (int pad = blen; pad < 10; pad++) terminal_putchar(' ');
+            while (blen > 0) terminal_putchar(buf[--blen]);
+            terminal_putchar(' ');
+            if (entries[i].is_dir) shell_fg(CLR_LIGHT_BLUE);
+            else if (is_exe_name(entries[i].name)) shell_fg(CLR_LIGHT_GREEN);
+            else shell_fg(CLR_LIGHT_GREY);
+            terminal_writestring(entries[i].name);
+            if (entries[i].is_dir) terminal_putchar('/');
+            shell_color_default();
+            terminal_putchar('\n');
+        }
+    } else {
+        /* eza 风格的彩色输出 */
+        int maxlen = 4;
+        for (int i = 0; i < n; i++) {
+            int l = 0; while (entries[i].name[l]) l++;
+            if (l > maxlen) maxlen = l;
+        }
+        int cols = 80 / (maxlen + 3);
+        if (cols < 1) cols = 1;
+        int rows = (n + cols - 1) / cols;
+        if (rows < 1) rows = 1;
+        char namebuf[64];
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                int idx = c * rows + r;
+                if (idx >= n) break;
+                if (entries[idx].is_dir) shell_fg(CLR_LIGHT_BLUE);
+                else if (is_exe_name(entries[idx].name)) shell_fg(CLR_LIGHT_GREEN);
+                else shell_fg(CLR_LIGHT_GREY);
+                int l = 0; while (entries[idx].name[l] && l < 60) { namebuf[l] = entries[idx].name[l]; l++; }
+                namebuf[l] = '\0';
+                for (int k = 0; k < l; k++) terminal_putchar(namebuf[k]);
+                if (entries[idx].is_dir) terminal_putchar('/');
+                shell_color_default();
+                /* 补空格到列宽 */
+                int pad = l + (entries[idx].is_dir ? 1 : 0);
+                for (int fill = pad; fill < maxlen + 3; fill++) terminal_putchar(' ');
+            }
+            terminal_putchar('\n');
+        }
+    }
+}
+
+static void cmd_cat(const char *args) {
+    char filename[128];
+    int i = 0;
+    while (*args && *args != ' ' && i < 127) {
+        filename[i++] = *args++;
+    }
+    filename[i] = '\0';
+    if (i == 0) {
+        if (pipe_len > 0) {
+            for (int j = 0; j < pipe_len; j++) terminal_putchar(pipe_buffer[j]);
+            terminal_putchar('\n');
+            return;
+        }
+        terminal_writestring("Usage: cat <filename>\n");
+        return;
+    }
+    /* 系统卷（/bin、/system）不需要磁盘挂载；只有数据盘路径才要求 fs_init。
+     * 站在系统卷里时裸名会被 fs 层解析成 /system/xxx，同样不需要盘。 */
+    if (fs_sysvol_cwd()[0] == 0 && !sysvol_is_path(filename) && fs_init() != 0) {
+        terminal_writestring("FS init failed.\n");
+        return;
+    }
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes < 0) {
+        if (bytes == -2) puts_c("Permission denied.\n", CLR_ERROR);
+        else puts_c("File not found or read error.\n", CLR_ERROR);
+    } else {
+        for (int j = 0; j < bytes; j++) {
+            char c = (char)g_file_buf[j];
+            if (c == '\n' || c == '\t' || c == '\r' || (c >= 32 && c <= 126)) {
+                terminal_putchar(c);
+            } else {
+                terminal_putchar('.');
+            }
+        }
+        terminal_putchar('\n');
+    }
+}
+
+static void cmd_write(const char *args) {
+    char filename[128];
+    int i = 0;
+    while (*args && *args != ' ' && i < 127) {
+        filename[i++] = *args++;
+    }
+    filename[i] = '\0';
+    if (*args == ' ') args++;
+    if (i == 0 || *args == '\0') {
+        terminal_writestring("Usage: write <filename> <content>\n");
+        return;
+    }
+
+    const char *content = args;
+    uint32_t len = 0;
+    while (content[len]) len++;
+    /* 4096 = 与 PIPE_BUF_SIZE 一致。原上限 512 恰好等于一簇，任何跨簇写入
+     * 都被静默截断成单簇文件——多簇 FAT 链这条路径根本没被测到过。 */
+    if (len > 4096) len = 4096;
+
+    if (fs_create_file(filename, (const uint8_t*)content, len) != 0) {
+        terminal_writestring(!fs_ready() ? "Not saved: no data volume mounted.\n" :
+                             fs_is_readonly() ? "Not saved: data volume is read-only.\n" :
+                             "Failed to write file.\n");
+    } else {
+        terminal_writestring("File written successfully.\n");
+    }
+}
+
+static void cmd_rm(const char *args) {
+    if (args[0] == '\0') {
+        terminal_writestring("Usage: rm <file>\n");
+        return;
+    }
+    if (user_confined()) {
+        if (fs_delete_file(args) == 0) terminal_writestring("File deleted.\n");
+        else terminal_writestring("Failed to delete file.\n");
+        return;
+    }
+    /* rm 默认走回收站（Windows 语义）；过大/不支持时回退永久删除 */
+    int rc = trash_put(args);
+    if (rc >= 0) {
+        puts_c("File deleted.\n", CLR_SUCCESS);
+        return;
+    }
+    if (rc == -3) {
+        if (fs_delete_file(args) != 0)
+            terminal_writestring("Failed to delete file.\n");
+        else
+            puts_c("Too big for recycle bin, deleted permanently.\n", CLR_WARNING);
+        return;
+    }
+    if (rc == -4) {
+        terminal_writestring("Cannot recycle a directory, use rmdir.\n");
+        return;
+    }
+    if (fs_delete_file(args) != 0) {
+        puts_c("Failed to delete file.\n", CLR_ERROR);
+    } else {
+        puts_c("File deleted.\n", CLR_SUCCESS);
+    }
+}
+
+/* ---- P3 Win 系特性：回收站 + 注册表 ---- */
+
+static int reg_ci_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static void cmd_trash(const char *args) {
+    (void)args;
+    int n = 0;
+    for (uint32_t i = 1; i <= 256; i++) {
+        char orig[256];
+        if (trash_get_orig(i, orig, sizeof(orig)) != 0) continue;
+        uint32_t sz = trash_get_size(i);
+        terminal_writestring("  ");
+        ezos_console_print_dec(i);
+        terminal_writestring("  ");
+        ezos_console_print_dec(sz);
+        terminal_writestring("  ");
+        terminal_writestring(orig);
+        terminal_writestring("\n");
+        n++;
+    }
+    if (n == 0) terminal_writestring("Recycle bin is empty.\n");
+}
+
+static void cmd_restore(const char *args) {
+    char tok[16];
+    parse_token(args, tok, sizeof(tok));
+    if (tok[0] == '\0') {
+        terminal_writestring("Usage: restore <slot>\n");
+        return;
+    }
+    uint32_t slot = 0;
+    for (int i = 0; tok[i]; i++) {
+        if (tok[i] < '0' || tok[i] > '9') {
+            terminal_writestring("Usage: restore <slot>\n");
+            return;
+        }
+        slot = slot * 10 + (uint32_t)(tok[i] - '0');
+    }
+    char orig[256];
+    if (trash_get_orig(slot, orig, sizeof(orig)) != 0) {
+        terminal_writestring("No such slot.\n");
+        return;
+    }
+    int rc = trash_restore(slot);
+    if (rc == 0) puts_c("Restored.\n", CLR_SUCCESS);
+    else if (rc == -2) puts_c("Permission denied.\n", CLR_ERROR);
+    else terminal_writestring("Restore failed.\n");
+}
+
+static void cmd_purge(const char *args) {
+    (void)args;
+    int n = trash_purge();
+    if (n < 0) terminal_writestring("Purge failed.\n");
+    else {
+        terminal_writestring("Purged ");
+        ezos_console_print_dec((uint32_t)n);
+        terminal_writestring(" item(s).\n");
+    }
+}
+
+static void cmd_reg(const char *args) {
+    char sub[16], key[64], val[256];
+    const char *p = parse_token(args, sub, sizeof(sub));
+    if (sub[0] == '\0') {
+        terminal_writestring("Usage: reg get|set|del|list ...\n");
+        return;
+    }
+    if (reg_ci_eq(sub, "list")) {
+        char out[1024];
+        int n = reg_list(out, sizeof(out));
+        if (n <= 0) terminal_writestring("(empty)\n");
+        else terminal_writestring(out);
+        return;
+    }
+    p = parse_token(p, key, sizeof(key));
+    if (key[0] == '\0') {
+        terminal_writestring("Usage: reg get <key> | reg set <key> <value> | reg del <key>\n");
+        return;
+    }
+    if (reg_ci_eq(sub, "get")) {
+        char v[256];
+        if (reg_get(key, v, sizeof(v)) != 0) terminal_writestring("(not set)\n");
+        else {
+            terminal_writestring(v);
+            terminal_writestring("\n");
+        }
+        return;
+    }
+    if (reg_ci_eq(sub, "set")) {
+        while (*p == ' ') p++;
+        int i = 0;
+        while (*p && i < (int)sizeof(val) - 1) val[i++] = *p++;
+        val[i] = 0;
+        if (i == 0) {
+            terminal_writestring("Usage: reg set <key> <value>\n");
+            return;
+        }
+        int rc = reg_set(key, val);
+        if (rc == 0) puts_c("ok\n", CLR_SUCCESS);
+        else if (rc == -2) puts_c("Permission denied.\n", CLR_ERROR);
+        else puts_c("Failed (readonly volume?).\n", CLR_ERROR);
+        return;
+    }
+    if (reg_ci_eq(sub, "del")) {
+        int rc = reg_del(key);
+        if (rc == 0) puts_c("ok\n", CLR_SUCCESS);
+        else if (rc == -1) terminal_writestring("No such key.\n");
+        else puts_c("Failed.\n", CLR_ERROR);
+        return;
+    }
+    terminal_writestring("Usage: reg get|set|del|list ...\n");
+}
+
+/* ---- P2 权限体系命令 ---- */
+
+static int account_arg(const char *args, char name[USER_NAME_MAX + 1]) {
+    while (*args == ' ') args++;
+    uint32_t n = 0;
+    while (*args && *args != ' ') {
+        if (n == USER_NAME_MAX) return -1;
+        name[n++] = *args++;
+    }
+    name[n] = 0;
+    while (*args == ' ') args++;
+    return *args || n == 0 ? -1 : 0;
+}
+
+static int new_password(char password[AUTH_MAX_PASSWORD + 1]) {
+    char confirm[AUTH_MAX_PASSWORD + 1];
+    int len = password_prompt("New password (15-64 characters): ", password);
+    if (len < AUTH_MIN_PASSWORD) {
+        terminal_writestring("Password cancelled or length invalid.\n");
+        return -1;
+    }
+    int other = password_prompt("Confirm password: ", confirm);
+    int ok = other == len && auth_equal(password, confirm, (uint32_t)len);
+    auth_wipe(confirm, sizeof(confirm));
+    if (!ok) terminal_writestring("Passwords do not match.\n");
+    return ok ? len : -1;
+}
+
+static int session_idle(void) {
+    shell_reap_bg();
+    if (!user_session_busy()) return 1;
+    terminal_writestring("Stop or wait for running programs before changing session.\n");
+    return 0;
+}
+
+static void cmd_setupusers(const char *args) {
+    while (*args == ' ') args++;
+    if (*args) { terminal_writestring("Usage: setupusers\n"); return; }
+    terminal_writestring("Local accounts are already enabled. Use passwd to set your password.\n");
+}
+
+static void cmd_login(const char *args) {
+    char name[USER_NAME_MAX + 1];
+    if (account_arg(args, name) != 0) {
+        terminal_writestring("Usage: login <user>\n");
+        return;
+    }
+    if (session_idle()) shell_authenticate(name);
+}
+
+static void cmd_su(const char *args) {
+    cmd_login(args);
+}
+
+static void cmd_whoami(const char *args) {
+    (void)args;
+    terminal_writestring(user_current_name());
+    terminal_writestring("\n");
+}
+
+static void cmd_useradd(const char *args) {
+    char name[USER_NAME_MAX + 1];
+    if (account_arg(args, name) != 0) {
+        terminal_writestring("Usage: useradd <name>\n");
+        return;
+    }
+    if (!user_is_admin() || !user_valid_account_name(name)) {
+        terminal_writestring("Use 1-16 lowercase letters, digits or underscores (admin only).\n");
+        return;
+    }
+    if (user_uid_of(name) >= 0) { terminal_writestring("already exists\n"); return; }
+    if (!user_can_store()) {
+        terminal_writestring("Account creation requires the boot-selected writable exFAT volume.\n");
+        return;
+    }
+    if (!session_idle()) return;
+    char password[AUTH_MAX_PASSWORD + 1];
+    int n = new_password(password);
+    int rc = n < 0 ? -4 : user_add_account(name, password, (uint32_t)n);
+    auth_wipe(password, sizeof(password));
+    if (rc == 0) terminal_writestring("Account created.\n");
+    else if (rc == -1) terminal_writestring("Cannot add account: maximum is 16 accounts.\n");
+    else if (rc == -3) terminal_writestring("Cannot create account: home exists or volume write failed.\n");
+}
+
+static void cmd_users(const char *args) {
+    (void)args;
+    terminal_writestring("Local accounts:\n");
+    for (uint32_t uid = 0; user_name_of(uid); uid++) {
+        const char *name = user_name_of(uid);
+        terminal_writestring("  ");
+        terminal_writestring(name);
+        if (user_account_admin(uid)) terminal_writestring(" [admin]");
+        if (!user_password_required(name)) terminal_writestring(" [no password]");
+        terminal_putchar('\n');
+    }
+}
+
+static void cmd_admin(const char *args) {
+    char name[USER_NAME_MAX + 1], value[5];
+    while (*args == ' ') args++;
+    unsigned n = 0, v = 0;
+    while (*args && *args != ' ' && n < USER_NAME_MAX) name[n++] = *args++;
+    name[n] = 0;
+    if (*args == ' ') {
+        while (*args == ' ') args++;
+        while (*args && *args != ' ' && v + 1 < sizeof(value)) value[v++] = *args++;
+    }
+    value[v] = 0;
+    while (*args == ' ') args++;
+    int enable = my_strcasecmp(value, "on") == 0;
+    if (!n || *args || (!enable && my_strcasecmp(value, "off") != 0)) {
+        terminal_writestring("Usage: admin <user> <on|off>\n");
+        return;
+    }
+    if (!user_is_admin() || !session_idle()) return;
+    int rc = user_set_admin(name, enable);
+    if (rc == 0) terminal_writestring(enable ? "Admin granted.\n" : "Admin revoked.\n");
+    else if (rc == USER_VOLATILE) terminal_writestring(enable ?
+        "Admin granted for this boot only.\n" : "Admin revoked for this boot only.\n");
+    else if (rc == -2) terminal_writestring("No such account.\n");
+    else if (rc == -3) terminal_writestring("The built-in root account must remain admin.\n");
+    else terminal_writestring("Unable to save admin change.\n");
+}
+
+static void cmd_passwd(const char *args) {
+    while (*args == ' ') args++;
+    if (*args) { terminal_writestring("Usage: passwd\n"); return; }
+    if (!user_can_store()) {
+        terminal_writestring("Saving passwords requires the boot-selected writable exFAT volume.\n");
+        return;
+    }
+    if (!session_idle()) return;
+    char password[AUTH_MAX_PASSWORD + 1];
+    int n = user_password_required(user_current_name()) ? password_prompt("Current password: ", password) : 0;
+    int ok = n >= 0 && user_check_password(password, (uint32_t)n);
+    auth_wipe(password, sizeof(password));
+    if (!ok) {
+        terminal_writestring("Password verification failed.\n");
+        login_delay();
+        return;
+    }
+    n = new_password(password);
+    int rc = n < 0 ? -2 : user_change_password(password, (uint32_t)n);
+    auth_wipe(password, sizeof(password));
+    if (rc == 0) terminal_writestring("Password changed.\n");
+    else if (rc == -1) terminal_writestring("Password not changed: unable to save the account database.\n");
+}
+
+static void cmd_logout(const char *args) {
+    while (*args == ' ') args++;
+    if (*args) { terminal_writestring("Usage: logout\n"); return; }
+    if (session_idle() && user_logout() == 0) shell_reset_session();
+}
+
+/* "644" 八进制 -> 0644；非法返回 0xFFFF */
+static uint16_t parse_mode_octal(const char *s) {
+    uint32_t v = 0, n = 0;
+    while (*s) {
+        if (*s < '0' || *s > '7' || n >= 4) return 0xFFFFu;
+        v = v * 8 + (uint32_t)(*s++ - '0');
+        n++;
+    }
+    if (n == 0) return 0xFFFFu;
+    return (uint16_t)v;
+}
+
+static void cmd_chmod(const char *args) {
+    char modestr[8], path[128];
+    int i = 0;
+    while (*args && *args != ' ' && i < 7) modestr[i++] = *args++;
+    modestr[i] = 0;
+    while (*args == ' ') args++;
+    i = 0;
+    while (*args && *args != ' ' && i < 127) path[i++] = *args++;
+    path[i] = 0;
+    uint16_t mode = parse_mode_octal(modestr);
+    if (mode == 0xFFFFu || i == 0) {
+        terminal_writestring("Usage: chmod <octal> <file>\n");
+        return;
+    }
+    int rc = fs_chmod(path, mode);
+    if (rc == 0) terminal_writestring("mode changed\n");
+    else if (rc == -2) terminal_writestring("permission denied\n");
+    else if (rc == -3) terminal_writestring("not supported on this filesystem\n");
+    else terminal_writestring("no such file\n");
+}
+
+static void cmd_chown(const char *args) {
+    char user[17], path[128];
+    int i = 0;
+    while (*args && *args != ' ' && i < 16) user[i++] = *args++;
+    user[i] = 0;
+    while (*args == ' ') args++;
+    i = 0;
+    while (*args && *args != ' ' && i < 127) path[i++] = *args++;
+    path[i] = 0;
+    if (i == 0) {
+        terminal_writestring("Usage: chown <user> <file>\n");
+        return;
+    }
+    int uid = user_uid_of(user);
+    if (uid < 0) {
+        terminal_writestring("no such user\n");
+        return;
+    }
+    int rc = fs_chown(path, (uint32_t)uid);
+    if (rc == 0) terminal_writestring("owner changed\n");
+    else if (rc == -2) terminal_writestring("permission denied (admin only)\n");
+    else if (rc == -3) terminal_writestring("not supported on this filesystem\n");
+    else terminal_writestring("no such file\n");
+}
+
+
+static void cmd_format(const char *args) {
+    if (user_storage_pinned()) {
+        terminal_writestring("Cannot format the active account volume.\n");
+        return;
+    }
+    while (*args == ' ') args++;
+    int type = FS_EXFAT;
+    if (args[0] != '\0') {
+        if (my_strcasecmp(args, "exfat") == 0) {
+            type = FS_EXFAT;
+        } else if (my_strcasecmp(args, "fat12") == 0) {
+            type = FS_FAT12;
+        } else if (my_strcasecmp(args, "fat16") == 0) {
+            type = FS_FAT16;
+        } else if (my_strcasecmp(args, "fat32") == 0) {
+            type = FS_FAT32;
+        } else if (my_strcasecmp(args, "ext4") == 0) {
+            type = FS_EXT4;
+        } else if (my_strcasecmp(args, "ntfs") == 0) {
+            type = FS_NTFS;
+        } else if (my_strcasecmp(args, "f2fs") == 0) {
+            type = FS_F2FS;
+        } else if (my_strcasecmp(args, "refs") == 0) {
+            type = FS_REFS;
+        } else {
+            terminal_writestring("Usage: format [exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs]\n");
+            return;
+        }
+    }
+    if (fs_format(type) != 0) {
+        puts_c("Format failed.\n", CLR_ERROR);
+    } else {
+        shell_fg(CLR_SUCCESS);
+        terminal_writestring("Disk formatted as ");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(".\n");
+        shell_color_default();
+        // fs_format succeeds with the new FS mounted; no re-init needed
+    }
+}
+
+static void cmd_setdrive(const char *args) {
+    if (user_storage_pinned()) {
+        terminal_writestring("Cannot switch away from the active account volume.\n");
+        return;
+    }
+    int drive = my_atoi(args);
+    if (drive < 0 || drive >= BLK_MAX_DRIVE) {
+        terminal_writestring("Usage: setdrive <0-");
+        ezos_console_print_dec((uint32_t)BLK_MAX_DRIVE - 1);
+        terminal_writestring(">\n");
+        return;
+    }
+    /* 盘**本身不存在**时不能报成功：fs_init() 有"探测不到文件系统就回退到
+     * 现有数据盘"的既有逻辑，只看它的返回值会让 setdrive 到一个压根没有的
+     * drive（比如没插 NVMe 时的 16）打印 "FS drive set to 16"，用户会误以为
+     * 已经切过去。这里先一步按块层存在性 fail closed。 */
+    if (ata_drive_present((uint8_t)drive) == 0) {
+        terminal_writestring("Drive ");
+        print_dec(drive);
+        terminal_writestring(": not present\n");
+        return;
+    }
+    fs_set_drive((uint8_t)drive);
+    if (fs_init() == 0) {
+        terminal_writestring("FS drive set to ");
+        print_dec(drive);
+        terminal_writestring(" (");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(")\n");
+    } else {
+        terminal_writestring("Drive ");
+        print_dec(drive);
+        terminal_writestring(": no filesystem found\n");
+    }
+}
+
+/* ============ 仿 Linux 风格的命令（真实实现） ============ */
+
+// 从 args 里取下一个以空格分隔的记号（token）写进 out，返回剩余字符串的指针
+static const char *parse_token(const char *args, char *out, int max) {
+    int i = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && i < max - 1) out[i++] = *args++;
+    out[i] = '\0';
+    while (*args == ' ') args++;
+    return args;
+}
+
+static void cmd_grep(const char *args) {
+    char pattern[128];
+    char filename[128];
+    const char *p = parse_token(args, pattern, 128);
+    parse_token(p, filename, 128);
+    if (pattern[0] == '\0') {
+        terminal_writestring("Usage: grep <pattern> [file]\n");
+        return;
+    }
+    if (filename[0] == '\0' && pipe_len > 0) {
+        /* 从管道里读输入 */
+        int plen = my_strlen(pattern);
+        int line_start = 0, line_end = 0;
+        while (line_end < pipe_len) {
+            while (line_end < pipe_len && pipe_buffer[line_end] != '\n') line_end++;
+            int found = 0;
+            for (int s = line_start; s + plen <= line_end; s++) {
+                int k = 0;
+                while (k < plen && pipe_buffer[s + k] == pattern[k]) k++;
+                if (k == plen) { found = 1; break; }
+            }
+            if (found) {
+                for (int j = line_start; j < line_end; j++) terminal_putchar(pipe_buffer[j]);
+                terminal_putchar('\n');
+            }
+            line_end++;
+            line_start = line_end;
+        }
+        return;
+    }
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes < 0) {
+        puts_c("File not found or read error.\n", CLR_ERROR);
+        return;
+    }
+    int plen = my_strlen(pattern);
+    int line_start = 0, line_end = 0;
+    while (line_end < bytes) {
+        while (line_end < bytes && g_file_buf[line_end] != '\n') line_end++;
+        int found = 0;
+        for (int s = line_start; s + plen <= line_end; s++) {
+            int k = 0;
+            while (k < plen && g_file_buf[s + k] == pattern[k]) k++;
+            if (k == plen) { found = 1; break; }
+        }
+        if (found) {
+            print_highlighted((const char *)g_file_buf, line_start, line_end, pattern, plen);
+            terminal_putchar('\n');
+        }
+        line_end++;
+        line_start = line_end;
+    }
+}
+
+static void cmd_wc(const char *args) {
+    char filename[128];
+    /* 支持 -l/-w/-c（可组合，如 -lw）：此前无选项解析，`wc -l file` 会把
+     * "-l" 当成文件名报 file not found——日用习惯性输入第一课。
+     * 无选项时保持原行为（三列全打印）。 */
+    int want_l = 0, want_w = 0, want_c = 0;
+    while (*args == ' ') args++;
+    while (args[0] == '-' && args[1] != '\0' && args[1] != ' ') {
+        for (const char *o = args + 1; *o && *o != ' '; o++) {
+            if (*o == 'l') want_l = 1;
+            else if (*o == 'w') want_w = 1;
+            else if (*o == 'c') want_c = 1;
+        }
+        while (*args && *args != ' ') args++;
+        while (*args == ' ') args++;
+    }
+    parse_token(args, filename, 128);
+    if (filename[0] == '\0') {
+        if (pipe_len > 0) {
+            int lines = 0, words = 0, chars = 0;
+            int in_word = 0;
+            for (int i = 0; i < pipe_len; i++) {
+                char c = pipe_buffer[i];
+                chars++;
+                if (c == '\n') { lines++; in_word = 0; }
+                else if (c == ' ' || c == '\t' || c == '\r') { in_word = 0; }
+                else if (!in_word) { words++; in_word = 1; }
+            }
+            print_dec(lines); terminal_putchar(' ');
+            print_dec(words); terminal_putchar(' ');
+            print_dec(chars); terminal_putchar(' ');
+            terminal_writestring("(pipe)\n");
+            return;
+        }
+        terminal_writestring("Usage: wc <file>\n");
+        return;
+    }
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes < 0) {
+        puts_c("File not found or read error.\n", CLR_ERROR);
+        return;
+    }
+    int lines = 0, words = 0, chars = 0;
+    int in_word = 0;
+    for (int i = 0; i < bytes; i++) {
+        char c = (char)g_file_buf[i];
+        chars++;
+        if (c == '\n') { lines++; in_word = 0; }
+        else if (c == ' ' || c == '\t' || c == '\r') { in_word = 0; }
+        else if (!in_word) { words++; in_word = 1; }
+    }
+    int any = want_l || want_w || want_c;
+    if (!any || want_l) { print_dec(lines); terminal_putchar(' '); }
+    if (!any || want_w) { print_dec(words); terminal_putchar(' '); }
+    if (!any || want_c) { print_dec(chars); terminal_putchar(' '); }
+    terminal_writestring(filename);
+    terminal_putchar('\n');
+}
+
+static void cmd_head(const char *args) {
+    char filename[128];
+    char numstr[32];
+    const char *p = parse_token(args, filename, 128);
+    parse_token(p, numstr, 32);
+    if (filename[0] == '\0') {
+        terminal_writestring("Usage: head <file> [n]\n");
+        return;
+    }
+    int n = numstr[0] ? my_atoi(numstr) : 10;
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes < 0) {
+        puts_c("File not found or read error.\n", CLR_ERROR);
+        return;
+    }
+    int shown = 0, line_start = 0, line_end = 0;
+    while (line_end < bytes && shown < n) {
+        while (line_end < bytes && g_file_buf[line_end] != '\n') line_end++;
+        for (int j = line_start; j < line_end; j++) terminal_putchar((char)g_file_buf[j]);
+        terminal_putchar('\n');
+        shown++;
+        line_end++;
+        line_start = line_end;
+    }
+}
+
+static void cmd_tail(const char *args) {
+    char filename[128];
+    char numstr[32];
+    const char *p = parse_token(args, filename, 128);
+    parse_token(p, numstr, 32);
+    if (filename[0] == '\0') {
+        terminal_writestring("Usage: tail <file> [n]\n");
+        return;
+    }
+    int n = numstr[0] ? my_atoi(numstr) : 10;
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes < 0) {
+        puts_c("File not found or read error.\n", CLR_ERROR);
+        return;
+    }
+    int total_lines = 0;
+    for (int i = 0; i < bytes; i++) if (g_file_buf[i] == '\n') total_lines++;
+    int start_line = total_lines > n ? total_lines - n : 0;
+    int cur_line = 0, line_start = 0;
+    for (int pos = 0; pos <= bytes; pos++) {
+        if (pos == bytes || g_file_buf[pos] == '\n') {
+            if (cur_line >= start_line) {
+                for (int j = line_start; j < pos; j++) terminal_putchar((char)g_file_buf[j]);
+                terminal_putchar('\n');
+            }
+            cur_line++;
+            line_start = pos + 1;
+        }
+    }
+}
+
+static void cmd_touch(const char *args) {
+    char filename[128];
+    parse_token(args, filename, 128);
+    if (filename[0] == '\0') {
+        terminal_writestring("Usage: touch <file>\n");
+        return;
+    }
+    if (fs_create_file(filename, 0, 0) != 0) {
+        terminal_writestring("Failed to create file.\n");
+    } else {
+        puts_c("File created.\n", CLR_SUCCESS);
+    }
+}
+
+/* Reject overlong tokens rather than treating a truncated name as another file. */
+static const char *transfer_arg(const char *p, char *out, uint32_t cap) {
+    uint32_t n = 0;
+    while (*p == ' ') p++;
+    while (*p && *p != ' ') {
+        if (n + 1 >= cap) return 0;
+        out[n++] = *p++;
+    }
+    if (!n) return 0;
+    out[n] = 0;
+    while (*p == ' ') p++;
+    return p;
+}
+
+static const char *transfer_file(const char *src, const char *dst, int move) {
+    uint32_t size, dst_size;
+    uint8_t is_dir, dst_is_dir;
+    if (fs_stat(src, &size, &is_dir) != 0) return "Source file not found.\n";
+    if (is_dir) return "Source is a directory.\n";
+    if (size > FILE_BUF_SIZE) return "Source exceeds the 64 KiB transfer limit.\n";
+
+    /* A backend lookup catches case/short-name/dot aliases; a string comparison
+     * cannot. Only exFAT currently guarantees staged overwrite on copy. */
+    if (fs_stat(dst, &dst_size, &dst_is_dir) == 0 &&
+        (move || dst_is_dir || fs_get_info()->type != FS_EXFAT))
+        return "Destination already exists.\n";
+
+    if (fs_read_file(src, g_file_buf, FILE_BUF_SIZE) != (int)size)
+        return "Could not read the complete source file.\n";
+    if (fs_create_file(dst, g_file_buf, size) != 0)
+        return move ? "Move failed.\n" : "Copy failed.\n";
+    if (move && fs_delete_file(src) != 0)
+        return "Copied, but failed to delete source.\n";
+    return 0;
+}
+
+static void cmd_transfer_file(const char *args, int move) {
+    char src[128], dst[128];
+    const char *p = transfer_arg(args, src, sizeof(src));
+    if (p) p = transfer_arg(p, dst, sizeof(dst));
+    if (!p || *p) {
+        puts_c(move ? "Usage: mv <src> <dst>\n" : "Usage: cp <src> <dst>\n", CLR_ERROR);
+        return;
+    }
+    fs_operation_lock();
+    const char *error = transfer_file(src, dst, move);
+    fs_operation_unlock();
+    if (error) puts_c(error, CLR_ERROR);
+    else puts_c(move ? "Moved.\n" : "Copied.\n", CLR_SUCCESS);
+}
+
+static void cmd_cp(const char *args) { cmd_transfer_file(args, 0); }
+static void cmd_mv(const char *args) { cmd_transfer_file(args, 1); }
+
+static void cmd_cd(const char *args) {
+    char dir[128];
+    parse_token(args, dir, 128);
+    if (user_managed() && (!dir[0] || (dir[0] == '~' && !dir[1]))) {
+        if (fs_change_dir(user_home()) != 0) terminal_writestring("cd: home directory unavailable\n");
+        return;
+    }
+    if (dir[0] == '\0') {
+        terminal_writestring("Usage: cd <dir>\n");
+        return;
+    }
+    /* /bin | /system: the read-only system volume has no directory
+     * cluster to walk, so fs_change_dir() just records the cwd at the
+     * fs layer (fs.c g_sysvol_cwd) -- no disk needed. Standing inside
+     * the system volume, "cd /" and "cd .." leave it again.
+     * Everything else falls through to the disk volume cwd. */
+    if (sysvol_is_path(dir) || fs_sysvol_cwd()[0] != 0) {
+        if (fs_change_dir(dir) != 0) {
+            terminal_writestring("cd: no such directory\n");
+        }
+        return;
+    }
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
+        return;
+    }
+    if (fs_change_dir(dir) != 0) {
+        terminal_writestring("cd: no such directory\n");
+    }
+}
+
+static void cmd_mkdir(const char *args) {
+    char dir[128];
+    parse_token(args, dir, 128);
+    if (dir[0] == '\0') {
+        terminal_writestring("Usage: mkdir <dir>\n");
+        return;
+    }
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
+        return;
+    }
+    if (fs_mkdir(dir) != 0) {
+        terminal_writestring("mkdir: failed\n");
+    }
+}
+
+static void cmd_pwd(const char *args) {
+    (void)args;
+    terminal_writestring(fs_cwd_path());   /* 已含 "/bin"、"/system" */
+    terminal_putchar('\n');
+}
+
+static void cmd_gui(const char *args) {
+    (void)args;
+    gui_start();
+    terminal_initialize();
+}
+
+/* desktop command: the ONLY way to enter the graphical desktop */
+static void cmd_desktop(const char *args) {
+    (void)args;
+    terminal_initialize();
+    gw_start();
+    /* 从桌面退回文本模式：重印横幅，而不是只留一个空屏 + 提示符。 */
+    terminal_initialize();
+    terminal_scroll_reset();
+    shell_banner();
+}
+
+/* vbetest [force] - 实模式回切 INT 10h 设置 VBE 模式（bios_thunk 探针）。
+ * 无参：设模式 -> 读回 mode info 逐字段比对 -> 恢复文本模式，全程打印。
+ *   VMware / 真机（无 Bochs DISPI）靠这条路进 VBE 图形；QEMU 有 DISPI，
+ *   平时走寄存器路径，此命令用于验证同一条 thunk 通路本身是好的。
+ * force：通过后把 gfx_skip_dispi 置 1，之后 desktop 强制走 thunk 路径
+ *   （QEMU E2E 覆盖 VMware/真机桌面路径的唯一入口）。
+ * 输出同时进串口，E2E 按行抓。 */
+static void cmd_vbetest(const char *args) {
+    uint16_t mode = *(volatile uint16_t*)0x500A;
+    if (!mode) {
+        terminal_writestring("vbetest: no VBE mode probed at boot\n");
+        return;
+    }
+    terminal_writestring("vbetest: set VBE mode ");
+    print_hex32((uint32_t)mode | 0x4000u);
+    int ax = bios_int10(0x4F02, (uint16_t)(mode | 0x4000u), 0, 0);
+    terminal_writestring(" -> AX=");
+    print_hex32((uint32_t)(uint16_t)ax);
+    if (ax != 0x004F) {
+        terminal_writestring(" FAIL (BIOS rejected)\n");
+        bios_int10(0x0003, 0, 0, 0);   /* 屏幕可能已变，拉回文本 */
+        return;
+    }
+    /* 读回 mode info（ES:DI = 0:BT_SCRATCH） */
+    (void)bios_int10(0x4F01, 0, mode, (uint16_t)(BT_SCRATCH & 0xFFFFu));
+    uint16_t xr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_XRES);
+    uint16_t yr  = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_YRES);
+    uint8_t  bpp = *(volatile uint8_t *)(BT_SCRATCH + VBE_MI_BPP);
+    uint32_t pb  = *(volatile uint32_t*)(BT_SCRATCH + VBE_MI_PHYS);
+    uint16_t bps = *(volatile uint16_t*)(BT_SCRATCH + VBE_MI_BPS);
+    terminal_writestring(" OK, readback ");
+    print_dec((uint32_t)xr);
+    terminal_writestring("x");
+    print_dec((uint32_t)yr);
+    terminal_writestring("x");
+    print_dec((uint32_t)bpp);
+    terminal_writestring(" LFB=");
+    print_hex32(pb);
+    terminal_writestring(" stride=");
+    print_dec((uint32_t)bps);
+    int ax3 = bios_int10(0x4F03, 0, 0, 0);
+    uint16_t cur = bios_int10_bx();
+    terminal_writestring(" cur=");
+    print_hex32((uint32_t)cur);
+    if (ax3 == 0x004F && (cur & 0x0FFFu) == (mode & 0x0FFFu)) {
+        terminal_writestring(" VERIFIED\n");
+        if (args && args[0] == 'f') {
+            gfx_skip_dispi = 1;
+            terminal_writestring("vbetest: gfx_skip_dispi=1, next desktop uses thunk\n");
+        }
+    } else {
+        terminal_writestring(" MISMATCH\n");
+    }
+    bios_int10(0x0003, 0, 0, 0);   /* 拉回文本模式，shell 才看得见 */
+}
+
+/* theme [n]: list or switch GUI theme (also selectable in Settings) */
+static void cmd_theme(const char *args) {
+    int n = gw_theme_count();
+    if (args[0] == '\0') {
+        terminal_writestring("Themes:\n");
+        for (int i = 0; i < n; i++) {
+            terminal_writestring("  ");
+            terminal_putchar((char)('0' + i));
+            terminal_writestring(". ");
+            terminal_writestring(gw_theme_name(i));
+            terminal_writestring("\n");
+        }
+        terminal_writestring("Use: theme <n>\n");
+        return;
+    }
+    int idx = 0, valid = 1;
+    for (const char *p = args; *p; p++) {
+        if (*p == ' ') continue;
+        if (*p < '0' || *p > '9' || idx > 99) { valid = 0; break; }
+        idx = idx * 10 + (*p - '0');
+    }
+    if (!valid || idx >= n) {
+        puts_c("Invalid theme index. Use 'theme' to list.\n", CLR_ERROR);
+        return;
+    }
+    gw_set_theme(idx);
+    shell_fg(CLR_SUCCESS);
+    terminal_writestring("Theme: ");
+    terminal_writestring(gw_theme_name(idx));
+    terminal_writestring("\n");
+    shell_color_default();
+}
+
+
+#define VI_MAX_LINES 512
+#define VI_MAX_LINE 128
+#define VI_SCREEN_ROWS 24
+#define VI_SCREEN_COLS 80
+
+static char vi_lines[VI_MAX_LINES][VI_MAX_LINE];
+static int vi_len[VI_MAX_LINES];
+static int vi_count = 0;
+static int vi_row = 0;
+static int vi_col = 0;
+static int vi_top = 0;
+static int vi_left = 0;
+static char vi_filename[128];
+static int vi_modified = 0;
+static int vi_mode = 0;
+static const char *vi_msg = NULL;
+
+// 语法高亮配色（用 static 放 .bss：100*96 的配色数组会撑爆栈，得放 .bss.hi）
+static uint8_t vi_colbuf[VI_MAX_LINE];     // 当前行可见区的逐字符颜色（每次重算）
+static uint8_t vi_block_comment[VI_MAX_LINES]; // 每行进入块注释时的状态(0/1)
+
+// ===== vi 的语法高亮：按语言选规则 =====
+static int vi_is_digit(char c) { return c >= '0' && c <= '9'; }
+static int vi_is_ident_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+static int vi_is_ident(char c) { return vi_is_ident_start(c) || vi_is_digit(c); }
+
+// 小写字符串比较：一直比到结尾的 '\0'（就是 strcmp）
+static int vi_streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (*a == '\0' && *b == '\0');
+}
+
+// C 关键字 / asm 助记符表比较：s 有 len 字节，不以结尾为准
+static int vi_match_list(const char *s, int len, const char *const *list, int n) {
+    for (int k = 0; k < n; k++) {
+        const char *kw = list[k];
+        int j = 0, match = 1;
+        while (j < len) {
+            if (kw[j] != s[j]) { match = 0; break; }
+            j++;
+        }
+        if (match && kw[j] == '\0') return 1; // s 确实等于 kw
+    }
+    return 0;
+}
+
+/* token equality: s[0..len) must equal t exactly */
+static int vi_tok_is(const char *s, int len, const char *t) {
+    int k = 0;
+    while (k < len && t[k]) { if (s[k] != t[k]) return 0; k++; }
+    return (k == len && t[k] == '\0');
+}
+
+static int vi_get_lang(void) {
+    int len = 0;
+    while (len < 128 && vi_filename[len]) len++;
+    int dot = -1;
+    for (int i = len - 1; i >= 0; i--) {
+        if (vi_filename[i] == '.') { dot = i; break; }
+    }
+    if (dot < 0) return 0;
+    char ext[8];
+    int e = 0;
+    for (int i = dot + 1; i < len && e < 7; i++) {
+        char c = vi_filename[i];
+        if (c >= 'A' && c <= 'Z') c += 32; // תСд
+        ext[e++] = c;
+    }
+    ext[e] = '\0';
+    if (vi_streq(ext, "c") || vi_streq(ext, "h")) return 1;
+    if (vi_streq(ext, "s") || vi_streq(ext, "asm")) return 2;
+    if (vi_streq(ext, "md")) return 3;
+    if (vi_streq(ext, "cpp") || vi_streq(ext, "cc") ||
+        vi_streq(ext, "cxx") || vi_streq(ext, "hpp") ||
+        vi_streq(ext, "hh")) return 4;
+    if (vi_streq(ext, "py")) return 5;
+    return 0; // 未知类型按默认配色
+}
+
+// 一次扫完全部行的 /* */ 块注释状态（O(总行*列)，避免逐行回溯）
+static void vi_compute_block_states(int lang) {
+    int in_block = 0;
+    char trip = 0; /* python triple-quote char while in_block */
+    for (int line = 0; line < vi_count && line < VI_MAX_LINES; line++) {
+        vi_block_comment[line] = in_block ? 1 : 0;
+        int L = vi_len[line];
+        if (L < 0) L = 0;
+        int i = 0;
+        if (lang == 5) { /* python: track """/''' state across lines */
+            while (i < L) {
+                char c = vi_lines[line][i];
+                if (in_block) {
+                    if (c == trip && i + 2 < L &&
+                        vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                        in_block = 0; trip = 0; i += 3;
+                    } else i++;
+                } else {
+                    if ((c == '"' || c == '\'') && i + 2 < L &&
+                        vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                        in_block = 1; trip = c; i += 3;
+                    } else i++;
+                }
+            }
+            continue; /* C-style scan below is for C/C++ only */
+        }
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (in_block) {
+                if (i + 1 < L && c == '*' && vi_lines[line][i + 1] == '/') { in_block = 0; i += 2; }
+                else i++;
+            } else {
+                if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') break; // 行注释
+                else if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '*') { in_block = 1; i += 2; }
+                else i++;
+            }
+        }
+    }
+}
+
+// 给一行做逐字符配色：写满 vi_colbuf[0..L-1]，in_block 表示进入时已在块注释里
+static void vi_color_line(int line, int lang, int in_block) {
+    int L = vi_len[line];
+    if (L < 0) L = 0;
+    /* vi_colbuf 只有 VI_MAX_LINE 个元素，所有写它的循环都以 L 为上界。
+     * vi_len 理论上由插入逻辑保证 <= VI_MAX_LINE-1，但这里是最后一道防线：
+     * 一旦越界就是向相邻 static 数据写颜色值，属于极难排查的静默破坏。 */
+    if (L > VI_MAX_LINE) L = VI_MAX_LINE;
+    for (int i = 0; i < VI_MAX_LINE; i++) vi_colbuf[i] = CLR_LIGHT_GREY; // 默认配色 0x07
+    if (lang == 0 || L == 0) return;
+
+    if (lang == 3) { // ===== Markdown =====
+        int k = 0; while (k < L && vi_lines[line][k] == ' ') k++;
+        if (k < L && vi_lines[line][k] == '#') { // 标题
+            for (int j = 0; j < L; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+            return;
+        }
+        int i = 0;
+        if (k < L && (vi_lines[line][k] == '-' || vi_lines[line][k] == '*') &&
+            (k + 1 >= L || vi_lines[line][k + 1] == ' ' || vi_lines[line][k + 1] == '\t')) {
+            vi_colbuf[k] = CLR_LIGHT_RED; // 列表标记
+            i = k + 1;
+        }
+        while (i < L) { // 行内代码 `...`
+            char c = vi_lines[line][i];
+            if (c == '`') {
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                while (i < L && vi_lines[line][i] != '`') { vi_colbuf[i] = CLR_LIGHT_GREEN; i++; }
+                if (i < L) { vi_colbuf[i] = CLR_LIGHT_GREEN; i++; }
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
+    if (lang == 2) { // ===== 汇编 =====
+        static const char *mnem[] = {
+            "mov","add","sub","mul","div","and","or","xor","not","shl","shr","jmp",
+            "je","jne","jz","jnz","call","ret","push","pop","int","cmp","lea","inc",
+            "dec","test","nop","in","out","cli","sti","hlt","loop","syscall"
+        };
+        int n = (int)(sizeof(mnem) / sizeof(mnem[0]));
+        int i = 0;
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (c == ';' || c == '#') {
+                for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+                break;
+            }
+            if (c == '.') { // 伪指令 .text .globl
+                int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                continue;
+            }
+            if (c == '%') { // 寄存器 %eax
+                int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+                continue;
+            }
+            if (vi_is_digit(c) || (c == '$' && i + 1 < L && vi_is_digit(vi_lines[line][i + 1]))) {
+                if (c == '$') { vi_colbuf[i] = CLR_LIGHT_RED; i++; }
+                while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == 'x' ||
+                       vi_lines[line][i] == 'X' ||
+                       (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                       (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F') ||
+                       vi_lines[line][i] == '.')) { vi_colbuf[i] = CLR_LIGHT_RED; i++; }
+                continue;
+            }
+            if (vi_is_ident_start(c)) {
+                int s = i; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                if (vi_match_list(&vi_lines[line][s], i - s, mnem, n))
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_GREEN;
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
+    if (lang == 5) { // ===== Python =====
+        static const char *pkw[] = {
+            "def","class","return","if","elif","else","for","while","import","from",
+            "as","pass","break","continue","global","nonlocal","lambda","try",
+            "except","finally","raise","assert","with","yield","in","is","not",
+            "and","or","del","True","False","None","async","await"
+        };
+        int np = (int)(sizeof(pkw) / sizeof(pkw[0]));
+        int prev_def = 0; /* highlight the name after def/class */
+        int i = 0;
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (in_block) { /* inside a triple-quoted string from an earlier line */
+                if ((c == '"' || c == '\'') && i + 2 < L &&
+                    vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                    vi_colbuf[i] = CLR_LIGHT_GREEN;
+                    vi_colbuf[i + 1] = CLR_LIGHT_GREEN;
+                    vi_colbuf[i + 2] = CLR_LIGHT_GREEN;
+                    in_block = 0; i += 3; continue;
+                }
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                continue;
+            }
+            if (c == '#') { /* comment to end of line */
+                for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+                break;
+            }
+            if (c == '@') { /* decorator */
+                int s = i; i++;
+                while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                if (i + 2 < L && vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                    /* triple-quoted string: paint rest of line (state via compute) */
+                    for (int j = i; j < L; j++) vi_colbuf[j] = CLR_LIGHT_GREEN;
+                    break;
+                }
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                while (i < L) {
+                    char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                    if (d == '\\' && i + 1 < L) {
+                        vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue;
+                    }
+                    if (d == c) { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            if (vi_is_digit(c)) {
+                int s = i;
+                while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == '.' ||
+                       vi_lines[line][i] == 'x' || vi_lines[line][i] == 'X' ||
+                       (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                       (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F') ||
+                       vi_lines[line][i] == 'e' || vi_lines[line][i] == 'E' ||
+                       vi_lines[line][i] == 'o' || vi_lines[line][i] == 'b' ||
+                       vi_lines[line][i] == 'j' || vi_lines[line][i] == '_')) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_RED;
+                continue;
+            }
+            if (vi_is_ident_start(c)) {
+                int s = i;
+                while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                if (vi_match_list(&vi_lines[line][s], i - s, pkw, np)) {
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+                    prev_def = (vi_tok_is(&vi_lines[line][s], i - s, "def") ||
+                                vi_tok_is(&vi_lines[line][s], i - s, "class")) ? 1 : 0;
+                } else if (prev_def) {
+                    prev_def = 0;
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                } else {
+                    prev_def = 0;
+                }
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
+    // ===== C (.c/.h) =====
+    static const char *kw[] = {
+        "int","char","void","if","else","for","while","do","return","struct",
+        "typedef","static","const","unsigned","signed","long","short","float","double",
+        "switch","case","break","continue","default","enum","union","sizeof","goto",
+        "extern","volatile","register","auto","size_t","uint8_t","uint32_t","uint64_t","int32_t"
+    };
+    static const char *kwcpp[] = {
+        /* C subset */
+        "int","char","void","if","else","for","while","do","return","struct",
+        "typedef","static","const","unsigned","signed","long","short","float","double",
+        "switch","case","break","continue","default","enum","union","sizeof","goto",
+        "extern","volatile","register","auto","size_t","uint8_t","uint32_t","uint64_t","int32_t",
+        /* C++ extensions */
+        "class","public","private","protected","virtual","template","typename",
+        "namespace","using","new","delete","this","try","catch","throw","bool",
+        "true","false","inline","operator","friend","constexpr","nullptr","override",
+        "final","mutable","explicit","decltype","noexcept","static_cast","dynamic_cast",
+        "const_cast","reinterpret_cast"
+    };
+    const char *const *kwt = kw;
+    int n = (int)(sizeof(kw) / sizeof(kw[0]));
+    if (lang == 4) {
+        kwt = kwcpp;
+        n = (int)(sizeof(kwcpp) / sizeof(kwcpp[0]));
+    }
+    // 预处理指令：行首空白之后的 '#' -> # 开始整行同色
+    int i = 0;
+    int p = 0; while (p < L && vi_lines[line][p] == ' ') p++;
+    if (p < L && vi_lines[line][p] == '#') {
+        vi_colbuf[p] = CLR_LIGHT_CYAN;
+        int q = p + 1; while (q < L && vi_is_ident(vi_lines[line][q])) { vi_colbuf[q] = CLR_LIGHT_CYAN; q++; }
+        i = q;
+    }
+    while (i < L) {
+        char c = vi_lines[line][i];
+        if (in_block) {
+            if (i + 1 < L && c == '*' && vi_lines[line][i + 1] == '/') {
+                vi_colbuf[i] = CLR_DARK_GREY; vi_colbuf[i + 1] = CLR_DARK_GREY;
+                in_block = 0; i += 2; continue;
+            }
+            vi_colbuf[i] = CLR_DARK_GREY; i++; continue;
+        }
+        if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') {
+            for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+            break;
+        }
+        if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '*') {
+            vi_colbuf[i] = CLR_DARK_GREY; vi_colbuf[i + 1] = CLR_DARK_GREY;
+            in_block = 1; i += 2; continue;
+        }
+        if (c == '"') { // 字符串
+            vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+            while (i < L) {
+                char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                if (d == '\\' && i + 1 < L) { vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue; }
+                if (d == '"') { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (c == '\'') { // 字符常量
+            vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+            while (i < L) {
+                char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                if (d == '\\' && i + 1 < L) { vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue; }
+                if (d == '\'') { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (vi_is_digit(c) || (c == '.' && i + 1 < L && vi_is_digit(vi_lines[line][i + 1]))) {
+            int s = i;
+            while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == '.' ||
+                   vi_lines[line][i] == 'x' || vi_lines[line][i] == 'X' ||
+                   (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                   (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F'))) i++;
+            for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_RED;
+            continue;
+        }
+        if (vi_is_ident_start(c)) {
+            int s = i; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+            if (vi_match_list(&vi_lines[line][s], i - s, kwt, n)) {
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+            }
+            continue;
+        }
+        i++;
+    }
+}
+
+// 确认光标位置合法
+static void vi_clamp_cursor(void) {
+    if (vi_count == 0) { vi_row = 0; vi_col = 0; return; }
+    if (vi_row < 0) vi_row = 0;
+    if (vi_row >= vi_count) vi_row = vi_count - 1;
+    if (vi_col < 0) vi_col = 0;
+    if (vi_col > vi_len[vi_row]) vi_col = vi_len[vi_row];
+}
+
+// 滚动到光标所在偏移，确保它可见
+static void vi_scroll_into_view(void) {
+    if (vi_row < vi_top) vi_top = vi_row;
+    if (vi_row >= vi_top + VI_SCREEN_ROWS) vi_top = vi_row - VI_SCREEN_ROWS + 1;
+    if (vi_col < vi_left) vi_left = vi_col;
+    if (vi_col >= vi_left + VI_SCREEN_COLS - 2) vi_left = vi_col - (VI_SCREEN_COLS - 2);
+    if (vi_left < 0) vi_left = 0;
+    if (vi_top < 0) vi_top = 0;
+}
+
+// 渲染整屏（带行号与语法高亮）
+static void vi_render(void) {
+    terminal_initialize();
+    int lang = vi_get_lang();
+    if (lang == 1 || lang == 4 || lang == 5) vi_compute_block_states(lang); // 多行注释的跨行状态
+    for (int i = 0; i < VI_SCREEN_ROWS; i++) {
+        int line = vi_top + i;
+        if (line < vi_count) {
+            terminal_set_cursor((size_t)i, 0);
+            int L = vi_len[line];
+            if (L < 0) L = 0;
+            int in_block = ((lang == 1 || lang == 4 || lang == 5) && line >= 0 && line < VI_MAX_LINES) ? vi_block_comment[line] : 0;
+            vi_color_line(line, lang, in_block);
+            int cur_color = -1; // 换色时才调 terminal_setcolor
+            for (int x = 0; x < VI_SCREEN_COLS - 1; x++) {
+                int src = vi_left + x;
+                char ch = (src < L) ? vi_lines[line][src] : ' ';
+                int col = (src < L) ? (int)vi_colbuf[src] : CLR_LIGHT_GREY;
+                if (col != cur_color) { shell_fg((uint8_t)col); cur_color = col; }
+                terminal_putchar(ch);
+            }
+        }
+    }
+    terminal_set_cursor(VI_SCREEN_ROWS, 0);
+    terminal_setcolor(0x70);
+    if (vi_msg != NULL) {
+        terminal_writestring(vi_msg);
+        vi_msg = NULL;
+    } else {
+        for (int k = 0; k < 24 && vi_filename[k]; k++) terminal_putchar(vi_filename[k]);
+        terminal_putchar(' ');
+        if (vi_mode == 1) terminal_writestring("-- INSERT --");
+        else terminal_writestring("-- NORMAL --");
+        terminal_putchar(' ');
+        print_dec((uint32_t)(vi_row + 1));
+        terminal_putchar(',');
+        print_dec((uint32_t)(vi_col + 1));
+        if (vi_modified) terminal_writestring(" [+]");
+    }
+    terminal_setcolor(0x07);
+    terminal_set_cursor((size_t)(vi_row - vi_top), (size_t)(vi_col - vi_left));
+}
+
+// 在光标处插入字符
+static void vi_insert_char(char c) {
+    if (vi_len[vi_row] >= VI_MAX_LINE - 1) return;
+    for (int i = vi_len[vi_row]; i > vi_col; i--) {
+        vi_lines[vi_row][i] = vi_lines[vi_row][i - 1];
+    }
+    vi_lines[vi_row][vi_col] = c;
+    vi_len[vi_row]++;
+    vi_col++;
+    vi_modified = 1;
+}
+
+// 删除光标处的字符
+static void vi_delete_char(void) {
+    if (vi_col >= vi_len[vi_row]) return;
+    for (int i = vi_col; i < vi_len[vi_row] - 1; i++) {
+        vi_lines[vi_row][i] = vi_lines[vi_row][i + 1];
+    }
+    vi_len[vi_row]--;
+    vi_modified = 1;
+}
+
+// 删除光标前的字符（退格，必要时并到上一行）
+static void vi_backspace(void) {
+    if (vi_col > 0) {
+        vi_col--;
+        vi_delete_char();
+    } else if (vi_row > 0) {
+        int prev = vi_len[vi_row - 1];
+        if (prev + vi_len[vi_row] < VI_MAX_LINE) {
+            for (int i = 0; i < vi_len[vi_row]; i++) {
+                vi_lines[vi_row - 1][prev + i] = vi_lines[vi_row][i];
+            }
+            vi_len[vi_row - 1] = prev + vi_len[vi_row];
+            for (int r = vi_row; r < vi_count - 1; r++) {
+                vi_len[r] = vi_len[r + 1];
+                for (int m = 0; m < VI_MAX_LINE; m++) vi_lines[r][m] = vi_lines[r + 1][m];
+            }
+            vi_count--;
+            vi_row--;
+            vi_col = prev;
+            vi_modified = 1;
+        }
+    }
+}
+
+// 在光标处插入换行
+static void vi_insert_newline(void) {
+    if (vi_count >= VI_MAX_LINES) return;
+    int tail = vi_len[vi_row] - vi_col;
+    for (int r = vi_count; r > vi_row + 1; r--) {
+        vi_len[r] = vi_len[r - 1];
+        for (int m = 0; m < VI_MAX_LINE; m++) vi_lines[r][m] = vi_lines[r - 1][m];
+    }
+    vi_count++;
+    for (int m = 0; m < tail; m++) {
+        vi_lines[vi_row + 1][m] = vi_lines[vi_row][vi_col + m];
+    }
+    vi_len[vi_row + 1] = tail;
+    vi_lines[vi_row][vi_col] = '\0';
+    vi_len[vi_row] = vi_col;
+    vi_row++;
+    vi_col = 0;
+    vi_modified = 1;
+}
+
+// 在当前行下方插入一个空行并把光标移过去（vi 的 o / O 命令）。
+// 历史缺陷：vi 一直没有 o/O 绑定——按 o 无任何反应，而后续误触的
+// 'a'/'i' 会把字符插进当前行，表现为"o 开新行失败、内容串行"。
+// 日用的编辑器不能开新行是不可接受的，这里补齐。语义与真 vi 一致：
+// o = 下方开行进插入；O = 上方开行进插入。
+static void vi_open_line(int below) {
+    if (vi_count >= VI_MAX_LINES) return;
+    int at = below ? vi_row + 1 : vi_row;
+    for (int r = vi_count; r > at; r--) {
+        vi_len[r] = vi_len[r - 1];
+        for (int m = 0; m < VI_MAX_LINE; m++) vi_lines[r][m] = vi_lines[r - 1][m];
+    }
+    vi_count++;
+    vi_lines[at][0] = '\0';
+    vi_len[at] = 0;
+    vi_row = at;
+    vi_col = 0;
+    vi_modified = 1;
+    vi_mode = 1;
+}
+
+// 删除当前行
+static void vi_delete_line(void) {
+    if (vi_count == 0) return;
+    for (int r = vi_row; r < vi_count - 1; r++) {
+        vi_len[r] = vi_len[r + 1];
+        for (int m = 0; m < VI_MAX_LINE; m++) vi_lines[r][m] = vi_lines[r + 1][m];
+    }
+    vi_count--;
+    if (vi_count == 0) {
+        vi_count = 1;
+        vi_len[0] = 0;
+        vi_lines[0][0] = '\0';
+        vi_row = 0;
+        vi_col = 0;
+    } else if (vi_row >= vi_count) {
+        vi_row = vi_count - 1;
+    }
+    vi_modified = 1;
+}
+
+// 保存到文件
+static void vi_save(void) {
+    static uint8_t out_buf[FILE_BUF_SIZE];
+    int o = 0;
+    for (int k = 0; k < vi_count && o < (int)sizeof(out_buf) - 1; k++) {
+        int L = vi_len[k];
+        for (int m = 0; m < L && o < (int)sizeof(out_buf) - 1; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
+        if (o < (int)sizeof(out_buf) - 1) out_buf[o++] = '\n';
+    }
+    if (fs_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
+        vi_msg = "saved";
+        vi_modified = 0;
+    } else {
+        vi_msg = "save failed";
+    }
+}
+
+// 从底部状态栏读一条命令
+static int vi_read_command(char *buf, int max) {
+    terminal_set_cursor(VI_SCREEN_ROWS, 0);
+    terminal_setcolor(0x70);
+    for (int x = 0; x < 40; x++) terminal_putchar(' ');
+    terminal_set_cursor(VI_SCREEN_ROWS, 0);
+    terminal_putchar(':');
+    terminal_setcolor(0x07);
+    int pos = 0;
+    while (1) {
+        int c = keyboard_getchar();
+        if (c == 0) continue;
+        if (c == '\n') { buf[pos] = '\0'; return 1; }
+        if (c == 27) { buf[0] = '\0'; return 0; }
+        if (c == '\b') {
+            if (pos > 0) pos--;
+        } else if (c >= 32 && c < 127 && pos < max - 1) {
+            buf[pos++] = (char)c;
+        }
+        terminal_set_cursor(VI_SCREEN_ROWS, 1);
+        for (int x = 0; x < 40; x++) terminal_putchar(' ');
+        terminal_set_cursor(VI_SCREEN_ROWS, 1);
+        for (int x = 0; x < pos; x++) terminal_putchar(buf[x]);
+        terminal_set_cursor(VI_SCREEN_ROWS, 1 + pos);
+    }
+}
+
+static void cmd_uname(const char *args) {
+    if (args[0] == '-') {
+        terminal_writestring("Cerulia localhost 0.3-gui i686\n");
+    } else {
+        terminal_writestring("Cerulia\n");
+    }
+}
+
+static void cmd_df(const char *args) {
+    (void)args;
+    if (fs_init() != 0) {
+        terminal_writestring("df: no filesystem\n");
+        return;
+    }
+    const fs_info_t *info = fs_get_info();
+    if (!info || info->cluster_count == 0) {
+        terminal_writestring("df: no volume info\n");
+        return;
+    }
+    uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
+    uint32_t used_clusters = fs_count_used_clusters();
+    /* 用 64 位乘法 + 移位换算 KB，绕开 libgcc 的 64 位除法 */
+    uint64_t total_b = (uint64_t)info->cluster_count * cluster_size;
+    uint64_t used_b = (uint64_t)used_clusters * cluster_size;
+    uint32_t total_kb = (uint32_t)(total_b >> 10);
+    uint32_t used_kb = (uint32_t)(used_b >> 10);
+    uint32_t free_kb = (used_kb >= total_kb) ? 0 : total_kb - used_kb;
+    uint64_t pct_num = (uint64_t)used_clusters * 100;
+    uint32_t pct = udiv64_32((uint32_t)(pct_num >> 32), (uint32_t)pct_num,
+                             info->cluster_count);
+
+    terminal_writestring("Filesystem 1K-blocks     Used    Avail Use% Mounted on\n");
+    const char *fsn = fs_type_name();
+    terminal_writestring(fsn);
+    for (int pad = (int)my_strlen(fsn); pad < 12; pad++) terminal_putchar(' ');
+    print_dec(total_kb);
+    terminal_writestring(" ");
+    print_dec(used_kb);
+    terminal_writestring(" ");
+    print_dec(free_kb);
+    terminal_writestring(" ");
+    print_dec(pct);
+    terminal_writestring("% / (");
+    print_dec((uint32_t)info->cluster_count);
+    terminal_writestring(" clusters, ");
+    print_dec(cluster_size);
+    terminal_writestring(" B/cluster)\n");
+}
+
+static void cmd_du(const char *args) {
+    char name[128];
+    parse_token(args, name, 128);
+    if (fs_init() != 0) {
+        terminal_writestring("du: no filesystem\n");
+        return;
+    }
+    const fs_info_t *info = fs_get_info();
+    if (!info) {
+        terminal_writestring("du: no volume info\n");
+        return;
+    }
+    uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
+
+    /* du <file>：显示指定文件/目录的占用（KB） */
+    if (name[0] != '\0') {
+        uint32_t clusters = fs_get_file_clusters(name);
+        uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
+        print_dec(kb);
+        terminal_writestring("\t");
+        terminal_writestring(name);
+        terminal_putchar('\n');
+        return;
+    }
+
+    /* du：列出当前目录所有项的占用（KB）与合计 */
+    /* 16.9KB（64 x 264B）。**绝不能放栈上**：任务内核栈 TASK_KSIZE 只有
+     * 16KB，放栈上会让 ls 一进来就越界写穿相邻数据（实测：ro_cwd 被目录项
+     * 名字覆盖，提示符变成 [A.TXT]，随后的 cat/write 全部失败）。
+     * static 落 .bss（19MB 区），ls 不重入，安全。
+     * （主栈 2026-10 起已扩到 1MB，但任务栈仍只有 16KB，这条约束不变。） */
+    static fs_dir_entry_t entries[64];
+    int n = fs_read_dir(entries, 64);
+    if (n < 0) {
+        terminal_writestring("du: cannot read directory\n");
+        return;
+    }
+    uint32_t total = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t clusters = fs_get_file_clusters(entries[i].name);
+        uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
+        total += kb;
+        print_dec(kb);
+        terminal_writestring("\t");
+        terminal_writestring(entries[i].name);
+        if (entries[i].is_dir) terminal_putchar('/');
+        terminal_putchar('\n');
+    }
+    terminal_writestring("total\t");
+    print_dec(total);
+    terminal_putchar('\n');
+}
+
+static void cmd_vi(const char *args) {
+    char filename[128];
+    parse_token(args, filename, 128);
+    if (filename[0] == '\0') {
+        terminal_writestring("Usage: vi <file>\n");
+        return;
+    }
+    for (int i = 0; i < 128; i++) { vi_filename[i] = filename[i]; if (filename[i] == '\0') break; }
+
+    vi_count = 0;
+    int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if (bytes > 0) {
+        int i = 0;
+        while (i < bytes && vi_count < VI_MAX_LINES) {
+            int j = 0;
+            while (i < bytes && g_file_buf[i] != '\n' && j < VI_MAX_LINE - 1) {
+                vi_lines[vi_count][j++] = (char)g_file_buf[i++];
+            }
+            vi_lines[vi_count][j] = '\0';
+            vi_len[vi_count] = j;
+            vi_count++;
+            if (i < bytes && g_file_buf[i] == '\n') i++;
+        }
+    }
+    if (vi_count == 0) {
+        vi_count = 1;
+        vi_len[0] = 0;
+        vi_lines[0][0] = '\0';
+    }
+    vi_row = 0;
+    vi_col = 0;
+    vi_top = 0;
+    vi_left = 0;
+    vi_modified = 0;
+    vi_mode = 0;
+    vi_msg = NULL;
+
+    int running = 1;
+    while (running) {
+        vi_clamp_cursor();
+        vi_scroll_into_view();
+        vi_render();
+        int c = 0;
+        while (c == 0) {
+            c = keyboard_getchar();
+            int w = mouse_get_wheel();
+            if (w != 0) {
+                if (w > 0) {
+                    if (vi_row > 0) vi_row--;
+                } else {
+                    if (vi_row < vi_count - 1) vi_row++;
+                }
+                vi_clamp_cursor();
+                vi_scroll_into_view();
+                vi_render();
+            }
+        }
+
+        if (vi_mode == 1) {
+            if (c == 27) {
+                vi_mode = 0;
+                if (vi_col > 0) vi_col--;
+            } else if (c == '\n') {
+                vi_insert_newline();
+            } else if (c == '\b') {
+                vi_backspace();
+            } else if (c == KEY_LEFT) {
+                if (vi_col > 0) vi_col--;
+            } else if (c == KEY_RIGHT) {
+                if (vi_col < vi_len[vi_row]) vi_col++;
+            } else if (c == KEY_UP) {
+                if (vi_row > 0) { vi_row--; vi_clamp_cursor(); }
+            } else if (c == KEY_DOWN) {
+                if (vi_row < vi_count - 1) { vi_row++; vi_clamp_cursor(); }
+            } else if (c >= 32 && c < 127) {
+                vi_insert_char((char)c);
+            }
+        } else {
+            if (c == 'h' || c == KEY_LEFT) {
+                if (vi_col > 0) vi_col--;
+            } else if (c == 'l' || c == KEY_RIGHT) {
+                if (vi_col < vi_len[vi_row]) vi_col++;
+            } else if (c == 'k' || c == KEY_UP) {
+                if (vi_row > 0) vi_row--;
+            } else if (c == 'j' || c == KEY_DOWN) {
+                if (vi_row < vi_count - 1) vi_row++;
+            } else if (c == 'i') {
+                vi_mode = 1;
+            } else if (c == 'a') {
+                if (vi_col < vi_len[vi_row]) vi_col++;
+                vi_mode = 1;
+            } else if (c == 'x') {
+                vi_delete_char();
+            } else if (c == '0') {
+                vi_col = 0;
+            } else if (c == '$') {
+                vi_col = vi_len[vi_row];
+            } else if (c == 'd') {
+                int c2 = 0;
+                while (c2 == 0) c2 = keyboard_getchar();
+                if (c2 == 'd') vi_delete_line();
+            } else if (c == 'g') {
+                int c2 = 0;
+                while (c2 == 0) c2 = keyboard_getchar();
+                if (c2 == 'g') vi_row = 0;
+            } else if (c == 'G') {
+                if (vi_count > 0) vi_row = vi_count - 1;
+            } else if (c == 'o') {
+                vi_open_line(1);
+            } else if (c == 'O') {
+                vi_open_line(0);
+            } else if (c == ':') {
+                char cmd[16];
+                if (vi_read_command(cmd, 16)) {
+                    if (my_strcasecmp(cmd, "w") == 0) {
+                        vi_save();
+                    } else if (my_strcasecmp(cmd, "wq") == 0) {
+                        vi_save();
+                        running = 0;
+                    } else if (my_strcasecmp(cmd, "q") == 0) {
+                        if (vi_modified) {
+                            vi_msg = "E37: no write (use :q! or :wq)";
+                        } else {
+                            running = 0;
+                        }
+                    } else if (my_strcasecmp(cmd, "q!") == 0) {
+                        running = 0;
+                    } else {
+                        vi_msg = "bad command";
+                    }
+                }
+            }
+        }
+        vi_clamp_cursor();
+    }
+    terminal_initialize();
+}
+
+
+
+/* ================= 实用工具 ================= */
+
+// 打印整数
+static void print_int(int num) {
+    uint32_t mag;
+    if (num < 0) {
+        terminal_putchar('-');
+        mag = (uint32_t)(-(num + 1)) + 1u;   /* 避免 INT_MIN 取负的未定义行为 */
+    } else {
+        mag = (uint32_t)num;
+    }
+    print_dec(mag);
+}
+
+// calc: 表达式求值（与 gfx_eval 同源）
+static void cmd_icalc(const char *args) {
+    if (*args == '\0') {
+        terminal_writestring("Usage: icalc <expr>   e.g. calc 1+2*3\n");
+        return;
+    }
+    int ok = 0;
+    int v = gfx_eval(args, &ok);
+    if (!ok) {
+        terminal_writestring("Error: bad expression\n");
+        return;
+    }
+    terminal_writestring("= ");
+    print_int(v);
+    terminal_writestring("\n");
+}
+
+// hex: 十六进制 / 十进制互转
+void cmd_hex(const char *args) {
+    if (*args == '\0') {
+        terminal_writestring("Usage: hex <num>   dec->hex, or 0x<hex> -> dec\n");
+        return;
+    }
+    if (args[0] == '0' && (args[1] == 'x' || args[1] == 'X')) {
+        uint32_t v = my_htoi(args + 2);
+        terminal_writestring("dec: ");
+        print_dec(v);
+        terminal_writestring("\n");
+    } else {
+        uint32_t v = (uint32_t)my_atoi(args);
+        terminal_writestring("hex: 0x");
+        print_hex32(v);
+        terminal_writestring("\n");
+    }
+}
+
+// rand: 伪随机数（LCG）
+static uint32_t rand_state = 0x9E3779B9u;
+static uint32_t my_rand(void) {
+    rand_state = rand_state * 1664525u + 1013904223u;
+    return rand_state;
+}
+
+void cmd_rand(const char *args) {
+    int max = 100;
+    if (*args != '\0') max = my_atoi(args);
+    if (max <= 0) max = 1;
+    print_dec(my_rand() % (uint32_t)max);
+    terminal_writestring("\n");
+}
+
+/* ================= 游戏 ================= */
+
+// 读一行输入（回显，支持退格，Esc 返回 -1）
+static int read_line(char *buf, int maxlen) {
+    int n = 0;
+    while (1) {
+        int c = keyboard_getchar();
+        if (c == 0) continue;
+        if (c == 27) return -1;
+        if (c == '\n') {
+            terminal_putchar('\n');
+            buf[n] = '\0';
+            return n;
+        }
+        if (c == '\b') {
+            if (n > 0) {
+                n--;
+                terminal_putchar('\b');
+                terminal_putchar(' ');
+                terminal_putchar('\b');
+            }
+            continue;
+        }
+        if (n < maxlen - 1) {
+            buf[n++] = (char)c;
+            terminal_putchar((char)c);
+        }
+    }
+}
+
+// guess: 猜数字游戏
+void cmd_guess(const char *args) {
+    (void)args;
+    if (games_gui_launch(1)) return;   /* 图形模式：直接进图形版 */
+    int target = (int)(my_rand() % 100) + 1;
+    terminal_writestring("I picked a number 1-100. Guess it! (0 to quit)\n");
+    char line[16];
+    while (1) {
+        terminal_writestring("> ");
+        int n = read_line(line, 16);
+        if (n < 0) { terminal_writestring("Quit.\n"); return; }
+        int g = my_atoi(line);
+        if (g == 0) {
+            terminal_writestring("Quit. (answer was ");
+            print_dec(target);
+            terminal_writestring(")\n");
+            return;
+        }
+        if (g < target) terminal_writestring("Too low.\n");
+        else if (g > target) terminal_writestring("Too high.\n");
+        else {
+            terminal_writestring("Correct! The number was ");
+            print_dec(target);
+            terminal_writestring(".\n");
+            return;
+        }
+    }
+}
+
+// tictactoe: 井字棋（玩家 X vs AI O）
+static int tt_win(char b[9], char p) {
+    static const int lines[8][3] = {
+        {0,1,2},{3,4,5},{6,7,8},
+        {0,3,6},{1,4,7},{2,5,8},
+        {0,4,8},{2,4,6}
+    };
+    for (int i = 0; i < 8; i++) {
+        if (b[lines[i][0]] == p && b[lines[i][1]] == p && b[lines[i][2]] == p)
+            return 1;
+    }
+    return 0;
+}
+
+static int tt_full(char b[9]) {
+    for (int i = 0; i < 9; i++) if (b[i] == 0) return 0;
+    return 1;
+}
+
+static void tt_draw(char b[9]) {
+    terminal_writestring("\n");
+    for (int r = 0; r < 3; r++) {
+        terminal_writestring("  ");
+        for (int c = 0; c < 3; c++) {
+            char ch = b[r*3+c] ? b[r*3+c] : ('1' + r*3+c);
+            terminal_putchar(ch);
+            if (c < 2) terminal_writestring(" | ");
+        }
+        terminal_writestring("\n");
+        if (r < 2) terminal_writestring("  ---------\n");
+    }
+    terminal_writestring("\n");
+}
+
+void cmd_tictactoe(const char *args) {
+    (void)args;
+    if (games_gui_launch(2)) return;   /* 图形模式：直接进图形版 */
+    char b[9] = {0};
+    terminal_writestring("Tic-Tac-Toe: you are X, AI is O. Enter 1-9.\n");
+    while (1) {
+        tt_draw(b);
+        char line[8];
+        int mv;
+        while (1) {
+            terminal_writestring("Your move (1-9): ");
+            int n = read_line(line, 8);
+            if (n < 0) { terminal_writestring("Quit.\n"); return; }
+            mv = my_atoi(line);
+            if (mv >= 1 && mv <= 9 && b[mv-1] == 0) break;
+            terminal_writestring("Invalid. Try again.\n");
+        }
+        b[mv-1] = 'X';
+        if (tt_win(b, 'X')) { tt_draw(b); terminal_writestring("You win!\n"); return; }
+        if (tt_full(b)) { tt_draw(b); terminal_writestring("Draw.\n"); return; }
+        // AI 落子
+        int best = -1;
+        for (int i = 0; i < 9 && best < 0; i++) {   // 1) 能赢就赢
+            if (b[i] == 0) {
+                b[i] = 'O';
+                if (tt_win(b, 'O')) best = i;
+                b[i] = 0;
+            }
+        }
+        for (int i = 0; i < 9 && best < 0; i++) {   // 2) 该堵就堵
+            if (b[i] == 0) {
+                b[i] = 'X';
+                if (tt_win(b, 'X')) best = i;
+                b[i] = 0;
+            }
+        }
+        if (best < 0 && b[4] == 0) best = 4;        // 3) 占中心
+        if (best < 0) {                             // 4) 占角
+            static const int corners[4] = {0,2,6,8};
+            for (int i = 0; i < 4; i++) {
+                if (b[corners[i]] == 0) { best = corners[i]; break; }
+            }
+        }
+        if (best < 0) {                             // 5) 随便下
+            int n = (int)(my_rand() % 9);
+            for (int i = 0; i < 9; i++) {
+                int idx = (n + i) % 9;
+                if (b[idx] == 0) { best = idx; break; }
+            }
+        }
+        b[best] = 'O';
+        terminal_writestring("AI plays ");
+        print_dec(best + 1);
+        terminal_writestring(".\n");
+        if (tt_win(b, 'O')) { tt_draw(b); terminal_writestring("AI wins!\n"); return; }
+        if (tt_full(b)) { tt_draw(b); terminal_writestring("Draw.\n"); return; }
+    }
+}
+
+// snake: 文本贪吃蛇
+#define SNAKE_W 40
+#define SNAKE_H 20
+#define SNAKE_MAX (SNAKE_W * SNAKE_H)
+
+// RDTSC 忙等延时：把 ticks 换算成 TSC 周期数
+static void delay_ticks(uint32_t ticks) {
+    uint32_t start;
+    __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
+    while (1) {
+        uint32_t now;
+        __asm__ __volatile__("rdtsc" : "=a"(now) : : "edx");
+        if (now - start >= ticks) break;
+    }
+}
+
+void cmd_snake(const char *args) {
+    (void)args;
+    if (games_gui_launch(3)) return;   /* 图形模式：直接进图形版 */
+    int sx[SNAKE_MAX], sy[SNAKE_MAX];
+    int len = 3;
+    int dir = KEY_RIGHT;
+    int next_dir = KEY_RIGHT;
+    int fx = 15, fy = 10;
+    int score = 0;
+    int paused = 0;
+    int over = 0;
+
+    sx[0] = 10; sy[0] = 10;
+    sx[1] = 9;  sy[1] = 10;
+    sx[2] = 8;  sy[2] = 10;
+
+    terminal_initialize();
+    terminal_writestring("SNAKE  [arrows] move  [P] pause  [Esc] quit\n");
+
+    while (1) {
+        int c = keyboard_getchar();
+        if (c == 27) break;
+        if (c == 'p' || c == 'P') paused = !paused;
+        else if (c == KEY_UP || c == KEY_DOWN || c == KEY_LEFT || c == KEY_RIGHT) {
+            if (!((c == KEY_UP && dir == KEY_DOWN) ||
+                  (c == KEY_DOWN && dir == KEY_UP) ||
+                  (c == KEY_LEFT && dir == KEY_RIGHT) ||
+                  (c == KEY_RIGHT && dir == KEY_LEFT))) {
+                next_dir = c;
+            }
+        }
+
+        if (!paused && !over) {
+            dir = next_dir;
+            int nx = sx[0], ny = sy[0];
+            if (dir == KEY_UP) ny--;
+            else if (dir == KEY_DOWN) ny++;
+            else if (dir == KEY_LEFT) nx--;
+            else if (dir == KEY_RIGHT) nx++;
+
+            if (nx < 0 || nx >= SNAKE_W || ny < 0 || ny >= SNAKE_H) over = 1;
+            for (int i = 0; i < len && !over; i++) {
+                if (sx[i] == nx && sy[i] == ny) over = 1;
+            }
+            if (!over) {
+                for (int i = len; i > 0; i--) { sx[i] = sx[i-1]; sy[i] = sy[i-1]; }
+                sx[0] = nx; sy[0] = ny;
+
+                if (nx == fx && ny == fy) {
+                    len++;
+                    score++;
+                    if (len >= SNAKE_MAX) break;   /* full board: stop before sx[len] overflows */
+                    int ok = 0;
+                    for (int tries = 0; tries < 200 && !ok; tries++) {
+                        fx = (int)(my_rand() % SNAKE_W);
+                        fy = (int)(my_rand() % SNAKE_H);
+                        ok = 1;
+                        for (int i = 0; i < len; i++) {
+                            if (sx[i] == fx && sy[i] == fy) { ok = 0; break; }
+                        }
+                    }
+                }
+            }
+        }
+
+        terminal_initialize();
+        terminal_writestring("SNAKE  score: ");
+        print_dec(score);
+        if (paused) terminal_writestring("  [PAUSED]");
+        terminal_writestring("\n");
+        for (int x = 0; x < SNAKE_W + 2; x++) terminal_putchar('#');
+        terminal_putchar('\n');
+        for (int y = 0; y < SNAKE_H; y++) {
+            terminal_putchar('#');
+            for (int x = 0; x < SNAKE_W; x++) {
+                char ch = ' ';
+                if (x == fx && y == fy) ch = '*';
+                for (int i = 0; i < len; i++) {
+                    if (sx[i] == x && sy[i] == y) { ch = (i == 0) ? 'O' : 'o'; break; }
+                }
+                terminal_putchar(ch);
+            }
+            terminal_putchar('#');
+            terminal_putchar('\n');
+        }
+        for (int x = 0; x < SNAKE_W + 2; x++) terminal_putchar('#');
+        terminal_putchar('\n');
+        if (over) {
+            terminal_writestring("GAME OVER! score: ");
+            print_dec(score);
+            terminal_writestring("\n");
+            break;
+        }
+
+        delay_ticks(30000000);
+    }
+    terminal_initialize();
+}
+
+
+/* 给 GUI 终端等外部模块用的单行命令入口 */
+int shell_exec_line(const char *line) {
+    char buf[CMD_BUFFER_SIZE];
+    int i = 0;
+    if (!line) return -1;
+    while (line[i] && i < CMD_BUFFER_SIZE - 1) { buf[i] = line[i]; i++; }
+    buf[i] = '\0';
+    shell_in_desktop_terminal++;
+    shell_execute(buf);
+    shell_in_desktop_terminal--;
+    return 0;
+}

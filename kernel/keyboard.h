@@ -1,0 +1,38 @@
+#ifndef KEYBOARD_H
+#define KEYBOARD_H
+
+#define KEY_UP    -1
+#define KEY_DOWN  -2
+#define KEY_LEFT  -3
+#define KEY_RIGHT -4
+#define KEY_PGUP  -5
+#define KEY_PGDN  -6
+#define KEY_F1    -7
+#define KEY_F2    -8
+#define KEY_F3    -9
+#define KEY_F4    -10
+#define KEY_F5    -11
+#define KEY_F6    -12
+#define KEY_F7    -13
+#define KEY_F8    -14
+#define KEY_F9    -15
+#define KEY_F10   -16
+#define KEY_F11   -17
+#define KEY_F12   -18
+#define KEY_HOME -20   /* Home：浏览器滚到页首 */
+#define KEY_END  -21   /* End：浏览器滚到页尾 */
+#define KEY_ALT_TAB -19   /* Alt+Tab 组合键：窗口切换（gw_handle_key 消费） */
+
+int keyboard_init(void);     /* 0: PS/2 controller configured; -1: absent/unresponsive */
+void keyboard_enable_serial_rescue(void);
+void keyboard_discard_boot_input(void);
+void keyboard_handler(void);
+int keyboard_getchar(void);   // 键存 int，支持扩展键码
+void keyboard_set_private_input(int enabled);
+int keyboard_private_input(void);
+/* 注入一个键（USB HID 键盘路径用）：与 IRQ1 共用环形缓冲，内部自保护。 */
+void keyboard_inject(int key);
+void keyboard_block(void);    /* 步骤 8a：任务睡到下一按键或 30s 超时 */
+void irq1_handler(void);
+
+#endif

@@ -1,0 +1,4 @@
+﻿== test_dhcp: DHCP client (D/O/R/A) ==
+-- A normal lease --
+---- serial tail ----
+

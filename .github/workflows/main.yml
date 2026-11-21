@@ -1,0 +1,146 @@
+# ============================================================
+# EZOS GitHub Actions workflow
+#   - push 到 main / dev         : 构建 + QEMU 冒烟测试
+#   - PR 到 main                 : 构建 + QEMU 冒烟测试（合并守门）
+#   - 打 tag v*                  : 构建 + 冒烟 + 打包发布到 GitHub Release
+#
+# 工具链：Ubuntu apt 轻量方案（nasm + gcc-multilib + qemu-system-x86），
+# 不下载 800MB 的第三方 i686-elf 包；64 位除法由 dev 分支自带的
+# kernel/div64.c 提供 __udivdi3/__umoddi3，无 libgcc 也能链接通过。
+# 构建细节统一收敛在 ci/build.sh（padding 从 boot.asm 自动推导）。
+# ============================================================
+name: build-and-release
+
+on:
+  workflow_dispatch:        # 手动触发：Actions 页点 Run workflow，可指定分支
+  push:
+    branches: [ main, dev ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm gcc-multilib qemu-system-x86 python3 zip
+          gcc --version | head -1
+          nasm -v
+          qemu-system-x86_64 --version | head -1
+
+      # rust_bridge.h 里 EZ_EXFAT_IMPL 默认 1 = Rust，exFAT 校验和的**生产
+      # 路径**就走 *_rs；`rstest` 还要 *_zig 做三路对拍。这两个产物缺了就是
+      # 链接期 undefined reference（CI 因此连红了十几次），所以必须真装真编。
+      #
+      # 工具链刻意**与开发机一致**：stable + RUSTC_BOOTSTRAP=1（ci/build.sh
+      # 里已设），而不是 nightly——nightly 每夜变，`-Z build-std` /
+      # `-Z json-target-spec` 这些不稳定开关随时可能被摘掉，CI 就成了掷骰子。
+      - name: Install rust-src (needed by -Z build-std)
+        run: |
+          rustc --version
+          cargo --version
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rust-src
+            rustup component list --installed
+          else
+            echo "::warning::no rustup in PATH; relying on rust-toolchain.toml"
+          fi
+
+      - name: Install Zig 0.15.1
+        run: |
+          curl -fsSL --retry 3 -o zig.tar.xz \
+            https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
+          tar -xJf zig.tar.xz
+          # $GITHUB_PATH 的改动**在同一步里不生效**（要下一步才生效），所以
+          # 这里必须用绝对路径自检；同时写 GITHUB_ENV 让 build.sh 明确拿到
+          # 它（PATH 那行是给后续步骤和人肉调试用的）。
+          echo "$PWD/zig-x86_64-linux-0.15.1" >> "$GITHUB_PATH"
+          echo "ZIG=$PWD/zig-x86_64-linux-0.15.1/zig" >> "$GITHUB_ENV"
+          "$PWD/zig-x86_64-linux-0.15.1/zig" version
+
+      - name: Build kernel image
+        run: bash ci/build.sh
+
+      # 纯宿主侧、秒级返回，不启 QEMU。守的正是这次 CI 连红撞上的那条契约：
+      # os-image = 引导扇区(512) + kernel.bin，扇区数写进 0x1FC、必须 <= 992
+      # 且总数为偶数（奇数会让 SeaBIOS 报 could not read the boot disk）。
+      # 它还会用三个故意做坏的镜像反向验证断言本身"咬得住"。
+      - name: Image layout guard
+        run: python3 tests/test_image.py
+
+      # 栈预算：内核主栈只有 ~21KB、任务栈 16KB，而且越界**不崩**——只是静默
+      # 写穿紧邻的 .data（历史上 shell 的 cmd_ls 把 fs.c 的 ro_cwd 覆盖成
+      # 文件名，症状伪装成文件系统损坏）。这一关守的就是"栈上放大数组"。
+      # CI 没有交叉编译器，用 gcc-multilib 的 gcc 顶上：脚本里已显式 -m32，
+      # 且 CFLAGS 与 build.ninja 一致（-Os），量到的才是真构建的那份栈用量。
+      - name: Stack budget guard
+        env:
+          EZOS_CC: gcc
+        run: python3 tools/check_stack.py
+
+      # 指令集闸门：Rust / Zig 产物里不许出现 SSE/SSE2。内核只做 fninit
+      # （x87），从不设 CR4.OSFXSR、也不保存 XMM 上下文——那些指令必然
+      # #UD。实测踩过：Zig 的 levenshtein_zig 里一个数组清零被编成
+      # movdqa，rstest 一跑就 panic（vector 06）。Zig 默认 baseline 档
+      # 允许 SSE，必须显式 -mcpu i686。
+      - name: CPU feature guard (no SSE in Rust/Zig objects)
+        run: python3 tools/check_cpu.py
+
+      # VMware 配置闸门：vmx 缺 virtualHW.version / config.version 时，
+      # VMware 26 的表现是 "Could not open virtual machine ... Internal error.
+      # Remove from library?"——报错完全不提字段名，只会让人去怀疑虚拟机库。
+      # 模板在 tools/make_vmware.py，改它的时候这道会红。
+      - name: VMware vmx guard (required fields present)
+        run: python3 tools/check_vmx.py
+
+      - name: Generate data disk
+        run: python3 tools/gen_diskimg.py disk.img
+
+      # 宿主机侧只读体检：Boot Checksum（主/备）、备份 VBR、位图↔FAT 一致性、
+      # Up-case 校验和、根目录次级条目标志位、MBR。这几个地方写错的话，内核
+      # 读自己写的盘照样绿、Windows 却直接弹"需要格式化"——只有独立实现能抓。
+      - name: Disk image health probe
+        run: python3 tools/host_probe.py disk.img
+
+      # 不再只判断「QEMU 12 秒没崩」——那是个弱断言：内核卡在 shell 之前、
+      # 25 个子系统自检全红、文件系统没挂上，它照样绿。现在 ci/smoke.sh 把
+      # 串口输出落成文件并对内容下断言（内核横幅 / INT13h 读入 / 全部自检
+      # PASS / shell 提示符 / 两块盘 / FS 就绪 + 反向断言不许出现 FAIL/panic）。
+      - name: Smoke test in QEMU
+        run: bash ci/smoke.sh
+
+      - name: Show image sizes
+        run: ls -l os-image.bin disk.img
+
+      # ---------- 以下仅在打 tag（v*）时执行：打包并发布 Release ----------
+      - name: Assemble release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp os-image.bin dist/
+          cp disk.img dist/disk.vhd
+          cp tools/gen_diskimg.py tools/make_vhd.py dist/
+          cp release/setup_and_run.bat release/setup_and_run.sh dist/
+          # 附上构建配置清单，方便用户在真机复现
+          cp linker.ld dist/ 2>/dev/null || true
+          cp boot/boot.asm dist/ 2>/dev/null || true
+          zip -r "EZOS-${GITHUB_REF_NAME}.zip" dist
+          ls -lh "EZOS-${GITHUB_REF_NAME}.zip"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EZOS-*.zip
+          generate_release_notes: true

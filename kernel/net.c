@@ -1,0 +1,2454 @@
+/*
+ * net.c - IPv4/UDP/TCP 协议栈 + socket 层（步骤 7.3）
+ *
+ * 分层：
+ *   net_input(以太帧) ─┬─ ARP   → 应答 request / 学习 sender 进缓存
+ *                      ├─ ICMP  → echo reply（7.2 从 rtl8139.c 迁入）
+ *                      ├─ UDP   → 按目的端口投递到 socket 接收环
+ *                      └─ TCP   → 极简服务端状态机（见下）
+ *   发送路径：net_udp_send / tcp_send_seg → ipv4_send →（查 ARP 缓存，
+ *   缺则发 request 并轮询等待）→ rtl8139_send
+ *
+ * TCP 范围（教学取舍，明示不做）：
+ *   - 只做被动打开（listen/accept），无 connect() 主动连接
+ *   - 无重传定时器（对端可靠时够用；QEMU socket netdev 是本机回环）
+ *   - 无乱序重组：seq != rcv_nxt 的数据整段丢弃并回 dup-ACK
+ *   - 固定通告窗口 4096，不跟踪对端窗口（回显数据 <= 单段）
+ *   - 无 TIME_WAIT：LAST_ACK 收最终 ACK / FIN_WAIT_2 收 FIN 即回收
+ *
+ * 并发模型：本模块代码只运行在两类上下文——IRQ11（net_input）与
+ * 系统调用（net_sockcall，IF=0）。二者互不可重入（单核 + 中断门清 IF），
+ * 故 socket 表/ARP 缓存/环形缓冲无需加锁。
+ *
+ * 阻塞模型（步骤 8a 起为真睡眠）：系统调用门 0xEE 进入后 IF=0，
+ * IRQ11 不会再触发——但等待不再忙轮询：recvfrom/accept/ARP 解析睡在
+ * g_netrx_wq 上（task_sleep 全程 cli，丢失唤醒被结构性排除），由
+ * rtl8139 rx_drain 的 net_rx_wake()（IRQ11 或轮询路径）与 IRQ0 的
+ * task_timer_tick（超时）唤醒。醒来先 net_poll() 排一次环再查条件，
+ * 覆盖"包在睡眠前已到"与"唤醒源是无关中断"两种情形。
+ *
+ * 校验和注意（真 bug 修复）：反码和不满足 ~a+~b == ~(a+b)——伪首部与
+ * 段必须分别求 RAW 和再相加、最后统一取反一次（cksum_raw），对两段
+ * 各自取反相加会算出错误校验和，slirp 等真协议栈直接丢包。
+ */
+#include "net.h"
+#include "version.h"
+#include "rtl8139.h"
+#include "e1000.h"
+#include "kmalloc.h"
+#include "syscall.h"
+#include "task.h"
+#include "isr.h"        /* g_pit_ticks：睡眠超时的 tick 源（步骤 8a） */
+#include "rtc.h"        /* rtc_unix：SNTP transmit timestamp 的客户端钟 */
+#include "irqflags.h"   /* irq_save_disable/irq_restore：发送构帧窗口 */
+#include "dmesg.h"
+#include "rust_bridge.h" /* cksum_active：RFC 1071 校验和的生产实现 */
+
+#define ETH_HDR_LEN   14u
+#define IP_HDR_MIN    20u
+#define UDP_HDR_LEN   8u
+#define TCP_HDR_MIN   20u
+#define NET_BUILD_MAX 1792u          /* 协议构造缓冲（最大以太帧 + 余量） */
+#define NET_DEFAULT_WAIT_MS 10000u   /* timeout 参数为 0 时的缺省等待 */
+
+/* ---- TCP 可靠性参数（步骤 7.4） ----
+ * RTO 取固定 200ms 起步 + 指数退避（无 RTT 测量：教学取舍，注释在
+ * tcp_retransmit_check）。上限 5 次 —— 全部落空则放弃连接（发 RST）。 */
+#define TCP_RTO_MS      200u
+#define TCP_RTX_MAX     5u
+#define TCP_MSS         1460u        /* 以太网 1514 帧上限 - IP(20) - TCP(20)+余量：
+                                      * 分块上限。1536+头的段 rtl8139_send 直接拒收 */
+#define TCP_RTX_BUF     1536u        /* 未确认数据副本（单段，无流水线） */
+#define TCP_OOO_BUF     2048u        /* 乱序重组缓冲（每 socket） */
+#define TCP_TICK_MS     100u         /* net_tick 的工作间隔（IRQ0 驱动） */
+
+/* TCP 标志位 */
+#define TCP_FIN 0x01u
+#define TCP_SYN 0x02u
+#define TCP_RST 0x04u
+#define TCP_PSH 0x08u
+#define TCP_ACK 0x10u
+
+/* socket 表 */
+#define NET_MAX_SOCKS 8u
+#define NET_SOCK_BUF  4096u          /* 每 socket 接收环 */
+
+/* TCP 状态 */
+enum {
+    TS_UNUSED = 0,
+    TS_LISTEN,
+    TS_SYN_RCVD,
+    TS_SYN_SENT,        /* 主动打开：SYN 已发，等 SYN+ACK（步骤 7.4 connect） */
+    TS_ESTABLISHED,
+    TS_CLOSE_WAIT,      /* 对端已 FIN */
+    TS_LAST_ACK,        /* 我方 FIN 已发，等最终 ACK */
+    TS_FIN_WAIT_1,      /* 我方先关，等对端 ACK */
+    TS_FIN_WAIT_2       /* 我方 FIN 已被 ACK，等对端 FIN */
+};
+
+typedef struct {
+    uint8_t  used;
+    uint8_t  type;                  /* SOCK_TYPE_* */
+    uint8_t  state;                 /* TS_*（TCP） */
+    uint8_t  got_fin;               /* TCP：对端 FIN 已收（recv 0 语义） */
+    uint16_t local_port;            /* 主机序（数值）；线上转换只在 put16/be16 边界做 */
+    uint16_t peer_port;             /* 主机序（TCP conn） */
+    uint32_t peer_ip;               /* 大端打包（TCP conn） */
+    uint32_t owner_pid;             /* 懒回收：0 = 内核 */
+    int      parent;                /* TCP：所属监听 socket 下标，-1 = 独立 */
+    uint8_t *rx;                    /* 接收环（kmalloc，槽位复用） */
+    uint32_t rx_r, rx_w;            /* 环读写指针（字节，模 NET_SOCK_BUF） */
+    uint32_t snd_nxt, rcv_nxt;      /* TCP 序号 */
+
+    /* ---- 步骤 7.4：可靠性 ----
+     * 重传：一个时刻只允许一段未确认（无流水线、无滑动窗口），rtx 存这段
+     * 的副本，snd_una 是它的起始序号；ACK 推进 snd_una 后把已确认字节从
+     * rtx 头部移掉。syn_unacked 是 connect 的 SYN 重传标志（无数据）。
+     * 乱序：ooo 存"到达比 rcv_nxt 早不了、但比 rcv_nxt 晚"的那一串连续
+     * 字节（ooo_seq 起 ooo_len 字节）；等缺口补上后一次性倒进接收环。 */
+    uint32_t snd_una;               /* 最早未确认序号 */
+    uint8_t *rtx;                   /* 未确认数据副本（kmalloc TCP_RTX_BUF） */
+    uint32_t rtx_len;               /* 未确认字节数；0 = 无待确认数据 */
+    uint32_t rto_tick;              /* 下次重传时刻（g_pit_ticks）；0 = 未定时 */
+    uint8_t  rtx_tries;             /* 已重传次数（退避/放弃判据） */
+    uint8_t  syn_unacked;           /* SYN 待确认（SYN_SENT 的重传对象） */
+    uint8_t *ooo;                   /* 乱序重组缓冲（kmalloc TCP_OOO_BUF） */
+    uint32_t ooo_seq, ooo_len;      /* 乱序数据的起始序号与长度 */
+} sock_t;
+
+/* socket 表与 ARP 缓存放 .bss.hi（1-2MB 高内存段）：低 .bss 预算紧
+ * （linker.ld 断言 __bss_end <= 0x90000，栈区之前只剩几百字节），
+ * 高段 identity 映射且所有进程 PD 共享，IRQ/系统调用上下文访问无碍。 */
+#define NET_HIBUF __attribute__((section(".bss.hi")))
+
+static sock_t g_socks[NET_MAX_SOCKS] NET_HIBUF;
+static uint8_t *g_build;            /* 协议载荷构造缓冲（懒分配） */
+static uint8_t *g_frame;            /* 最终帧组装缓冲（与 g_build 分离：
+                                      * ipv4_send 的 eth+ip 头写在 g_frame，
+                                      * payload 从 g_build 拷入，避免同缓冲
+                                      * 前后段重叠拷贝互相踩） */
+static uint8_t *g_tx_stage;         /* 发送侧载荷私有暂存槽：ipv4_send_via
+                                      * 的 arp_resolve 可睡等，期间 IRQ 的
+                                      * ICMP/DHCP 应答会改写共享 g_build/
+                                      * g_frame——载荷必须先撤离共享缓冲 */
+
+/* 统计 */
+static uint32_t g_udp_rx, g_udp_tx, g_tcp_rx, g_tcp_tx;
+static uint32_t g_arp_replied, g_icmp_replied;
+/* 收包侧 fail closed 计数：首部校验和错 / 分片（不实现重组，必须丢） */
+static uint32_t g_ip_bad_csum, g_ip_frag_drop;
+static uint32_t g_tcp_rtx;          /* 步骤 7.4：重传次数（E2E 断言用） */
+static uint16_t g_ephemeral = 40000u;  /* connect 的临时端口分配游标 */
+
+/* IP 标识计数器 */
+static uint16_t g_ip_id = 0x1000;
+
+/* ---------- 小工具 ---------- */
+
+static uint16_t be16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+static uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+static void put16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
+}
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+static void wr16le(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+
+/* Internet 校验和（RFC 1071）：16 位反码和。cksum_raw 返回不取反的和
+ * （多段求和时逐段累加，最后统一取反一次——对两段分别取反再相加是
+ * 错的：反码和不满足 ~a+~b == ~(a+b)，slirp 等真协议栈会丢弃坏包）。
+ *
+ * 下面这两个是 **C 参考实现**（`rstest` 对拍基线 / EZ_TEXT_IMPL=0 回退）。
+ * 生产路径走 rust_bridge.h 选中的那一份（默认 Rust）——当初网络调试时
+ * "到底是测试包算错还是实现算错"卡了很久，两边各写一份正是成因。 */
+uint32_t cksum_raw_c(const uint8_t *p, uint32_t n) {
+    uint32_t s = 0;
+    while (n >= 2) { s += ((uint32_t)p[0] << 8) | p[1]; p += 2; n -= 2; }
+    if (n) s += (uint32_t)p[0] << 8;
+    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
+    return s;
+}
+uint16_t cksum_c(const uint8_t *p, uint32_t n) {
+    return (uint16_t)(~cksum_raw_c(p, n));
+}
+
+/* 内部一律用 active 版本：这个宏在 EZ_TEXT_IMPL=1（默认）下指向 Rust。
+ * 用宏而不是函数指针：这条路径每个包都要跑几次，函数指针会挡住内联，
+ * 而 ODR 上 C 参考实现已经编进来了，链接器会自动丢掉没人用的那份。 */
+#define cksum_raw  cksum_raw_active
+#define cksum      cksum_active
+
+/* ---------- netdev 统一层（e1000 优先，缺则 rtl8139） ---------- */
+
+int netdev_present(void) {
+    return e1000_present() ? 1 : rtl8139_present();
+}
+
+const char *netdev_name(void) {
+    return e1000_present() ? "e1000" : "rtl8139";
+}
+
+int netdev_send(const uint8_t *frame, uint32_t len) {
+    if (e1000_present()) return e1000_send(frame, len);
+    return rtl8139_send(frame, len);
+}
+
+void netdev_poll(void) {
+    if (e1000_present()) e1000_poll();
+    else rtl8139_poll();
+}
+
+const uint8_t *netdev_mac(void) {
+    return e1000_present() ? e1000_mac() : rtl8139_mac();
+}
+
+void netdev_mac_str(char *out) {
+    if (e1000_present()) e1000_mac_str(out);
+    else rtl8139_mac_str(out);
+}
+
+const uint8_t *netdev_ip(void) {
+    return e1000_present() ? e1000_ip() : rtl8139_ip();
+}
+
+void netdev_set_ip(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    if (e1000_present()) e1000_set_ip(a, b, c, d);
+    else rtl8139_set_ip(a, b, c, d);
+}
+
+void netdev_ip_str(char *out) {
+    if (e1000_present()) e1000_ip_str(out);
+    else rtl8139_ip_str(out);
+}
+
+uint32_t netdev_base(void) {
+    return e1000_present() ? e1000_mmio_base() : (uint32_t)rtl8139_io_base();
+}
+
+uint8_t netdev_irq(void) {
+    return e1000_present() ? e1000_irq() : rtl8139_irq();
+}
+
+uint32_t netdev_rx_packets(void) {
+    return e1000_present() ? e1000_rx_packets() : rtl8139_rx_packets();
+}
+uint32_t netdev_rx_errors(void) {
+    return e1000_present() ? e1000_rx_errors() : rtl8139_rx_errors();
+}
+uint32_t netdev_tx_packets(void) {
+    return e1000_present() ? e1000_tx_packets() : rtl8139_tx_packets();
+}
+uint32_t netdev_tx_busy(void) {
+    return e1000_present() ? e1000_tx_busy() : rtl8139_tx_busy();
+}
+uint32_t netdev_irq_count(void) {
+    return e1000_present() ? e1000_irq_count() : rtl8139_irq_count();
+}
+
+void netdev_rx_debug(uint32_t *a, uint32_t *b, uint32_t *c) {
+    if (e1000_present()) e1000_rx_debug(a, b, c);
+    else rtl8139_rx_debug(a, b, c);
+}
+
+static uint32_t my_ip_be(void) {
+    return be32(netdev_ip());
+}
+
+/* net 等待队列（步骤 8a）：recvfrom/accept/ARP 解析共用一条——
+ * 唤醒源都是"RX 环进了新包"（rtl8139 rx_drain → net_rx_wake）。
+ * 惊群（多个等待者同醒）由各自的条件复查消化，任务数 ≤ MAX_TASKS。
+ * {-1}：head 哨兵（0 是任务下标）。 */
+static wait_queue_t g_netrx_wq = {-1};
+
+void net_rx_wake(void) {
+    task_wake_all(&g_netrx_wq);
+}
+
+/* 构造缓冲懒分配（net_input 可能在 IRQ 上下文首次进入；kmalloc 在
+ * IF=0 下调用是安全的——见文件头并发模型） */
+static int build_ready(void) {
+    if (g_build && g_frame && g_tx_stage) return 1;
+    if (!g_build)   g_build = kmalloc(NET_BUILD_MAX + 16);
+    if (!g_frame)   g_frame = kmalloc(NET_BUILD_MAX + 16);
+    if (!g_tx_stage) g_tx_stage = kmalloc(NET_BUILD_MAX + 16);
+    if (!g_build || !g_frame || !g_tx_stage) {
+        dmesg_write("NET: kmalloc failed for build buffers");
+        return 0;
+    }
+    return 1;
+}
+
+/* ---------- ARP 缓存 ---------- */
+
+#define ARP_CACHE 16
+static struct {
+    uint32_t ip;                    /* 大端打包；0 = 空槽 */
+    uint8_t  mac[6];
+} g_arp[ARP_CACHE] NET_HIBUF;
+
+/* 只学习"发往本机"的帧：广播帧和别人对话的帧学进来只会把小缓存瞬间
+ * 冲掉（eth 广播 + 4→16 扩表前曾把表瞬间填满别人的 MAC）。 */
+static int eth_dst_is_me(const uint8_t *f) {
+    const uint8_t *my = netdev_mac();
+    for (int i = 0; i < 6; i++)
+        if (f[i] != my[i]) return 0;
+    return 1;
+}
+
+static void arp_learn(uint32_t ip, const uint8_t *mac) {
+    if (ip == 0) return;
+    for (int i = 0; i < ARP_CACHE; i++) {
+        if (g_arp[i].ip == ip) {
+            for (int k = 0; k < 6; k++) g_arp[i].mac[k] = mac[k];
+            return;
+        }
+    }
+    int slot = 0;
+    for (int i = 1; i < ARP_CACHE; i++)
+        if (g_arp[i].ip == 0) { slot = i; break; }
+    g_arp[slot].ip = ip;
+    for (int k = 0; k < 6; k++) g_arp[slot].mac[k] = mac[k];
+}
+
+static const uint8_t *arp_lookup(uint32_t ip) {
+    if (ip == 0) return 0;                         /* 0.0.0.0 不是合法邻居 */
+    for (int i = 0; i < ARP_CACHE; i++)
+        if (g_arp[i].ip == ip) return g_arp[i].mac;
+    return 0;
+}
+
+static void arp_request(uint32_t ip) {
+    uint8_t *r = g_build;
+    for (int i = 0; i < 6; i++) r[i] = 0xFF;
+    const uint8_t *my = netdev_mac();
+    for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+    r[12] = 0x08; r[13] = 0x06;
+    uint8_t *p = r + ETH_HDR_LEN;
+    put16(p + 0, 1); put16(p + 2, 0x0800); p[4] = 6; p[5] = 4;
+    put16(p + 6, 1);                              /* request */
+    for (int i = 0; i < 6; i++) p[8 + i] = my[i];
+    put32(p + 14, my_ip_be());
+    for (int i = 0; i < 6; i++) p[18 + i] = 0;
+    put32(p + 24, ip);
+    netdev_send(r, ETH_HDR_LEN + 28);
+}
+
+static const uint8_t *arp_resolve(uint32_t ip, uint32_t timeout_ms) {
+    const uint8_t *m = arp_lookup(ip);
+    if (m) return m;
+    /* IRQ 上下文绝不睡等：task_sleep 会把被中断任务误标 BLOCKED 从 IRQ
+     * 栈上切走，系统级损坏。丢帧重试——调用方（net_input 路径）的包
+     * 该丢就丢，对端 TCP/UDP 自己会重传。 */
+    if (g_in_irq) return 0;
+    arp_request(ip);
+    /* 步骤 8a：睡等 ARP reply（rx_drain → net_rx_wake 唤醒），
+     * deadline 用 PIT tick（回绕安全的有符号比较）。 */
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();                                /* 先排环：reply 可能已到 */
+        m = arp_lookup(ip);
+        if (m) return m;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* ---------- IPv4 发送 ---------- */
+
+/* 构造并发送一个 IPv4 包（payload 为完整传输层报文，通常在 g_build）。
+ * hop_ip 是**下一跳**：与 dst_ip 相同时就是普通的同网段直连；不同时
+ * 走网关——以太网目的 MAC 解析 hop_ip，而 IP 头里的目的仍是 dst_ip
+ * （由网关转发）。目前只有 DNS 用得上（DNS 服务器常常不在本网段）。
+ * 顺序（防撕裂/防重入）：payload 先拷进私有暂存槽 g_tx_stage（arp_resolve
+ * 可能睡等几百 ms，期间 IRQ 上下文的 ICMP echo reply / DHCP 应答会改写
+ * 共享的 g_build/g_frame——旧实现把载荷留在共享缓冲里去解析，发出去的
+ * 是被换过内容的撕裂包）；解析成功后在关中断窗口内一气呵成构帧+发送，
+ * IRQ 的 net_input 复用 g_frame/g_build 组应答帧，绝不允许插进中间。
+ * 返回 0 = 已提交网卡；-1 = ARP 解析失败/参数非法。 */
+static int ipv4_send_via(uint32_t dst_ip, uint32_t hop_ip, uint8_t proto,
+                         const uint8_t *payload, uint32_t len) {
+    if (len == 0 || ETH_HDR_LEN + IP_HDR_MIN + len > NET_BUILD_MAX) return -1;
+    if (!g_tx_stage) return -1;                    /* build_ready 未过 */
+
+    for (uint32_t i = 0; i < len; i++) g_tx_stage[i] = payload[i];
+
+    const uint8_t *dst_mac = arp_resolve(hop_ip, 3000);
+    if (!dst_mac) return -1;
+
+    uint32_t f = irq_save_disable();
+    uint8_t *r = g_frame;
+    for (int i = 0; i < 6; i++) r[i] = dst_mac[i];
+    const uint8_t *my = netdev_mac();
+    for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+    r[12] = 0x08; r[13] = 0x00;
+
+    uint8_t *ip = r + ETH_HDR_LEN;
+    ip[0] = 0x45; ip[1] = 0;
+    put16(ip + 2, (uint16_t)(IP_HDR_MIN + len));
+    put16(ip + 4, ++g_ip_id);
+    put16(ip + 6, 0);                              /* 无分片 */
+    ip[8] = 64; ip[9] = proto;
+    put16(ip + 10, 0);
+    put32(ip + 12, my_ip_be());
+    put32(ip + 16, dst_ip);
+    for (uint32_t i = 0; i < len; i++) ip[IP_HDR_MIN + i] = g_tx_stage[i];
+    put16(ip + 10, cksum(ip, IP_HDR_MIN));
+
+    int rc = netdev_send(r, ETH_HDR_LEN + IP_HDR_MIN + len);
+    irq_restore(f);
+    return rc;
+}
+
+/* 同网段直连（hop == dst）——绝大多数协议走这条，与改造前完全一致 */
+static int ipv4_send(uint32_t dst_ip, uint8_t proto,
+                     const uint8_t *payload, uint32_t len) {
+    return ipv4_send_via(dst_ip, dst_ip, proto, payload, len);
+}
+
+/* ---------- ICMP（echo reply + ping 客户端） ---------- */
+
+/* ping 等待者：单等待者足够（shell 一次只 ping 一个目标）。reply 在
+ * IRQ/轮询上下文被匹配上后置 got，等待者睡在 net 等待队列上被踢醒。 */
+static struct {
+    uint8_t  active;
+    uint16_t id, seq;
+    uint8_t  got;
+} g_ping_w;
+static uint32_t g_ping_reqs, g_ping_matched;   /* 诊断：nic 显示 */
+
+static void icmp_input(const uint8_t *ip, uint32_t ihl) {
+    const uint8_t *ic = ip + ihl;
+    uint32_t totlen = be16(ip + 2);
+    uint32_t iclen = totlen - ihl;
+    if (iclen < 8 || iclen > NET_BUILD_MAX) return;
+
+    /* echo reply：只认正在等的那个 (id, seq) */
+    if (ic[0] == 0 && ic[1] == 0 && g_ping_w.active && !g_ping_w.got &&
+        be16(ic + 4) == g_ping_w.id && be16(ic + 6) == g_ping_w.seq) {
+        g_ping_w.got = 1;
+        g_ping_matched++;
+        return;
+    }
+    if (ic[0] != 8 || ic[1] != 0) return;          /* 其余类型不处理 */
+
+    uint8_t *p = g_build;
+    p[0] = 0;                                      /* echo reply（type 0） */
+    p[1] = 0;
+    put16(p + 2, 0);
+    for (uint32_t i = 4; i < iclen; i++) p[i] = ic[i];
+    put16(p + 2, cksum(p, iclen));
+    if (ipv4_send(be32(ip + 12), 1, p, iclen) == 0) g_icmp_replied++;
+}
+
+/* 主动 ping：发 echo request，睡等匹配的 reply。返回 0=收到（rtt_ms 有效），
+ * 1=超时，-1=发送失败（无路由/ARP 解析失败）。 */
+int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms) {
+    if (!build_ready()) return -1;
+    uint16_t id = 0x455Au;                         /* 'EZ'，单等待者不需要唯一 */
+    static uint16_t seq_counter;
+    uint16_t seq = ++seq_counter;
+
+    uint8_t *p = g_build;
+    p[0] = 8; p[1] = 0;                            /* echo request */
+    put16(p + 2, 0);
+    put16(p + 4, id);
+    put16(p + 6, seq);
+    for (int i = 0; i < 8; i++) p[8 + i] = "EZOSPING"[i];
+    put16(p + 2, cksum(p, 16));                    /* 8 头 + 8 载荷 */
+
+    g_ping_reqs++;
+    g_ping_w.active = 1;
+    g_ping_w.id = id;
+    g_ping_w.seq = seq;
+    g_ping_w.got = 0;
+
+    uint32_t t0 = g_pit_ticks;
+    uint32_t deadline = t0 + timeout_ms;
+    /* active 先置位再发：reply 可能在 ipv4_send 的 ARP 睡等期间就到达 */
+    int rc = ipv4_send(dst_ip_be, 1, p, 16);
+    if (rc == 0) {
+        for (;;) {
+            net_poll();
+            if (g_ping_w.got) {
+                if (rtt_ms) *rtt_ms = g_pit_ticks - t0;
+                break;
+            }
+            uint32_t now = g_pit_ticks;
+            if ((int32_t)(now - deadline) >= 0) { rc = 1; break; }
+            task_sleep(&g_netrx_wq, deadline - now);
+        }
+    }
+    g_ping_w.active = 0;
+    return rc;
+}
+
+/* ---------- UDP ---------- */
+
+/* 接收环里的 UDP 记录格式：[u32 src_ip 大端][u16 src_port 主机序][u16 len] + 数据 */
+static void udp_deliver(uint32_t src_ip, uint16_t src_port, uint16_t dst_port,
+                        const uint8_t *data, uint32_t n) {
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (!s->used || s->type != SOCK_TYPE_UDP) continue;
+        if (s->local_port != dst_port) continue;
+
+        uint32_t total = 8 + n;
+        uint32_t space = (NET_SOCK_BUF - 1 + s->rx_r - s->rx_w) % NET_SOCK_BUF;
+        if (space < total) return;                 /* 环满：丢弃 */
+
+        uint8_t hdr[8];
+        put32(hdr, src_ip);
+        wr16le(hdr + 4, src_port);
+        wr16le(hdr + 6, (uint16_t)n);
+        for (uint32_t k = 0; k < 8; k++) {
+            s->rx[s->rx_w] = hdr[k];
+            s->rx_w = (s->rx_w + 1) % NET_SOCK_BUF;
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            s->rx[s->rx_w] = data[k];
+            s->rx_w = (s->rx_w + 1) % NET_SOCK_BUF;
+        }
+        return;                                    /* 只投递第一个匹配 */
+    }
+    /* 无监听端口：静默丢弃（不做 ICMP port-unreachable） */
+}
+
+static void udp_input(const uint8_t *ip, uint32_t ihl) {
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen < UDP_HDR_LEN) return;
+    uint32_t dlen = ulen - UDP_HDR_LEN;
+    if (dlen > totlen - ihl - UDP_HDR_LEN) return;
+
+    g_udp_rx++;
+    udp_deliver(be32(ip + 12), be16(u + 0), be16(u + 2),
+                u + UDP_HDR_LEN, dlen);
+}
+
+/* UDP 校验和（含 IPv4 伪首部）。源 IP 参数化：DHCP 在未取得地址时用
+ * 0.0.0.0 作源（net_udp_send 用本机 IP）。伪首部与段分别求 RAW 和再相加，
+ * 最后统一折叠取反；奇数字节按"高位字节 + 隐式 0 填充"处理（与在缓冲
+ * 尾部补 0 等价）。 */
+static uint16_t l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                            const uint8_t *p, uint32_t n) {
+    uint8_t ps[12];
+    put32(ps + 0, src_ip);
+    put32(ps + 4, dst_ip);
+    ps[8] = 0; ps[9] = proto;
+    put16(ps + 10, (uint16_t)n);
+    uint32_t s = cksum_raw(ps, 12) + cksum_raw(p, n);
+    /* 不要在这里补奇数字节：cksum_raw() 末尾的 `if (n) s += p[0] << 8`
+     * 已经处理过了（它把最后一个字节当高 8 位、低 8 位补 0），再加一次
+     * 就是双重计数。DHCP 报文 308 字节是偶数所以没暴露，DNS 查询 41 字节
+     * 是奇数，一上来就校验和错、被对端丢弃。 */
+    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
+    uint16_t c = (uint16_t)(~s);
+    return (c == 0) ? 0xFFFFu : c;
+}
+
+/* UDP/TCP 收包校验（RFC 768 / RFC 793）。
+ *   UDP：字段为 0 = 发送方没算（IPv4 允许），跳过；非 0 必须完全对上。
+ *   TCP：校验和强制，不存在 0 的情形。
+ * 验的方法不是"重算一遍再跟字段比"——字段里存的是**反码**，重算出来的是
+ * 0（本文件把 0 规范成 0xFFFF）。正确判据是 RFC 1071 的那句：把伪首部 +
+ * 段（含校验和字段本身）一起求反码和，结果必须是全 1（0xFFFF）。 */
+static int l4_csum_ok(const uint8_t *ip, uint32_t ihl, uint32_t totlen) {
+    uint8_t  proto = ip[9];
+    uint32_t ln    = totlen - ihl;
+    const uint8_t *l4 = ip + ihl;
+    uint16_t got;
+    if (proto == 17) {
+        if (ln < UDP_HDR_LEN) return 0;
+        got = be16(l4 + 6);
+        if (got == 0) return 1;                    /* 未计算，合法 */
+    } else if (proto == 6) {
+        if (ln < TCP_HDR_MIN) return 0;
+        got = be16(l4 + 16);
+    } else {
+        return 1;                                  /* ICMP 另有自己的校验和 */
+    }
+    uint8_t ps[12];
+    put32(ps + 0, be32(ip + 12));
+    put32(ps + 4, be32(ip + 16));
+    ps[8] = 0; ps[9] = proto;
+    put16(ps + 10, (uint16_t)ln);
+    uint32_t s = cksum_raw(ps, 12) + cksum_raw(l4, ln);
+    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
+    return (s == 0xFFFFu) ? 1 : 0;
+}
+
+static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
+                             const uint8_t *p, uint32_t n) {
+    return l4_checksum(src_ip, dst_ip, 17, p, n);
+}
+
+static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
+                        const uint8_t *data, uint32_t n) {
+    if (n > NET_BUILD_MAX - IP_HDR_MIN - UDP_HDR_LEN) return -1;
+    uint8_t *p = g_build;
+    put16(p + 0, src_port);
+    put16(p + 2, dst_port);
+    put16(p + 4, (uint16_t)(UDP_HDR_LEN + n));
+    put16(p + 6, 0);
+    for (uint32_t i = 0; i < n; i++) p[UDP_HDR_LEN + i] = data[i];
+
+    /* UDP 校验和含伪首部（IPv4 可选，算上更正规，对端可验证）。 */
+    uint32_t need = UDP_HDR_LEN + n;
+    put16(p + 6, udp_checksum(my_ip_be(), dst_ip, p, need));
+
+    if (ipv4_send(dst_ip, 17, p, need) != 0) return -1;
+    g_udp_tx++;
+    return (int)n;
+}
+
+/* ---------- DHCP 客户端（RFC 2131 简化版） ----------
+ *
+ * 为什么单独一段：DHCP 是唯一"本机还没有 IP 就要收发"的协议——
+ *   源 IP 0.0.0.0、目的 255.255.255.255、以太网广播、UDP 68<->67。
+ * 因此它不能走 ipv4_send()（那条路径会 arp_resolve(255.255.255.255)，
+ * 永远解析不到），也不走 socket 层（绑定前就要收包）。
+ *
+ * 收发两端的不对称：
+ *   发：dhcp_send() 直接组 eth+ip+udp+bootp 出帧，无 ARP、无路由。
+ *   收：net_input() 在 g_dhcp_w.active 期间对 UDP 67->68 **放宽目的 IP
+ *       检查**（见 net_input 里的注释），由 dhcp_input() 按 xid 过滤。
+ *       不放行的话，服务器广播回来的 OFFER（目的 255.255.255.255）
+ *       或单播到尚未生效的 yiaddr 都会被"不是我的 IP"直接丢掉。
+ *
+ * 状态机：DISCOVER -> OFFER -> REQUEST -> ACK，各 3 次重试；绑定后由
+ * net_tick 在 IRQ0 里跑 T1/T2 续租（RENEWING 单播 / REBINDING 广播）。
+ * option overload（52）按 RFC 2131 9.3 扫 file/sname 两个备用区。
+ *
+ * 刻意没做的（都是"不做也不会配错"的，不是"做了会静默错"的）：
+ *   - ARP 冲突检测（RFC 2131 3.1 step 4 的推荐步骤，非强制）
+ *   - 只保留前 DNS_MAX_SRV 个 DNS，超出部分丢弃
+ *   - NAK 处理：回到 INIT 重新 DISCOVER，不做指数退避
+ *
+ * 并发：与 ping 同一条 net 等待队列（g_netrx_wq），单等待者——
+ * shell 一次只跑一个 dhcp。dhcp_input 可能在 IRQ 上下文被调（rtl8139
+ * rx_drain → net_input），只做"拷包 + 置 got"，解析留给任务上下文。
+ */
+
+#define DHCP_SRV_PORT   67u
+#define DHCP_CLI_PORT   68u
+#define DHCP_MAGIC      0x63825363u   /* 99.130.83.99，options 起始标记 */
+#define BOOTP_FIXED     236u          /* BOOTP 固定部分长度（到 chaddr 结束） */
+#define BOOTP_MIN       300u          /* RFC 951：BOOTP 报文不得短于 300 */
+
+/* 一次会话的接收槽（512 > BOOTP_MIN + 常规 options） */
+static struct {
+    uint8_t  active;      /* 正在等响应（net_input 据此放宽目的 IP 检查） */
+    uint8_t  got;
+    uint8_t  renewing;    /* 这一轮是后台续租，不是 shell 的 dhcp 命令在等 */
+    uint32_t xid;         /* 只认自己发起的事务 */
+    uint8_t  msg_type;    /* option 53：2=OFFER 5=ACK 6=NAK */
+    uint32_t yiaddr;      /* BOOTP 头里的"你的地址"（网络序） */
+    /* 应答缓冲：RFC 2131 要求客户端至少收 576 字节；以太网 MTU 内合法的
+     * UDP 载荷最大 1472。QEMU user-net（slirp）的应答固定 548 字节，旧的
+     * buf[512] 会把它整个丢掉（user-net 下 dhcp 永远 no response），1536
+     * 覆盖 MTU 内一切合法报文。 */
+    uint8_t  buf[1536];
+    uint32_t len;
+} g_dhcp_w;
+
+/* 后台续租状态机（RFC 2131 4.4.5 的 T1/T2）：
+ *   未到 T1（0.5 × 租期）      什么也不做
+ *   RENEWING  过了 T1          单播 REQUEST 给原来那台服务器（ciaddr 已填）
+ *   REBINDING 过了 T2（0.875） 没人理就改广播，任何服务器都能接手
+ *   INIT      租期到            地址不再属于我，重新走 DISCOVER
+ * 三个特点必须记牢：
+ *   1. 全部由 net_tick（IRQ0）驱动，**不睡等**——睡等只能在任务上下文，而
+ *      内核没有专职网络线程。发 REQUEST 与收 ACK 是两件分开的事：应答由
+ *      dhcp_input（IRQ11）收下并置 got，下一次 net_tick 才应用。
+ *   2. 两个入口都在 IF=0 的上下文（IRQ0/IRQ11 都走中断门），故 g_lease /
+ *      g_renew 的读写不需要加锁。
+ *   3. 续租窗口里 g_dhcp_w.active 保持 1，net_input 才会放行回给 68 端口
+ *      的包；续租成功后 dhcp_apply() 把它清掉。 */
+static struct {
+    uint8_t  active;    /* 有租约在计时（租期 0 或超长 = 不开定时器） */
+    uint8_t  state;     /* 0=未到 T1  1=RENEWING  2=REBINDING  3=INIT */
+    uint32_t t1, t2, expire;   /* 绝对 tick（g_pit_ticks，单位 ms） */
+    uint32_t next;             /* 下一次重发的 tick */
+} g_renew;
+
+#define DHCP_RENEW_RETRY_MIN  1000u    /* 重发间隔下限（ms） */
+#define DHCP_LEASE_MAX_SEC    100000u  /* 租期超过它就当永久（ms 换算会溢出） */
+
+/* 新事务号：MAC 与 tick 混合，保证与上一轮不同（否则会把旧应答当新应答） */
+static uint32_t dhcp_new_xid(void) {
+    const uint8_t *my = netdev_mac();
+    uint32_t x = (uint32_t)g_pit_ticks ^ 0x9E3779B9u;
+    for (int i = 0; i < 6; i++) x = (x << 5) ^ (x >> 27) ^ my[i];
+    if (x == 0) x = 0x5A5A5A5Au;
+    return x;
+}
+
+/* DNS 服务器表（DHCP option 6 填写，DNS 查询时逐个尝试）。
+ * 放在 DHCP 段是因为只有 DHCP 会写它；DNS 段只负责读。
+ * g_dns_manual = 表来自 `dns a.b.c.d`（手动配的），DHCP 没下发时不覆盖。 */
+#define DNS_MAX_SRV 4u
+static uint32_t g_dns_srv[DNS_MAX_SRV];
+static uint32_t g_dns_srv_n;
+static uint8_t  g_dns_manual;
+
+/* 已生效的租约（nic 命令显示；后续 DNS 客户端直接用 g_lease.dns） */
+static struct {
+    uint8_t  valid;
+    uint32_t ip, mask, router, dns, server;   /* 全部网络序 */
+    uint32_t lease;                            /* 秒；0 = 服务器没下发 */
+    uint32_t tick;                             /* 取得时刻（g_pit_ticks） */
+} g_lease;
+
+/* 发一份 DHCP 报文。两种形态：
+ *   bound = 0（INIT/SELECTING）：以太网广播 + IP 源 0.0.0.0 目的 255.255.255.255，
+ *           REQUEST 带 option 50（请求的 IP）与 54（选中的服务器）。
+ *   bound = 1（RENEWING/REBINDING，RFC 2131 表 5）：已有地址，ciaddr 填上
+ *           自己的 IP、源 IP 也是它，**且不发** 50/54（服务器靠 ciaddr +
+ *           chaddr 认人）；能查到服务器 MAC 就单播给它，否则退回广播。
+ * msg_type: 1=DISCOVER 3=REQUEST。
+ * flags 置 broadcast(0x8000)：请求服务器用广播回，避免它单播到一个
+ * 二层上还解析不到的地址。返回 0 = 已提交网卡。 */
+static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id,
+                     int bound) {
+    uint8_t *p = g_build;
+    for (uint32_t i = 0; i < BOOTP_MIN; i++) p[i] = 0;   /* 含 sname/file 全零 */
+
+    p[0] = 1;                                 /* BOOTREQUEST */
+    p[1] = 1; p[2] = 6;                       /* htype=ethernet, hlen=6 */
+    p[3] = 0;                                 /* hops */
+    put32(p + 4, g_dhcp_w.xid);
+    put16(p + 8, 0);                          /* secs */
+    put16(p + 10, 0x8000);                    /* flags: broadcast */
+    const uint8_t *my = netdev_mac();
+    for (int i = 0; i < 6; i++) p[28 + i] = my[i];       /* chaddr[0..5] */
+    if (bound) put32(p + 12, g_lease.ip);     /* ciaddr：我已绑定这个地址 */
+    put32(p + 236, DHCP_MAGIC);
+
+    uint32_t o = 240;
+    p[o++] = 53; p[o++] = 1; p[o++] = msg_type;
+    if (msg_type == 3 && !bound) {
+        p[o++] = 50; p[o++] = 4; put32(p + o, req_ip);    o += 4;
+        p[o++] = 54; p[o++] = 4; put32(p + o, server_id); o += 4;
+    }
+    p[o++] = 55; p[o++] = 4;                  /* 参数请求：掩码/路由/DNS/租期 */
+    p[o++] = 1; p[o++] = 3; p[o++] = 6; p[o++] = 51;
+    p[o++] = 61; p[o++] = 7; p[o++] = 1;      /* client id: 01 + MAC */
+    for (int i = 0; i < 6; i++) p[o++] = my[i];
+    p[o++] = 255;                             /* end */
+    if (o > BOOTP_MIN) return -1;             /* options 写穿了固定长度区 */
+
+    /* 目的：单播给服务器（只有查得到 MAC 时），否则广播 */
+    uint32_t ip_dst = 0xFFFFFFFFu, udp_src_ip = 0u;
+    const uint8_t *dst_mac = 0;
+    if (bound) {
+        udp_src_ip = g_lease.ip;
+        if (server_id != 0) {
+            dst_mac = arp_lookup(server_id);   /* 非阻塞：只看缓存，不发 ARP */
+            if (dst_mac) ip_dst = server_id;
+        }
+    }
+
+    /* 构帧+发送在关中断窗口内一气呵成：g_frame/g_build 是与 IRQ 收包
+     * 路径共享的，构帧中途被 net_input 插进来组应答帧就会撕裂。 */
+    uint32_t ifl = irq_save_disable();
+    uint8_t *r = g_frame;
+    for (int i = 0; i < 6; i++) r[i] = dst_mac ? dst_mac[i] : 0xFF;
+    for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+    r[12] = 0x08; r[13] = 0x00;
+
+    uint8_t *u = r + ETH_HDR_LEN + IP_HDR_MIN;
+    uint32_t ulen = UDP_HDR_LEN + BOOTP_MIN;
+    put16(u + 0, DHCP_CLI_PORT);
+    put16(u + 2, DHCP_SRV_PORT);
+    put16(u + 4, (uint16_t)ulen);
+    put16(u + 6, 0);
+    for (uint32_t i = 0; i < BOOTP_MIN; i++) u[UDP_HDR_LEN + i] = p[i];
+    put16(u + 6, udp_checksum(udp_src_ip, ip_dst, u, ulen));
+
+    uint8_t *ip = r + ETH_HDR_LEN;
+    ip[0] = 0x45; ip[1] = 0;
+    put16(ip + 2, (uint16_t)(IP_HDR_MIN + ulen));
+    put16(ip + 4, ++g_ip_id);
+    put16(ip + 6, 0);                         /* 无分片 */
+    ip[8] = 64; ip[9] = 17;
+    put16(ip + 10, 0);
+    put32(ip + 12, udp_src_ip);               /* 未绑定 = 0.0.0.0 */
+    put32(ip + 16, ip_dst);                   /* 未绑定 = 255.255.255.255 */
+    put16(ip + 10, cksum(ip, IP_HDR_MIN));
+
+    g_udp_tx++;
+    int rc = netdev_send(r, ETH_HDR_LEN + IP_HDR_MIN + ulen);
+    irq_restore(ifl);
+    return rc;
+}
+
+/* net_input 路径（可能 IRQ 上下文）：校验后整包收下并置 got。
+ * 只在这里认 xid + option 53，其余选项交给任务上下文的 net_dhcp()。 */
+static void dhcp_input(const uint8_t *ip, uint32_t ihl) {
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen < UDP_HDR_LEN || ulen > totlen - ihl) return;
+    uint32_t dlen = ulen - UDP_HDR_LEN;
+    if (dlen < BOOTP_FIXED + 4 || dlen > sizeof(g_dhcp_w.buf)) return;
+
+    const uint8_t *b = u + UDP_HDR_LEN;
+    if (be32(b + 236) != DHCP_MAGIC) return;       /* 非 RFC 2131 格式 */
+    if (be32(b + 4) != g_dhcp_w.xid) return;       /* 不是我这一轮的事务 */
+
+    uint8_t type = 0;
+    for (uint32_t i = 240; i + 1 < dlen; ) {
+        uint8_t code = b[i];
+        if (code == 0)  { i++; continue; }         /* pad */
+        if (code == 255) break;                    /* end */
+        uint32_t olen = b[i + 1];
+        if (i + 2 + olen > dlen) break;            /* 长度越界：截断当作结束 */
+        if (code == 53 && olen >= 1) type = b[i + 2];
+        i += 2 + olen;
+    }
+    if (type == 0) return;                         /* 没有消息类型：不认 */
+
+    for (uint32_t i = 0; i < dlen; i++) g_dhcp_w.buf[i] = b[i];
+    g_dhcp_w.len = dlen;
+    g_dhcp_w.yiaddr = be32(b + 16);
+    g_dhcp_w.msg_type = type;
+    g_dhcp_w.got = 1;
+}
+
+/* 从已收下的报文里取一个 option（返回拷贝字节数，0 = 没有/非法） */
+/* 在一个 option 区里线性找 code。返回拷贝进 out 的字节数，0 = 没有。
+ * 规范细节（RFC 2131 Table 3 / RFC 1497 vendor extensions）：
+ *   0    = Pad，占一字节，必须跳过继续找
+ *   255  = End，区结束
+ *   olen 越出区尾 -> 报文截断，停（不越过边界读） */
+static uint32_t dhcp_opt_in(const uint8_t *b, uint32_t start, uint32_t end,
+                            uint8_t code, uint8_t *out, uint32_t max) {
+    for (uint32_t i = start; i + 1 < end; ) {
+        uint8_t c = b[i];
+        if (c == 0) { i++; continue; }
+        if (c == 255) break;
+        uint32_t olen = b[i + 1];
+        if (i + 2 + olen > end) break;
+        if (c == code) {
+            uint32_t n = (olen < max) ? olen : max;
+            for (uint32_t k = 0; k < n; k++) out[k] = b[i + 2 + k];
+            return n;
+        }
+        i += 2 + olen;
+    }
+    return 0;
+}
+
+/* 取一个 DHCP option（跨 option overload 区）。
+ *
+ * RFC 2131 9.3：option 52（Option Overload）说明 options 区装不下时，
+ * 服务器会把余下的 option 塞进 BOOTP 的 file(108..235) 与/或
+ * sname(44..107) 字段：
+ *   1 = file 区装 option    2 = sname 区装 option    3 = 两者都装
+ * 以前只看 240 之后那段，遇到 overload 的服务器就会"掩码/路由读不到，
+ * 却以为读到了"——配出来的网络是半残的。现在按规范三区都扫。 */
+static uint32_t dhcp_opt(uint8_t code, uint8_t *out, uint32_t max) {
+    const uint8_t *b = g_dhcp_w.buf;
+    uint32_t dlen = g_dhcp_w.len;
+    if (dlen < BOOTP_FIXED + 4) return 0;
+
+    uint32_t n = dhcp_opt_in(b, 240, dlen, code, out, max);
+    if (n) return n;
+
+    uint8_t ov[1];
+    if (dhcp_opt_in(b, 240, dlen, 52, ov, 1) != 1) return 0;    /* 无 overload */
+    /* 只有 file/sname 区真的落到报文里才扫（报文可能被截短） */
+    if ((ov[0] & 1) && dlen > 108) {
+        uint32_t end = (dlen < 236) ? dlen : 236u;
+        n = dhcp_opt_in(b, 108, end, code, out, max);
+        if (n) return n;
+    }
+    if ((ov[0] & 2) && dlen > 44) {
+        uint32_t end = (dlen < 108) ? dlen : 108u;
+        n = dhcp_opt_in(b, 44, end, code, out, max);
+        if (n) return n;
+    }
+    return 0;
+}
+
+/* 睡等一个响应（与 ping 共用 g_netrx_wq）。返回 1 = 收到，0 = 超时。 */
+static int dhcp_wait(uint32_t timeout_ms) {
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (g_dhcp_w.got) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* 把刚收到的 ACK 落到 g_lease 上，并重启 T1/T2 计时（net_dhcp 与后台
+ * 续租共用同一条路径，保证"首次取得"与"续上"的行为完全一致）。
+ * server_id 是 OFFER 里记下的服务器（ACK 不带 option 54 时沿用旧的）。
+ * 调用上下文：任务（net_dhcp）或 IRQ0（dhcp_renew_check），都是 IF=0。 */
+static void dhcp_apply(uint32_t ip, uint32_t server_id) {
+    uint8_t v[4];
+
+    g_lease.valid = 0;      /* 先摘掉，IRQ0 的续租检查在下面装好前不会误动 */
+    g_renew.active = 0;
+    g_renew.state  = 0;
+
+    if (dhcp_opt(54, v, 4) == 4) server_id = be32(v);
+    g_lease.ip      = ip;
+    g_lease.mask    = (dhcp_opt(1, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.router  = (dhcp_opt(3, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.server  = server_id;
+    g_lease.lease   = (dhcp_opt(51, v, 4) == 4) ? be32(v) : 0u;
+    g_lease.tick    = g_pit_ticks;
+
+    /* DNS 服务器表（option 6 可能给多个，全部收下；超时/失败时逐个问）。
+     * 手动配过（`dns a.b.c.d`）而服务器这次没下发时保留手动那张表。 */
+    uint8_t dv[16];
+    uint32_t dn = dhcp_opt(6, dv, sizeof(dv)) / 4u;
+    if (dn != 0) {
+        g_dns_srv_n = 0;
+        for (uint32_t k = 0; k < dn && g_dns_srv_n < DNS_MAX_SRV; k++) {
+            uint32_t a = be32(dv + k * 4);
+            if (a != 0) g_dns_srv[g_dns_srv_n++] = a;      /* 0.0.0.0 跳过 */
+        }
+        g_dns_manual = 0;
+    } else if (!g_dns_manual) {
+        g_dns_srv_n = 0;
+    }
+    g_lease.dns = (g_dns_srv_n != 0) ? g_dns_srv[0] : 0u;  /* 显示用：第一个 */
+
+    /* T1/T2 计时（RFC 2131 4.4.5）。租期为 0（服务器没下发）或长到换算会
+     * 溢出时不排定时器——那种租约当永久，不做续租。 */
+    uint32_t l = g_lease.lease;
+    if (l != 0 && l <= DHCP_LEASE_MAX_SEC) {
+        uint32_t ms = l * 1000u, now = g_pit_ticks;
+        g_renew.t1     = now + ms / 2u;          /* T1 = 0.5 × 租期 */
+        g_renew.t2     = now + (ms / 8u) * 7u;   /* T2 = 0.875 × 租期 */
+        g_renew.expire = now + ms;
+        g_renew.next   = 0;
+        g_renew.active = 1;
+    }
+
+    g_dhcp_w.active   = 0;
+    g_dhcp_w.got      = 0;
+    g_dhcp_w.renewing = 0;
+
+    /* IP 是网络序（大端打包）的 u32：字节 0（点分第一段）在**最高** 8 位。
+     * 写成 ip & 0xFF 取第一段会得到反过来的地址（10.0.2.66 -> 66.2.0.10），
+     * 屏幕上的租约看着对、实际发包全用错地址，且掩码算出的网络号与网关
+     * 对不上，跨网段判断会静默失效。 */
+    netdev_set_ip((uint8_t)((ip >> 24) & 0xFFu), (uint8_t)((ip >> 16) & 0xFFu),
+                   (uint8_t)((ip >> 8) & 0xFFu),  (uint8_t)(ip & 0xFFu));
+    g_lease.valid = 1;      /* 放在最后：IRQ0 见到 valid 时其余字段已就绪 */
+}
+
+/* 后台续租定时器（net_tick 调用，IRQ0 上下文）。只做两件不阻塞的事：
+ * 发出 REQUEST/DISCOVER、把 dhcp_input 收下的应答交给 dhcp_apply。
+ * 返回 1 表示这一轮发了包（调用方可据此决定是否要 net_poll）。 */
+static int dhcp_renew_check(uint32_t now) {
+    if (!g_renew.active || !g_lease.valid) return 0;
+
+    /* 1) 消化上一轮发出的请求的应答（dhcp_input 在 IRQ11 收下、置 got） */
+    if (g_dhcp_w.renewing && g_dhcp_w.got) {
+        uint8_t t = g_dhcp_w.msg_type;
+        g_dhcp_w.got = 0;
+        if (t == 5) {                                  /* ACK：续上了 */
+            if (g_dhcp_w.yiaddr != 0) {
+                dhcp_apply(g_dhcp_w.yiaddr, g_lease.server);
+                dmesg_write("DHCP: renewed");
+            }
+            return 0;
+        }
+        if (t == 6) {                                  /* NAK：地址没了 */
+            g_lease.valid = 0;                         /* 不再使用它 */
+            g_renew.state = 3;                         /* 回 INIT 重来 */
+        } else if (t == 2 && g_renew.state == 3) {     /* INIT 收到 OFFER */
+            uint32_t ip = g_dhcp_w.yiaddr;
+            uint8_t sid[4];
+            uint32_t server = (dhcp_opt(54, sid, 4) == 4) ? be32(sid) : 0u;
+            if (ip != 0 && dhcp_send(3, ip, server, 0) == 0) {
+                g_renew.next = now + DHCP_RENEW_RETRY_MIN;
+                return 1;
+            }
+        }
+    }
+
+    /* 2) 状态推进：T1 -> RENEWING -> T2 -> REBINDING -> 到期 -> INIT。
+     * 每次**跃迁**都立刻发一次（next 清 0）：否则上一轮的重发间隔会把
+     * 新状态的第一包推到租期之后——T2 的广播 rebind 就永远发不出去。 */
+    uint32_t state = g_renew.state;
+    int changed = 0;
+    if (state == 0) {
+        if ((int32_t)(now - g_renew.t1) < 0) return 0;
+        g_renew.state = state = 1;
+        changed = 1;
+    } else if (state == 1) {
+        if ((int32_t)(now - g_renew.t2) >= 0) {
+            g_renew.state = state = 2;
+            changed = 1;
+        }
+    } else if (state == 2 && (int32_t)(now - g_renew.expire) >= 0) {
+        g_lease.valid = 0;                 /* 租期到：地址不再属于我 */
+        g_renew.state = state = 3;
+        changed = 1;
+        dmesg_write("DHCP: lease expired");
+    }
+    if (changed) g_renew.next = 0;
+    if ((int32_t)(now - g_renew.next) < 0) return 0;   /* 未到重发间隔 */
+
+    /* 3) 发一次。RENEWING 单播给原服务器，REBINDING 广播，INIT 重新 DISCOVER */
+    uint32_t retry = (g_renew.t2 > g_renew.t1)
+                     ? (g_renew.t2 - g_renew.t1) / 2u : 0u;
+    if (retry < DHCP_RENEW_RETRY_MIN) retry = DHCP_RENEW_RETRY_MIN;
+    if (retry > 60000u) retry = 60000u;
+
+    g_dhcp_w.xid      = dhcp_new_xid();
+    g_dhcp_w.got      = 0;
+    g_dhcp_w.msg_type = 0;
+    g_dhcp_w.active   = 1;
+    g_dhcp_w.renewing = 1;
+    int ok;
+    if (state == 3)      ok = (dhcp_send(1, 0, 0, 0) == 0);
+    else if (state == 1) ok = (dhcp_send(3, g_lease.ip, g_lease.server, 1) == 0);
+    else                 ok = (dhcp_send(3, g_lease.ip, 0u, 1) == 0);
+    if (!ok) { g_dhcp_w.active = 0; g_dhcp_w.renewing = 0; }
+    g_renew.next = now + retry;
+    return ok ? 1 : 0;
+}
+
+/* DHCP 主流程（任务上下文，会睡最多 ~3*timeout_ms 每阶段）。
+ * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
+ * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。 */
+int net_dhcp(uint32_t timeout_ms) {
+    if (!netdev_present()) return -1;
+    if (!build_ready()) return -1;
+    if (timeout_ms == 0) timeout_ms = 2500u;
+
+    g_lease.valid = 0;
+    g_dhcp_w.xid = dhcp_new_xid();
+
+    /* 阶段 1：DISCOVER -> OFFER */
+    int offered = 0;
+    for (int attempt = 0; attempt < 3 && !offered; attempt++) {
+        g_dhcp_w.got = 0;
+        g_dhcp_w.active = 1;              /* 先置位再发：响应可能在发送途中到 */
+        if (dhcp_send(1, 0, 0, 0) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_wait(timeout_ms) && g_dhcp_w.msg_type == 2) offered = 1;
+    }
+    if (!offered) { g_dhcp_w.active = 0; return 1; }
+
+    uint32_t offer_ip = g_dhcp_w.yiaddr;
+    if (offer_ip == 0) { g_dhcp_w.active = 0; return 2; }
+    uint8_t sid[4];
+    uint32_t server_id = (dhcp_opt(54, sid, 4) == 4) ? be32(sid) : 0u;
+
+    /* 阶段 2：REQUEST -> ACK（广播，让未被选中的服务器也收到并释放预留） */
+    int acked = 0;
+    for (int attempt = 0; attempt < 3 && !acked; attempt++) {
+        g_dhcp_w.got = 0;
+        g_dhcp_w.active = 1;
+        if (dhcp_send(3, offer_ip, server_id, 0) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_wait(timeout_ms)) {
+            if (g_dhcp_w.msg_type == 5) acked = 1;
+            else if (g_dhcp_w.msg_type == 6) { g_dhcp_w.active = 0; return 2; }
+        }
+    }
+    g_dhcp_w.active = 0;
+    if (!acked) return 1;
+
+    uint32_t ip = g_dhcp_w.yiaddr;
+    if (ip == 0) return 2;                 /* ACK 里没给地址：不应用 */
+    dhcp_apply(ip, server_id);
+    return 0;
+}
+
+int net_dhcp_valid(void) { return g_lease.valid; }
+
+void net_dhcp_lease(uint32_t *ip, uint32_t *mask, uint32_t *router,
+                    uint32_t *dns, uint32_t *lease) {
+    if (ip)     *ip     = g_lease.ip;
+    if (mask)   *mask   = g_lease.mask;
+    if (router) *router = g_lease.router;
+    if (dns)    *dns    = g_lease.dns;
+    if (lease)  *lease  = g_lease.lease;
+}
+
+/* ---------- DNS 解析器（RFC 1035，只做 A 记录） ----------
+ *
+ * 与 DHCP 不同，DNS 是"已经有 IP 之后"的正常 UDP 流量，所以它能复用
+ * ipv4_send_via() 与 udp_checksum()，不需要自己组帧。两处仍然特殊：
+ *   1. 不走 socket 层：解析是内核自己的一次性查询，没必要占一个 socket，
+ *      也没有进程在等——和 ping/DHCP 一样用"等待者槽"（g_dns_w）。
+ *   2. 服务器可能不在本网段（8.8.8.8 之类）。ARP 问它没人答，必须把帧
+ *      交给网关（g_lease.router），IP 头里的目的仍写服务器地址。
+ *      判据是掩码：双方掩码下网络号不同、且网关与自己同网段才走网关。
+ *
+ * 只支持 A 记录；CNAME 会跳过继续找；响应名一律按压缩指针规则跳过
+ * （0xC0 开头两字节结束，0x00 是根 label），不展开、不比较名字——
+ * 正确性由"查询 ID 匹配 + 是应答 + 只认本端口"保证。
+ */
+
+#define DNS_PORT    53u
+#define DNS_BUF     512u        /* 传统 UDP DNS 上限 */
+
+static struct {
+    uint8_t  active;
+    uint8_t  got;
+    uint8_t  rcode;
+    uint16_t id;
+    uint16_t port;              /* 本轮查询用的源端口，响应必须回到它 */
+    uint8_t  buf[DNS_BUF];
+    uint32_t len;
+} g_dns_w;
+
+/* ---- 解析结果缓存 ----
+ * 表项很少（8 条）且只存 A 记录：shell 一次只跑一个查询，命中就省掉一次
+ * 往返（局域网里 1ms、公网几十 ms，但更重要的是不再给服务器添负载）。
+ * 失效只看 TTL：expire 是绝对 tick，判断用回绕安全的有符号比较。
+ * 不做负缓存（NXDOMAIN 不入表）——错误答案缓存起来的代价比重查一次大。 */
+#define DNS_CACHE_MAX  8u
+#define DNS_NAME_MAX   64u      /* 缓存键上限；更长的名字照常解析但不入表 */
+#define DNS_TTL_MAX    86400u   /* TTL 上限（秒）：挡住荒谬 TTL 与换算溢出 */
+
+static struct {
+    uint8_t  used;
+    char     name[DNS_NAME_MAX];
+    uint32_t ip;                /* 网络序 */
+    uint32_t expire;            /* 绝对 tick（ms） */
+} g_dns_cache[DNS_CACHE_MAX];
+
+static uint32_t g_dns_rr;       /* 轮换下标：表满时顶掉最老的一条 */
+static uint32_t g_dns_hits;     /* 缓存命中次数（nic 显示 / E2E 断言） */
+
+/* 小写化拷贝；名字过长则返回 0（不入缓存，但解析照常） */
+static uint32_t dns_name_copy(char *out, const char *in) {
+    uint32_t n = 0;
+    for (; in[n] != '\0'; n++) {
+        if (n + 1 >= DNS_NAME_MAX) return 0;
+        char c = in[n];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        out[n] = c;
+    }
+    out[n] = '\0';
+    return (n != 0) ? n : 0u;
+}
+
+static int dns_name_eq(const char *a, const char *b) {
+    for (;;) {
+        char x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+        if (x == '\0') return 1;
+    }
+}
+
+/* 只查缓存，不发任何包（shell 的 lookup 用它区分"(cached)"）。
+ * 命中返回 1 并写入 *ip；过期项顺手清掉。 */
+int net_dns_cache_lookup(const char *name, uint32_t *out_ip_be) {
+    if (!name || !out_ip_be) return 0;
+    uint32_t now = g_pit_ticks;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) {
+        if (!g_dns_cache[i].used) continue;
+        if (!dns_name_eq(name, g_dns_cache[i].name)) continue;
+        if ((int32_t)(now - g_dns_cache[i].expire) >= 0) {
+            g_dns_cache[i].used = 0;               /* 过期：当作没这条 */
+            return 0;
+        }
+        *out_ip_be = g_dns_cache[i].ip;
+        g_dns_hits++;
+        return 1;
+    }
+    return 0;
+}
+
+static void dns_cache_put(const char *name, uint32_t ip_be, uint32_t ttl) {
+    if (ttl == 0) return;                          /* RFC：TTL 0 = 不许缓存 */
+    if (ttl > DNS_TTL_MAX) ttl = DNS_TTL_MAX;
+    char key[DNS_NAME_MAX];
+    if (dns_name_copy(key, name) == 0) return;     /* 太长/空：不缓存 */
+
+    uint32_t slot = DNS_CACHE_MAX;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) {
+        if (!g_dns_cache[i].used) { slot = i; break; }
+        if (dns_name_eq(key, g_dns_cache[i].name)) { slot = i; break; }
+    }
+    if (slot == DNS_CACHE_MAX) {                   /* 满：轮换顶掉一条 */
+        slot = g_dns_rr % DNS_CACHE_MAX;
+        g_dns_rr++;
+    }
+    g_dns_cache[slot].used = 1;
+    for (uint32_t i = 0; key[i] != '\0'; i++) g_dns_cache[slot].name[i] = key[i];
+    g_dns_cache[slot].name[DNS_NAME_MAX - 1] = '\0';
+    g_dns_cache[slot].ip = ip_be;
+    g_dns_cache[slot].expire = g_pit_ticks + ttl * 1000u;
+}
+
+void net_dns_cache_clear(void) {
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) g_dns_cache[i].used = 0;
+    g_dns_rr = 0;
+}
+
+uint32_t net_dns_cache_hits(void)  { return g_dns_hits; }
+
+uint32_t net_dns_cache_entries(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) if (g_dns_cache[i].used) n++;
+    return n;
+}
+
+/* "www.example.com" -> 03 77 77 77 07 ... 00
+ * 返回写入字节数；0 = 名字非法（空、空 label、label > 63、总长 > 255）。 */
+static uint32_t dns_encode_name(uint8_t *out, const char *name) {
+    if (name[0] == '\0') return 0;
+    uint32_t w = 0, lab = 0;
+    out[w++] = 0;                                  /* 第一个 label 的长度占位 */
+    for (;;) {
+        char c = *name;
+        if (c == '.' || c == '\0') {
+            uint32_t n = w - lab - 1;
+            if (n == 0 || n > 63) return 0;        /* 空 label / 超长 label */
+            out[lab] = (uint8_t)n;
+            if (c == '\0') break;
+            name++;
+            if (*name == '\0') return 0;           /* 以点结尾：非法 */
+            lab = w;
+            out[w++] = 0;                          /* 下一个 label 的长度占位 */
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);   /* 域名不区分大小写 */
+        out[w++] = (uint8_t)c;
+        if (w > 255) return 0;
+        name++;
+    }
+    out[w++] = 0;                                  /* 根 label */
+    return w;
+}
+
+/* 跳过一个（可能被压缩的）域名，返回新偏移；越界/非法返回 0 */
+static uint32_t dns_skip_name(const uint8_t *p, uint32_t i, uint32_t n) {
+    for (;;) {
+        if (i >= n) return 0;
+        uint8_t l = p[i];
+        if ((l & 0xC0) == 0xC0) return (i + 2 <= n) ? i + 2 : 0;  /* 指针：收尾 */
+        if (l == 0)            return (i + 1 <= n) ? i + 1 : 0;   /* 根 label */
+        if ((l & 0xC0) != 0)   return 0;                          /* 保留类型 */
+        i += 1u + l;
+    }
+}
+
+/* 下一跳选择：同网段直连；跨网段且网关与自己同网段时帧给网关，IP 头
+ * 目的不变（由网关转发）。DNS 与 TCP 共用——TCP 过去直接对最终目的
+ * ARP，网段外的地址（如 user-net 下的公网 IP）没人应答，SYN 发不出去。 */
+static uint32_t next_hop(uint32_t dst_ip) {
+    uint32_t my = my_ip_be();
+    uint32_t mask = g_lease.mask, gw = g_lease.router;
+    if (mask != 0 && gw != 0 && (my & mask) != (dst_ip & mask) &&
+        (gw & mask) == (my & mask))
+        return gw;
+    return dst_ip;
+}
+
+/* 解析 TCP 对端 MAC：按下一跳解析（网段外即网关），成功后把结果记在
+ * 对端 IP 名下——tcp_send_seg_ex 发段时只做非阻塞 arp_lookup(peer_ip)，
+ * 与 net_input 的统一学习同一语义：ARP 缓存记的是"往这个 IP 发帧用哪个
+ * MAC"，网段外的答案就是网关的 MAC。 */
+static const uint8_t *arp_resolve_peer(uint32_t peer_ip, uint32_t timeout_ms) {
+    uint32_t hop = next_hop(peer_ip);
+    const uint8_t *m = arp_resolve(hop, timeout_ms);
+    if (m && hop != peer_ip) arp_learn(peer_ip, m);
+    return m;
+}
+
+static int dns_send(uint32_t server, const uint8_t *q, uint32_t n) {
+    uint32_t my = my_ip_be();
+    uint32_t hop = next_hop(server);
+
+    uint8_t *p = g_build;
+    uint32_t need = UDP_HDR_LEN + n;
+    put16(p + 0, g_dns_w.port);
+    put16(p + 2, DNS_PORT);
+    put16(p + 4, (uint16_t)need);
+    put16(p + 6, 0);
+    for (uint32_t i = 0; i < n; i++) p[UDP_HDR_LEN + i] = q[i];
+    put16(p + 6, udp_checksum(my, server, p, need));
+    g_udp_tx++;
+    return ipv4_send_via(server, hop, 17, p, need);
+}
+
+/* net_input 路径（可能 IRQ 上下文）。命中本轮查询就收下并返回 1（消费掉），
+ * 否则返回 0 让包照常走 UDP 投递。 */
+static int dns_input(const uint8_t *ip, uint32_t ihl) {
+    if (!g_dns_w.active) return 0;
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return 0;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen < UDP_HDR_LEN || ulen > totlen - ihl) return 0;
+    uint32_t dlen = ulen - UDP_HDR_LEN;
+    if (dlen < 12 || dlen > sizeof(g_dns_w.buf)) return 0;
+    if (be16(u + 0) != DNS_PORT || be16(u + 2) != g_dns_w.port) return 0;
+
+    const uint8_t *d = u + UDP_HDR_LEN;
+    if (be16(d + 0) != g_dns_w.id) return 0;       /* 不是这一轮的应答 */
+    if ((d[2] & 0x80) == 0) return 0;              /* QR=0：这是查询不是应答 */
+
+    for (uint32_t i = 0; i < dlen; i++) g_dns_w.buf[i] = d[i];
+    g_dns_w.len = dlen;
+    g_dns_w.rcode = d[3] & 0x0F;
+    g_dns_w.got = 1;
+    return 1;
+}
+
+static int dns_wait(uint32_t timeout_ms) {
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (g_dns_w.got) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* 解析一个域名到 IPv4（网络序写入 *out_ip_be）。
+ * 返回：0 = 成功、1 = 超时（发了但没人回）、-1 = 参数/发送失败、
+ * -2 = 服务器回了但不是 A 记录（含 NXDOMAIN 等 rcode != 0）、
+ * -3 = 没有 DNS 服务器（既没 DHCP 租约也没手动配）。 */
+int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) {
+    if (!name || !out_ip_be) return -1;
+    if (g_dns_srv_n == 0) return -3;
+    if (net_dns_cache_lookup(name, out_ip_be)) return 0;   /* 命中：一个包都不发 */
+    if (!netdev_present()) return -1;
+    if (!build_ready()) return -1;
+    if (timeout_ms == 0) timeout_ms = 2500u;
+
+    uint8_t q[320];
+    uint32_t namelen = dns_encode_name(q + 12, name);
+    if (namelen == 0 || 12u + namelen + 4u > sizeof(q)) return -1;
+
+    static uint16_t id_counter = 0x1234;
+    uint16_t id = ++id_counter;
+    put16(q + 0, id);
+    put16(q + 2, 0x0100);                          /* 标准查询，RD=1 */
+    put16(q + 4, 1);                               /* QDCOUNT */
+    put16(q + 6, 0); put16(q + 8, 0); put16(q + 10, 0);
+    put16(q + 12 + namelen, 1);                    /* QTYPE  = A */
+    put16(q + 14 + namelen, 1);                    /* QCLASS = IN */
+    uint32_t qlen = 12u + namelen + 4u;
+
+    g_dns_w.id = id;
+    g_dns_w.port = (uint16_t)(40000u + (id & 0x07FFu));
+
+    /* 逐个服务器问，每个最多两轮（超时/丢包才轮到下一个；NXDOMAIN 这种
+     * 权威否定答案直接返回，不去问第二台——它也会说"没有"）。 */
+    int got = 0;
+    for (int attempt = 0; attempt < 2 && !got; attempt++) {
+        for (uint32_t s = 0; s < g_dns_srv_n && !got; s++) {
+            uint32_t server = g_dns_srv[s];
+            if (server == 0) continue;
+            g_dns_w.got = 0;
+            g_dns_w.rcode = 0;
+            g_dns_w.active = 1;    /* 先置位再发：应答可能在发送途中就到 */
+            if (dns_send(server, q, qlen) != 0) { g_dns_w.active = 0; return -1; }
+            got = dns_wait(timeout_ms);
+        }
+    }
+    g_dns_w.active = 0;
+    if (!got) return 1;
+    if (g_dns_w.rcode != 0) return -2;              /* NXDOMAIN / SERVFAIL ... */
+
+    const uint8_t *d = g_dns_w.buf;
+    uint32_t n = g_dns_w.len;
+    uint16_t qd = be16(d + 4), an = be16(d + 6);
+    uint32_t i = 12;
+    for (uint32_t k = 0; k < qd; k++) {             /* 跳过问题区 */
+        i = dns_skip_name(d, i, n);
+        if (i == 0 || i + 4 > n) return -2;
+        i += 4;
+    }
+    for (uint32_t k = 0; k < an; k++) {             /* 应答区找第一条 A */
+        i = dns_skip_name(d, i, n);
+        if (i == 0 || i + 10 > n) return -2;
+        uint16_t type = be16(d + i), cls = be16(d + i + 2);
+        uint32_t rdlen = be16(d + i + 8);
+        i += 10;
+        if (i + rdlen > n) return -2;
+        if (type == 1 && cls == 1 && rdlen == 4) {
+            *out_ip_be = be32(d + i);
+            dns_cache_put(name, *out_ip_be, be32(d + i - 6));  /* TTL 在 TYPE 前 4 字节 */
+            return 0;
+        }
+        i += rdlen;                                 /* CNAME 等：跳过继续找 */
+    }
+    return -2;                                      /* 没有 A 记录 */
+}
+
+/* 手动指定服务器：覆盖整张表（DHCP 下次拿到 option 6 会重新覆盖回来） */
+void net_dns_set_server(uint32_t be) {
+    g_dns_srv[0] = be;
+    g_dns_srv_n  = (be != 0) ? 1u : 0u;
+    g_dns_manual = 1;
+}
+
+uint32_t net_dns_server(void) {
+    return (g_dns_srv_n != 0) ? g_dns_srv[0] : 0u;   /* 实际会用的第一个 */
+}
+
+uint32_t net_dns_server_count(void) { return g_dns_srv_n; }
+
+uint32_t net_dns_server_at(uint32_t i) {
+    return (i < g_dns_srv_n) ? g_dns_srv[i] : 0u;
+}
+
+/* ---------- SNTP 客户端（RFC 4330，只做客户端，一次查询） ----------
+ * 与 DNS 同款"等待者槽"：内核自己的一次性查询，不走 socket 层。
+ * 48 字节报文，客户端置 LI=0/VN=4/Mode=3；只认 mode=4（服务器）的
+ * 应答，取偏移 40 的 transmit timestamp（32.32，1900 纪元）换算成
+ * Unix 秒（减 2208988800）。客户端自身没有可信的墙钟，transmit
+ * timestamp 写 RTC 的当前 Unix 秒（有就是多少，没有就 0——RFC 允许
+ * 无钟客户端置 0，服务器不据此拒绝）。 */
+#define NTP_PORT        123u
+#define NTP_PKT_LEN     48u
+#define NTP_UNIX_DELTA  2208988800u    /* 1900-1970 的秒差 */
+
+static struct {
+    uint8_t  active;
+    uint8_t  got;
+    uint16_t port;
+    uint8_t  buf[NTP_PKT_LEN];
+} g_ntp_w;
+
+static int ntp_send(uint32_t server) {
+    uint32_t my = my_ip_be();
+
+    uint8_t *p = g_build;
+    uint32_t need = UDP_HDR_LEN + NTP_PKT_LEN;
+    uint8_t *q = p + UDP_HDR_LEN;
+    for (uint32_t i = 0; i < NTP_PKT_LEN; i++) q[i] = 0;
+    q[0] = 0x23;                     /* LI=0 VN=4 Mode=3(client) */
+    uint32_t rtc = 0;
+    if (rtc_unix(&rtc) == 0) put32(q + 40, rtc + NTP_UNIX_DELTA);
+
+    put16(p + 0, g_ntp_w.port);
+    put16(p + 2, NTP_PORT);
+    put16(p + 4, (uint16_t)need);
+    put16(p + 6, 0);
+    put16(p + 6, udp_checksum(my, server, p, need));
+    g_udp_tx++;
+    /* ipv4_send 内部带阻塞 ARP 解析（冷缓存也能发出首包） */
+    return ipv4_send(server, 17, p, need);
+}
+
+/* net_input 路径（可能 IRQ 上下文）。命中本轮查询返回 1（消费掉） */
+static int ntp_input(const uint8_t *ip, uint32_t ihl) {
+    if (!g_ntp_w.active) return 0;
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return 0;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen != UDP_HDR_LEN + NTP_PKT_LEN) return 0;
+    if (ulen > totlen - ihl) return 0;
+    if (be16(u + 0) != NTP_PORT || be16(u + 2) != g_ntp_w.port) return 0;
+
+    const uint8_t *d = u + UDP_HDR_LEN;
+    if ((d[0] & 0x07) != 4) return 0;              /* mode 4 = server */
+    for (uint32_t i = 0; i < NTP_PKT_LEN; i++) g_ntp_w.buf[i] = d[i];
+    g_ntp_w.got = 1;
+    return 1;
+}
+
+static int ntp_wait(uint32_t timeout_ms) {
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (g_ntp_w.got) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* 向 server_ip_be（网络序）查一次时间。
+ * 返回：0 = 成功（*out_unix_sec = Unix 秒）、1 = 超时、
+ * -1 = 参数/发送失败、-2 = 应答格式非法。任务上下文专用。 */
+int net_ntp(uint32_t server_ip_be, uint32_t *out_unix_sec, uint32_t timeout_ms) {
+    if (server_ip_be == 0 || !out_unix_sec) return -1;
+    if (!netdev_present()) return -1;
+    if (!build_ready()) return -1;
+    if (timeout_ms == 0) timeout_ms = 2500u;
+
+    static uint16_t ntp_port_counter = 0;
+    g_ntp_w.port = (uint16_t)(42000u + (++ntp_port_counter & 0x07FFu));
+    g_ntp_w.got = 0;
+    g_ntp_w.active = 1;              /* 先置位再发：应答可能在发送途中就到 */
+    int rc = ntp_send(server_ip_be);
+    if (rc != 0) { g_ntp_w.active = 0; return -1; }
+    int got = ntp_wait(timeout_ms);
+    g_ntp_w.active = 0;
+    if (!got) return 1;
+
+    uint32_t ts = be32(g_ntp_w.buf + 40);          /* transmit timestamp 秒 */
+    if (ts < NTP_UNIX_DELTA) return -2;            /* 早于 1970：假应答 */
+    *out_unix_sec = ts - NTP_UNIX_DELTA;
+    return 0;
+}
+
+/* ---------- TCP ---------- */
+
+/* seq 显式传入：正常发送用 snd_nxt，重传必须用 snd_una（重传不改变
+ * snd_nxt，否则序号空间会被重传段推着走）。 */
+static int tcp_send_seg_ex(sock_t *s, uint8_t flags, const uint8_t *data,
+                           uint32_t n, uint32_t seq) {
+    if (n > NET_BUILD_MAX - IP_HDR_MIN - TCP_HDR_MIN) return -1;
+    const uint8_t *dst_mac = arp_lookup(s->peer_ip);
+    if (!dst_mac) return -1;
+
+    uint8_t *r = g_build;
+    for (int i = 0; i < 6; i++) r[i] = dst_mac[i];
+    const uint8_t *my = netdev_mac();
+    for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+    r[12] = 0x08; r[13] = 0x00;
+
+    uint8_t *ip = r + ETH_HDR_LEN;
+    uint32_t iplen = IP_HDR_MIN + TCP_HDR_MIN + n;
+    ip[0] = 0x45; ip[1] = 0;
+    put16(ip + 2, (uint16_t)iplen);
+    put16(ip + 4, ++g_ip_id);
+    put16(ip + 6, 0);
+    ip[8] = 64; ip[9] = 6;
+    put16(ip + 10, 0);
+    put32(ip + 12, my_ip_be());
+    put32(ip + 16, s->peer_ip);
+
+    uint8_t *t = ip + IP_HDR_MIN;
+    put16(t + 0, s->local_port);
+    put16(t + 2, s->peer_port);
+    put32(t + 4, seq);
+    put32(t + 8, s->rcv_nxt);
+    t[12] = (uint8_t)(TCP_HDR_MIN << 2);
+    t[13] = flags;
+    put16(t + 14, 4096);                           /* 固定通告窗口 */
+    put16(t + 16, 0); put16(t + 18, 0);
+    for (uint32_t i = 0; i < n; i++) t[TCP_HDR_MIN + i] = data[i];
+
+    /* 校验和：伪首部 + 段（含补零）。分段求 RAW 和，统一取反一次。 */
+    uint32_t tlen = TCP_HDR_MIN + n;
+    if (tlen & 1) t[tlen] = 0;
+    uint8_t ps[12];
+    put32(ps + 0, my_ip_be());
+    put32(ps + 4, s->peer_ip);
+    ps[8] = 0; ps[9] = 6;
+    put16(ps + 10, (uint16_t)tlen);
+    uint32_t sum = cksum_raw(ps, 12) + cksum_raw(t, tlen + (tlen & 1));
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    put16(t + 16, (uint16_t)(~sum));
+
+    put16(ip + 10, cksum(ip, IP_HDR_MIN));
+
+    if (netdev_send(r, ETH_HDR_LEN + iplen) != 0) return -1;
+    g_tcp_tx++;
+    return 0;
+}
+
+static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t n) {
+    return tcp_send_seg_ex(s, flags, data, n, s->snd_nxt);
+}
+
+/* ---------------- 步骤 7.4：重传定时器 ----------------
+ *
+ * RTO 固定 200ms 起、每次 ×2（无 RTT 采样：教学取舍——真栈用 Jacobson/
+ * Karn 算法按实测 RTT 估算，这里只求"丢了能补上"）。最多重传 5 次，
+ * 全部落空就发 RST 放弃：无限重传会把一个死连接永久钉在 socket 表上。
+ *
+ * 调用上下文：IRQ0（isr.c 的 irq0_handler，每 tick 进 net_tick，内部按
+ * TCP_TICK_MS 节流）与系统调用（net_poll）。两者不并发（单核 + 中断门
+ * 清 IF），故无需加锁。重传走 rtl8139_send，它内部自带 IF 保护。 */
+static void sock_free(sock_t *s);   /* 定义在下面的 socket 层 */
+
+static void tcp_retransmit_check(sock_t *s, uint32_t now) {
+    if (s->state == TS_UNUSED || s->type != SOCK_TYPE_TCP) return;
+    if (s->rto_tick == 0) return;                       /* 无待确认对象 */
+    if ((int32_t)(now - s->rto_tick) < 0) return;       /* 未到期（回绕安全） */
+
+    if (s->rtx_tries >= TCP_RTX_MAX) {                  /* 放弃 */
+        tcp_send_seg(s, TCP_RST | TCP_ACK, 0, 0);
+        sock_free(s);
+        return;
+    }
+    s->rtx_tries++;
+    uint32_t backoff = (uint32_t)TCP_RTO_MS << (s->rtx_tries > 4 ? 4 : s->rtx_tries);
+    s->rto_tick = now + backoff;
+    g_tcp_rtx++;
+    if (s->syn_unacked) {
+        /* SYN 重传：序号回退到 ISN（snd_una 就是它），不带数据 */
+        tcp_send_seg_ex(s, TCP_SYN, 0, 0, s->snd_una);
+        return;
+    }
+    if (s->rtx_len == 0) { s->rto_tick = 0; return; }
+    tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, s->rtx, s->rtx_len, s->snd_una);
+}
+
+void net_tick(void) {
+    static uint32_t last_tick;
+    uint32_t now = g_pit_ticks;
+    if ((int32_t)(now - last_tick) < (int32_t)TCP_TICK_MS) return;
+    last_tick = now;
+    /* DHCP 续租（T1/T2，见 g_renew 注释）：先跑，因为它可能刚续上租约、
+     * 也可能刚把地址作废——之后的重传都按最新的本机 IP 走。 */
+    dhcp_renew_check(now);
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (!s->used || s->type != SOCK_TYPE_TCP) continue;
+        if (s->rto_tick == 0) continue;
+        /* 只有"还有东西没被确认"的连接需要定时器：纯 ACK/FIN 已确认、
+         * 或状态机已结束的都该是 0。 */
+        tcp_retransmit_check(s, now);
+    }
+}
+
+/* TCP 的可靠性缓冲（rx/rtx/ooo）按需分配：UDP socket 不该为用不到的东西
+ * 付内存；分配失败时 fail closed（该 socket 不能进 ESTABLISHED）。
+ * rx 也在兜底之列：tcp_input 的被动 accept 子连接是直接占用空槽建起来的
+ * （不走 sock_alloc），rx 可能还是 NULL——ESTABLISHED 分支
+ * conn->rx[conn->rx_w] 直接写物理页 0。 */
+static int tcp_bufs(sock_t *s) {
+    if (!s->rx) {
+        s->rx = kmalloc(NET_SOCK_BUF);
+        if (!s->rx) return 0;
+    }
+    if (!s->rtx) {
+        s->rtx = kmalloc(TCP_RTX_BUF);
+        if (!s->rtx) return 0;
+    }
+    if (!s->ooo) {
+        s->ooo = kmalloc(TCP_OOO_BUF);
+        if (!s->ooo) return 0;
+    }
+    s->rtx_len = 0;
+    s->rto_tick = 0;
+    s->rtx_tries = 0;
+    s->syn_unacked = 0;
+    s->ooo_len = 0;
+    s->ooo_seq = 0;
+    return 1;
+}
+
+static void sock_free(sock_t *s) {
+    s->used = 0;
+    s->state = TS_UNUSED;
+    s->rtx_len = 0;
+    s->rto_tick = 0;
+    s->rtx_tries = 0;
+    s->syn_unacked = 0;
+    s->ooo_len = 0;
+    /* rx/rtx/ooo 缓冲保留复用（挂在槽上），不 kfree */
+}
+
+/* TCP 的统一关闭：ESTABLISHED/CLOSE_WAIT 发 FIN 进收尾状态机；LISTEN
+ * 连未 accept 的子连接一并回收（防止 parent 下标被新 socket 复用后误认领，
+ * 见 SC_CLOSE 的注释）；其它状态直接释放。内核侧（httpd）与 SC_CLOSE 共用。 */
+static int tcp_close(sock_t *s) {
+    if (s->type == SOCK_TYPE_TCP) {
+        if (s->state == TS_ESTABLISHED || s->state == TS_CLOSE_WAIT) {
+            uint32_t seq = s->snd_nxt;
+            s->snd_nxt = seq + 1;
+            if (tcp_send_seg_ex(s, TCP_FIN | TCP_ACK, 0, 0, seq) != 0) {
+                s->snd_nxt = seq;
+                return -1;
+            }
+            s->state = (s->state == TS_ESTABLISHED) ? TS_FIN_WAIT_1 : TS_LAST_ACK;
+            return 0;
+        }
+        if (s->state == TS_LISTEN) {
+            for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+                if (g_socks[i].used && g_socks[i].parent == (int)(s - g_socks))
+                    sock_free(&g_socks[i]);
+            }
+        }
+    }
+    sock_free(s);
+    return 0;
+}
+
+static void tcp_input(const uint8_t *ip, uint32_t ihl) {
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + TCP_HDR_MIN) return;
+    const uint8_t *t = ip + ihl;
+    uint32_t doff = (uint32_t)(t[12] >> 4) * 4u;
+    if (doff < TCP_HDR_MIN || ihl + doff > totlen) return;
+    uint8_t  flags = t[13];
+    uint32_t seq = be32(t + 4);
+    uint32_t ack = be32(t + 8);
+    uint32_t dlen = totlen - ihl - doff;
+    const uint8_t *data = t + doff;
+    uint16_t dport = be16(t + 2);
+    uint16_t sport = be16(t + 0);
+    uint32_t srcip = be32(ip + 12);
+
+    sock_t *conn = 0, *listener = 0;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (!s->used || s->type != SOCK_TYPE_TCP) continue;
+        if (s->local_port != dport) continue;
+        if (s->state == TS_LISTEN) { listener = s; continue; }
+        if (s->peer_port == sport && s->peer_ip == srcip) { conn = s; break; }
+    }
+
+    if (!conn) {
+        if (!listener || !(flags & TCP_SYN) || (flags & TCP_ACK)) return;
+        for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+            sock_t *s = &g_socks[i];
+            if (s->used) continue;
+            s->used = 1;
+            s->type = SOCK_TYPE_TCP;
+            s->state = TS_SYN_RCVD;
+            s->local_port = dport;
+            s->peer_port = sport;
+            s->peer_ip = srcip;
+            s->got_fin = 0;
+            s->owner_pid = listener->owner_pid;
+            s->parent = (int)(listener - g_socks);
+            s->rx_r = s->rx_w = 0;
+            /* ISN 由收发计数器拼成，可预测——教学取舍；真实环境必须随机化
+             * （RFC 6528），否则序列号可被猜出，连接可被注入/劫持。 */
+            if (!tcp_bufs(s)) { s->used = 0; return; }   /* 缓冲不足：拒连 */
+            s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;
+            s->snd_una = s->snd_nxt;
+            s->rcv_nxt = seq + 1;
+            {
+                uint32_t sq = s->snd_nxt;
+                s->snd_nxt = sq + 1;
+                tcp_send_seg_ex(s, TCP_SYN | TCP_ACK, 0, 0, sq);
+            }
+            return;
+        }
+        return;                                    /* 连接表满：丢弃 */
+    }
+
+    if (flags & TCP_RST) { sock_free(conn); return; }
+
+    /* ---- ACK 推进发送窗口（所有状态通用，含 SYN_SENT 收到的 SYN+ACK）----
+     * snd_una 左边界右移 → rtx 里已确认的字节去掉；全确认就撤掉定时器。
+     * 注意 ack 必须落在 (snd_una, snd_nxt] 内：超出 snd_nxt 是对端在确认
+     * 我们没发过的字节（异常/攻击），忽略。比较用有符号差，回绕安全。 */
+    if (flags & TCP_ACK) {
+        uint32_t una = conn->snd_una;
+        if ((int32_t)(ack - una) > 0 && (int32_t)(ack - conn->snd_nxt) <= 0) {
+            uint32_t acked = ack - una;
+            conn->snd_una = ack;
+            if (conn->syn_unacked) {            /* SYN 被确认 */
+                conn->syn_unacked = 0;
+                conn->rtx_tries = 0;
+                if (conn->rtx_len == 0) conn->rto_tick = 0;
+            } else if (acked >= conn->rtx_len) { /* 数据全确认 */
+                conn->rtx_len = 0;
+                conn->rto_tick = 0;
+                conn->rtx_tries = 0;
+            } else {                             /* 部分确认：剩余字节挪到头 */
+                for (uint32_t k = 0; k + acked < conn->rtx_len; k++)
+                    conn->rtx[k] = conn->rtx[k + acked];
+                conn->rtx_len -= acked;
+                conn->rto_tick = g_pit_ticks + TCP_RTO_MS;
+                conn->rtx_tries = 0;
+            }
+        }
+    }
+
+    switch (conn->state) {
+    case TS_SYN_SENT:
+        /* 主动打开：只认 SYN+ACK；纯 ACK / 同时打开的裸 SYN 都忽略。 */
+        if (!(flags & TCP_SYN) || !(flags & TCP_ACK)) return;
+        if (ack != conn->snd_una) return;      /* 上面的处理已把 una 推到 ack */
+        conn->rcv_nxt = seq + 1;
+        conn->state = TS_ESTABLISHED;
+        conn->syn_unacked = 0;
+        conn->rto_tick = 0;
+        conn->rtx_tries = 0;
+        tcp_send_seg(conn, TCP_ACK, 0, 0);     /* 三次握手最后一包 */
+        return;
+    case TS_SYN_RCVD:
+        if (!(flags & TCP_ACK) || ack != conn->snd_nxt) return;
+        conn->state = TS_ESTABLISHED;
+        if (dlen == 0 && !(flags & TCP_FIN)) return;  /* 纯握手 ACK：无需回包 */
+        /* 握手第三次 ACK 捎带的首段数据/FIN：落入 ESTABLISHED 一并处理。
+         * 原实现直接 return 丢掉——要等对端超时重传才收得到（多一个 RTT，
+         * 不可靠对端则数据彻底丢失）。 */
+        /* FALLTHROUGH */
+    case TS_ESTABLISHED:
+    case TS_CLOSE_WAIT:
+        /* 数据按序号入位（步骤 7.4 乱序重组）：
+         *   seq <  rcv_nxt：重传来的旧段（我们的 ACK 丢了），丢掉即可
+         *   seq == rcv_nxt：直接进接收环，然后看能不能把乱序串接上
+         *   seq >  rcv_nxt：先存进乱序缓冲；只有"紧挨着已收乱序串"的才收，
+         *                   中间还有洞的段只能等重传补（教学取舍：不做
+         *                   多洞分段链表，缓冲 2KB 单串足够覆盖演示场景） */
+        if (dlen > 0) {
+            if ((int32_t)(seq - conn->rcv_nxt) < 0) {
+                /* 旧数据：不推进 rcv_nxt，靠下面的 ACK 让对端往前走 */
+            } else if (seq == conn->rcv_nxt) {
+                uint32_t space = (NET_SOCK_BUF - 1 + conn->rx_r - conn->rx_w)
+                                 % NET_SOCK_BUF;
+                uint32_t take = (dlen > space) ? space : dlen;
+                for (uint32_t k = 0; k < take; k++) {
+                    conn->rx[conn->rx_w] = data[k];
+                    conn->rx_w = (conn->rx_w + 1) % NET_SOCK_BUF;
+                }
+                conn->rcv_nxt += take;
+                g_tcp_rx += take;
+                /* 缺口补上了：把乱序串里紧接着的连续数据倒进接收环 */
+                while (conn->ooo_len && conn->ooo_seq == conn->rcv_nxt) {
+                    space = (NET_SOCK_BUF - 1 + conn->rx_r - conn->rx_w)
+                            % NET_SOCK_BUF;
+                    uint32_t n = (conn->ooo_len < space) ? conn->ooo_len : space;
+                    if (n == 0) break;          /* 接收环满：留给下一轮 */
+                    for (uint32_t k = 0; k < n; k++) {
+                        conn->rx[conn->rx_w] = conn->ooo[k];
+                        conn->rx_w = (conn->rx_w + 1) % NET_SOCK_BUF;
+                    }
+                    conn->rcv_nxt += n;
+                    g_tcp_rx += n;
+                    for (uint32_t k = 0; k + n < conn->ooo_len; k++)
+                        conn->ooo[k] = conn->ooo[k + n];
+                    conn->ooo_len -= n;
+                    conn->ooo_seq = conn->rcv_nxt;
+                }
+            } else if (conn->ooo && conn->ooo_len + dlen <= TCP_OOO_BUF &&
+                       (conn->ooo_len == 0 ||
+                        seq == conn->ooo_seq + conn->ooo_len)) {
+                if (conn->ooo_len == 0) conn->ooo_seq = seq;
+                for (uint32_t k = 0; k < dlen; k++)
+                    conn->ooo[conn->ooo_len + k] = data[k];
+                conn->ooo_len += dlen;
+            }
+            /* 环满/缓冲满：不推进 rcv_nxt —— 对端超时重传即恢复 */
+        }
+        if (flags & TCP_FIN) {
+            if (seq + dlen == conn->rcv_nxt) {
+                conn->rcv_nxt++;
+                conn->got_fin = 1;
+                if (conn->state == TS_ESTABLISHED) conn->state = TS_CLOSE_WAIT;
+            }
+        }
+        /* 只有数据/FIN 才需要 ACK。对对端的**纯 ACK**回 ACK 会形成
+         * ping-pong 风暴：我方 ACK（还带着过期 seq）→ 对端 dup-ACK →
+         * 我方再 ACK……IRQ 风暴把单核整个饿死（httpd E2E 抓出来的）。 */
+        if (dlen > 0 || (flags & TCP_FIN))
+            tcp_send_seg(conn, TCP_ACK, 0, 0);
+        return;
+    case TS_LAST_ACK:
+        if ((flags & TCP_ACK) && ack == conn->snd_nxt) sock_free(conn);
+        return;
+    case TS_FIN_WAIT_1:
+        if ((flags & TCP_ACK) && ack == conn->snd_nxt) conn->state = TS_FIN_WAIT_2;
+        if (flags & TCP_FIN) {
+            if (seq + dlen == conn->rcv_nxt) {
+                conn->rcv_nxt++;               /* FIN 占一个序号：ACK 必须是 FINseq+1，
+                                                * 否则对端视为未确认而重传 FIN */
+                conn->got_fin = 1;
+            }
+            tcp_send_seg(conn, TCP_ACK, 0, 0);
+            sock_free(conn);
+        }
+        return;
+    case TS_FIN_WAIT_2:
+        if (flags & TCP_FIN) {
+            if (seq + dlen == conn->rcv_nxt) {
+                conn->rcv_nxt++;               /* 同上：先推进序号再 ACK */
+                conn->got_fin = 1;
+            }
+            tcp_send_seg(conn, TCP_ACK, 0, 0);
+            sock_free(conn);
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+/* ---------- 帧分发入口 ---------- */
+
+int net_input(const uint8_t *f, uint32_t len) {
+    if (!build_ready()) return -1;
+    if (len < ETH_HDR_LEN) return -1;
+    uint16_t et = be16(f + 12);
+
+    if (et == 0x0806) {                            /* ARP */
+        if (len < ETH_HDR_LEN + 28) return -1;
+        const uint8_t *a = f + ETH_HDR_LEN;
+        if (be16(a + 0) != 1 || be16(a + 2) != 0x0800 ||
+            a[4] != 6 || a[5] != 4) return -1;
+
+        uint32_t spa = be32(a + 14);
+        /* 只学"发往本机"的：request 目标 IP 是本机（eth 是广播但逻辑上
+         * 是找我们）、或 eth 目的 MAC 是本机（reply）。别人对话的广播帧
+         * 不学——否则缓存被无关 MAC 瞬间冲掉。 */
+        if ((be16(a + 6) == 1 && be32(a + 24) == my_ip_be()) ||
+            eth_dst_is_me(f))
+            arp_learn(spa, a + 8);
+
+        if (be16(a + 6) == 1 && be32(a + 24) == my_ip_be()) {
+            uint8_t *r = g_build;
+            for (int i = 0; i < 6; i++) r[i] = a[8 + i];
+            const uint8_t *my = netdev_mac();
+            for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+            r[12] = 0x08; r[13] = 0x06;
+            uint8_t *p = r + ETH_HDR_LEN;
+            put16(p + 0, 1); put16(p + 2, 0x0800); p[4] = 6; p[5] = 4;
+            put16(p + 6, 2);
+            for (int i = 0; i < 6; i++) p[8 + i] = my[i];
+            put32(p + 14, my_ip_be());
+            for (int i = 0; i < 6; i++) p[18 + i] = a[8 + i];
+            put32(p + 24, spa);
+            if (netdev_send(r, ETH_HDR_LEN + 28) == 0) g_arp_replied++;
+        }
+        return 0;
+    }
+    if (et != 0x0800) return -1;
+    if (len < ETH_HDR_LEN + IP_HDR_MIN) return -1;
+    const uint8_t *ip = f + ETH_HDR_LEN;
+    if ((ip[0] >> 4) != 4) return -1;
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
+    if (ihl < IP_HDR_MIN || ETH_HDR_LEN + ihl > len) return -1;
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl || totlen > 1500 || ETH_HDR_LEN + totlen > len) return -1;
+
+    /* RFC 791 3.1：首部校验和必须验，错的静默丢弃。
+     * 以前只验长度不验校验和——链路噪声或伪造帧能让它后面每一层
+     * （端口、seq、长度）都在解析一个坏首部派生出来的假报文。 */
+    if (cksum(ip, ihl) != 0) { g_ip_bad_csum++; return -1; }
+
+    /* RFC 791 3.2 分片：MF 置位或片偏移非 0 的都是"不完整的一片"。
+     * 本栈不实现重组，那就必须 fail closed 丢掉，而不是把它当完整包
+     * 递给 UDP/TCP——那会拿第一片的 UDP 头去套一个长度字段，解析出
+     * 无意义甚至有害的结果（治疗比病贵：分片攻击正是这么来的）。 */
+    uint16_t frag = be16(ip + 6);
+    if ((frag & 0x1FFFu) != 0 || (frag & 0x2000u) != 0) {
+        g_ip_frag_drop++;
+        return -1;
+    }
+    /* UDP/TCP 传输层校验和（发送方算了就必须对得上） */
+    if ((ip[9] == 17 || ip[9] == 6) && !l4_csum_ok(ip, ihl, totlen)) {
+        g_ip_bad_csum++;
+        return -1;
+    }
+
+    /* 统一 ARP 学习：只学目的 IP 是本机的单播帧（广播/别人对话的不学，
+     * 避免缓存被冲掉）。同网段直连成立（教学环境无路由）；回包不再
+     * 需要 ARP 解析。 */
+    if (be32(ip + 16) == my_ip_be())
+        arp_learn(be32(ip + 12), f + 6);
+
+    /* DHCP 阶段特例：此时本机还没有 IP，服务器回的包目的可能是
+     * 255.255.255.255（我们置了 broadcast flag）或尚未生效的 yiaddr，
+     * 两者都会被下面的"不是我的 IP"丢掉。故会话活跃期间对 UDP 67->68
+     * 放宽检查，真正的合法性由 dhcp_input() 用 xid 把关（xid 由 MAC+tick
+     * 生成，别的客户机的包撞不上）。会话不活跃时本分支不生效。 */
+    if (g_dhcp_w.active && ip[9] == 17 && ihl + UDP_HDR_LEN <= totlen) {
+        const uint8_t *u = ip + ihl;
+        if (be16(u + 0) == DHCP_SRV_PORT && be16(u + 2) == DHCP_CLI_PORT) {
+            /* 记下服务器的 IP<->MAC：应答目的是广播/yiaddr（不是本机，
+             * 上面那条 arp_learn 不生效）；T1 续租要单播给原服务器，
+             * 没这条缓存就只能广播出去。 */
+            arp_learn(be32(ip + 12), f + 6);
+            dhcp_input(ip, ihl);
+            return 0;
+        }
+    }
+    if (be32(ip + 16) != my_ip_be()) return -1;
+
+    if (ip[9] == 1)      icmp_input(ip, ihl);
+    else if (ip[9] == 17) {
+        /* DNS/NTP 等待者优先：解析/校时是内核自己发的查询，不走 socket 层 */
+        if (dns_input(ip, ihl)) return 0;
+        if (ntp_input(ip, ihl)) return 0;
+        udp_input(ip, ihl);
+    }
+    else if (ip[9] == 6)  tcp_input(ip, ihl);
+    return 0;
+}
+
+/* ---------- socket 层 ---------- */
+
+static sock_t *sock_get(uint32_t idx) {
+    if (idx >= NET_MAX_SOCKS) return 0;
+    if (!g_socks[idx].used) return 0;
+    return &g_socks[idx];
+}
+
+static sock_t *sock_alloc(uint8_t type, uint32_t owner_pid) {
+    /* 懒回收：表满时清掉 owner 进程已不存在的条目（ZOMBIE 未收割仍算
+     * 存在——task_find 找得到，不误杀）。pid 0 = 内核，永不回收。 */
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (s->used && s->owner_pid != 0 && task_find((int)s->owner_pid) == 0)
+            sock_free(s);
+    }
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (s->used) continue;
+        s->used = 1;
+        s->type = type;
+        s->state = TS_UNUSED;
+        s->got_fin = 0;
+        s->local_port = 0;
+        s->peer_port = 0;
+        s->peer_ip = 0;
+        s->owner_pid = owner_pid;
+        s->parent = -1;
+        s->rx_r = s->rx_w = 0;
+        s->snd_nxt = s->rcv_nxt = 0;
+        if (!s->rx) {
+            s->rx = kmalloc(NET_SOCK_BUF);
+            if (!s->rx) { s->used = 0; return 0; }
+        }
+        return s;
+    }
+    return 0;
+}
+
+/* 步骤 8a：真睡眠等待条件。循环顶先 net_poll() 再查条件（覆盖"包在
+ * 睡眠窗口内已到/唤醒源是无关中断"）；然后睡到 net_rx_wake 或超时。 */
+static int wait_cond(int (*cond)(void *), void *ctx, uint32_t timeout_ms) {
+    if (timeout_ms == 0) timeout_ms = NET_DEFAULT_WAIT_MS;
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (cond(ctx)) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+static int cond_udp(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->rx_r != s->rx_w;
+}
+static int cond_tcp(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->rx_r != s->rx_w || s->got_fin;
+}
+static int cond_connected(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->state == TS_ESTABLISHED;
+}
+static int cond_accept(void *p) {
+    sock_t *l = (sock_t *)p;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
+        if (g_socks[i].used && g_socks[i].parent == (int)(l - g_socks) &&
+            g_socks[i].state == TS_ESTABLISHED)
+            return 1;
+    return 0;
+}
+
+static int uptr_ok(uint32_t va, uint32_t len, int rw) {
+    return rw ? syscall_user_range_rw(va, len) : syscall_user_range_ok(va, len);
+}
+
+int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
+    task_t *cur = task_current();
+    uint32_t pid = cur ? cur->pid : 0;
+    if (!build_ready()) return -1;
+
+    switch (subcmd) {
+    case SC_SOCKET: {
+        if (a[0] != SOCK_TYPE_UDP && a[0] != SOCK_TYPE_TCP) return -1;
+        sock_t *s = sock_alloc(a[0], pid);
+        if (!s) return -1;
+        return (int)(s - g_socks);
+    }
+    case SC_BIND: {
+        sock_t *s = sock_get(a[0]);
+        if (!s || a[1] == 0 || a[1] > 0xFFFF) return -1;
+        if (s->type == SOCK_TYPE_TCP && s->state != TS_UNUSED) return -1;
+        /* 端口一律存数值（host 序）；线上转换只在 put16/be16 边界做 */
+        for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+            sock_t *o = &g_socks[i];
+            if (o->used && o != s && o->local_port == (uint16_t)a[1])
+                return -1;                         /* 端口已占用 */
+        }
+        s->local_port = (uint16_t)a[1];
+        return 0;
+    }
+    case SC_LISTEN: {
+        sock_t *s = sock_get(a[0]);
+        if (!s || s->type != SOCK_TYPE_TCP || s->local_port == 0) return -1;
+        s->state = TS_LISTEN;
+        return 0;
+    }
+    case SC_ACCEPT: {
+        sock_t *l = sock_get(a[0]);
+        if (!l || l->type != SOCK_TYPE_TCP || l->state != TS_LISTEN) return -1;
+        if (!wait_cond(cond_accept, l, a[1])) return -1;
+        for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+            sock_t *c = &g_socks[i];
+            if (c->used && c->parent == (int)(l - g_socks) &&
+                c->state == TS_ESTABLISHED) {
+                c->parent = -1;
+                return (int)i;
+            }
+        }
+        return -1;
+    }
+    case SC_CONNECT: {
+        /* 步骤 7.4 主动打开：分配临时端口 → 发 SYN → 睡等 SYN+ACK。
+         * SYN 的重传由 net_tick 负责（syn_unacked + rto_tick），所以这里
+         * 发完就可以直接去睡，不必自己循环重试。 */
+        sock_t *s = sock_get(a[0]);
+        if (!s || s->type != SOCK_TYPE_TCP) return -1;
+        if (s->state != TS_UNUSED || s->local_port != 0) return -1;
+        if (a[1] == 0 || a[2] == 0 || a[2] > 0xFFFF) return -1;
+
+        uint16_t port = 0;
+        for (int tries = 0; tries < 200 && port == 0; tries++) {
+            uint16_t cand = g_ephemeral++;
+            if (cand < 40000u) g_ephemeral = 40000u;
+            int conflict = 0;
+            for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
+                if (g_socks[i].used && g_socks[i].local_port == cand) { conflict = 1; break; }
+            if (!conflict) port = cand;
+        }
+        if (port == 0) return -1;
+        if (!tcp_bufs(s)) return -1;
+
+        s->local_port = port;
+        s->peer_ip   = a[1];
+        s->peer_port = (uint16_t)a[2];
+        s->got_fin   = 0;
+        s->rx_r = s->rx_w = 0;
+        s->rcv_nxt = 0;
+        /* ISN 同上：可预测是教学取舍（RFC 6528 要求随机化） */
+        s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;
+        s->snd_una = s->snd_nxt;
+        s->state = TS_SYN_SENT;
+        s->syn_unacked = 1;
+
+        /* 先解析对端 MAC（可能睡等 ARP reply），再起重传定时器并发 SYN：
+         * 顺序反了的话定时器会在 MAC 还没解析完时就尝试重传而白跑一趟。 */
+        if (arp_resolve_peer(s->peer_ip, 3000) == 0) { sock_free(s); return -1; }
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+        s->rtx_tries = 0;
+        {
+            uint32_t seq = s->snd_nxt;
+            s->snd_nxt = seq + 1;
+            tcp_send_seg_ex(s, TCP_SYN, 0, 0, seq);
+        }
+
+        if (!wait_cond(cond_connected, s, a[3])) { sock_free(s); return -1; }
+        return 0;
+    }
+    case SC_SENDTO: {
+        sock_t *s = sock_get(a[0]);
+        if (!s || a[2] == 0) return -1;
+        if (!uptr_ok(a[1], a[2], 0)) return -1;
+        const uint8_t *buf = (const uint8_t *)a[1];
+        if (s->type == SOCK_TYPE_UDP) {
+            if (s->local_port == 0 || a[4] == 0 || a[4] > 0xFFFF) return -1;
+            return net_udp_send(a[3], (uint16_t)a[4],
+                                s->local_port, buf, a[2]);
+        }
+        if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
+        /* 一时刻只允许一段未确认：上一段还没被 ACK 就先拒绝（真实的滑动
+         * 窗口要排队 + 拥塞控制，这里只求"丢了能重传"）。 */
+        if (s->rtx_len != 0) return -1;
+        if (a[2] > TCP_MSS) return -1;   /* 1536+头 > 1514 帧上限，rtl8139 拒收 */
+        if (!s->rtx && !tcp_bufs(s)) return -1;
+        for (uint32_t k = 0; k < a[2]; k++) s->rtx[k] = buf[k];
+        s->rtx_len = a[2];
+        /* 先推进 snd_nxt 再发送：段一旦上线，IRQ 可能立刻带着对端的
+         * ACK 回来——那时如果 snd_nxt 还是旧值，后续 ACK/重传全用错序号 */
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt += a[2];
+        if (tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, buf, a[2], seq) != 0) {
+            s->rtx_len = 0;                    /* 提交失败：回滚不留残状态 */
+            s->snd_nxt = seq;
+            return -1;
+        }
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;   /* 起重传定时器 */
+        s->rtx_tries = 0;
+        return (int)a[2];
+    }
+    case SC_RECVFROM: {
+        sock_t *s = sock_get(a[0]);
+        if (!s || a[2] == 0) return -1;
+        if (!uptr_ok(a[1], a[2], 1)) return -1;
+        uint8_t *buf = (uint8_t *)a[1];
+
+        int (*cond)(void *) = (s->type == SOCK_TYPE_UDP) ? cond_udp : cond_tcp;
+        if (!cond(s) && !wait_cond(cond, s, a[3])) return -1;
+
+        if (s->type == SOCK_TYPE_UDP) {
+            uint8_t hdr[8];
+            for (int k = 0; k < 8; k++) {
+                hdr[k] = s->rx[s->rx_r];
+                s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+            }
+            uint32_t dn = hdr[6] | ((uint32_t)hdr[7] << 8);
+            uint32_t n = (dn > a[2]) ? a[2] : dn;
+            for (uint32_t k = 0; k < n; k++) {
+                buf[k] = s->rx[s->rx_r];
+                s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+            }
+            for (uint32_t k = n; k < dn; k++)      /* 截断残余弹掉，保边界 */
+                s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+            if (a[4] && uptr_ok(a[4], 8, 1)) {
+                uint32_t *out = (uint32_t *)a[4];
+                out[0] = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                         ((uint32_t)hdr[2] << 8) | hdr[3];
+                out[1] = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8);
+            }
+            return (int)n;
+        }
+        /* TCP：字节流；对端 FIN 且读空 → 0（EOF） */
+        uint32_t n = 0;
+        while (n < a[2] && s->rx_r != s->rx_w) {
+            buf[n++] = s->rx[s->rx_r];
+            s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+        }
+        return (int)n;
+    }
+    case SC_CLOSE: {
+        sock_t *s = sock_get(a[0]);
+        if (!s) return -1;
+        return tcp_close(s);
+    }
+    default:
+        return -1;
+    }
+}
+
+/* ---------- 轮询 / 统计 ---------- */
+
+void net_poll(void) {
+    netdev_poll();
+    net_tick();          /* 系统调用上下文（IF=0，IRQ0 进不来）也要推进重传 */
+}
+
+/* ---------- 简易 HTTP 服务（网络上层演示） ----------
+ * 内核侧直接走 socket 内部 API（shell 是任务 0，不必绕 sockcall）。
+ * 服务一个连接即返回：教学演示 + E2E 都只需要一次 GET/200 往返，
+ * 常驻监听会让 shell 永久阻塞在 accept 上（无 Ctrl-C 中断机制）。 */
+int net_httpd_once(void) {
+    static const char resp[] =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><head><title>Cerulia</title></head><body>"
+        "<h1>Cerulia " EZOS_VERSION "</h1>"
+        "<p>Hello from a hand-written i686 kernel - "
+        "TCP/IP stack included, no libc required.</p>"
+        "</body></html>";
+
+    if (!build_ready()) return -1;
+    sock_t *c = 0;                             /* out: 处也要访问，先置空 */
+    sock_t *l = sock_alloc(SOCK_TYPE_TCP, 0);
+    if (!l) return -1;
+    if (!tcp_bufs(l)) { sock_free(l); return -1; }
+
+    l->local_port = 80;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        if (g_socks[i].used && &g_socks[i] != l && g_socks[i].local_port == 80) {
+            sock_free(l);                      /* 80 已被占用 */
+            return -1;
+        }
+    }
+    l->state = TS_LISTEN;
+
+    int rc = 0;
+    if (!wait_cond(cond_accept, l, 30000)) {
+        rc = 1;                                /* 30s 没人来连 */
+        goto out;
+    }
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (s->used && s->parent == (int)(l - g_socks) && s->state == TS_ESTABLISHED) {
+            c = s;
+            break;
+        }
+    }
+    if (!c) { rc = -1; goto out; }
+    c->parent = -1;                            /* 从监听者名下摘走 */
+
+    /* 等请求头到达再回（不解析内容：对 200 响应无关紧要） */
+    wait_cond(cond_tcp, c, 5000);
+
+    uint32_t len = sizeof(resp) - 1;
+    if (len > TCP_RTX_BUF || !tcp_bufs(c)) { rc = -1; goto out; }
+    for (uint32_t k = 0; k < len; k++) c->rtx[k] = (uint8_t)resp[k];
+    c->rtx_len = len;
+    uint32_t seq = c->snd_nxt;
+    c->snd_nxt += len;                         /* 同 SC_SENDTO：先推进再发送 */
+    if (tcp_send_seg_ex(c, TCP_PSH | TCP_ACK, c->rtx, len, seq) != 0) {
+        rc = -1; goto out;
+    }
+    c->rto_tick = g_pit_ticks + TCP_RTO_MS;    /* 响应也要能重传 */
+
+out:
+    tcp_close(l);
+    if (c) tcp_close(c);                       /* 发 FIN；对端回 ACK 后自动回收 */
+    return rc;
+}
+
+/* ==================================================================
+ * 内核内部 TCP 客户端 API（不经 sockcall）
+ *
+ * 为什么不用 net_sockcall：SC_SENDTO/SC_RECVFROM 开头是 uptr_ok()，
+ * 即用户指针校验。内核自己用（shell 是 task 0、http.c 跑在内核态）传
+ * 的是内核地址，会被判非法直接 -1。所以这里另开一套直接操作 sock_t
+ * 的入口，**不做指针校验**——代价是调用方必须自己保证指针有效，
+ * 因此只给内核内部模块用，不导出到用户态 ABI。
+ *
+ * 与 sockcall 的差别仅此一项，连接/发送/接收的语义完全一致
+ * （含"一时刻只允许一段未确认"这条硬约束）。
+ * ================================================================== */
+
+/* 发完一段、等着对方 ACK 的条件：rtx 清空即已确认。
+ * 半关闭（对端已 FIN，我们还能发）也算可以继续。 */
+static int cond_sent(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->rtx_len == 0 ||
+           s->state == TS_FIN_WAIT_1 || s->state == TS_FIN_WAIT_2;
+}
+
+int net_tcp_connect(uint32_t dst_ip_be, uint16_t port, uint32_t timeout_ms) {
+    if (!build_ready()) return -1;
+    if (dst_ip_be == 0 || port == 0) return -1;
+
+    sock_t *s = sock_alloc(SOCK_TYPE_TCP, 0);
+    if (!s) return -1;
+
+    /* 临时端口：从游标往上找第一个未被占用的（与 SC_CONNECT 同策略）。
+     * 失败路径统一走 fail，直接 sock_free —— 不能留半初始化的表项，
+     * 否则 sock_alloc 的懒回收会把 owner_pid=0（内核）当常驻条目留着。 */
+    uint16_t local = 0;
+    for (int tries = 0; tries < 200 && local == 0; tries++) {
+        uint16_t cand = g_ephemeral++;
+        if (cand < 40000u) g_ephemeral = 40000u;
+        int conflict = 0;
+        for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
+            if (g_socks[i].used && g_socks[i].local_port == cand) { conflict = 1; break; }
+        if (!conflict) local = cand;
+    }
+    if (local == 0) { sock_free(s); return -1; }
+    if (!tcp_bufs(s)) { sock_free(s); return -1; }
+
+    s->local_port = local;
+    s->peer_ip   = dst_ip_be;
+    s->peer_port = port;
+    s->got_fin   = 0;
+    s->rx_r = s->rx_w = 0;
+    s->rcv_nxt = 0;
+    s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;   /* ISN：教学取舍 */
+    s->snd_una = s->snd_nxt;
+    s->state = TS_SYN_SENT;
+    s->syn_unacked = 1;
+
+    /* 先解析对端 MAC（可能睡等 ARP reply）再起重传定时器并发 SYN：
+     * 顺序反了会让定时器在 MAC 还没解析完时就白跑一趟重传。 */
+    if (arp_resolve_peer(s->peer_ip, 3000) == 0) { sock_free(s); return -1; }
+    s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+    s->rtx_tries = 0;
+    {
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt = seq + 1;
+        tcp_send_seg_ex(s, TCP_SYN, 0, 0, seq);
+    }
+
+    if (!wait_cond(cond_connected, s, timeout_ms)) { sock_free(s); return -1; }
+    return (int)(s - g_socks);
+}
+
+int net_tcp_send(int sid, const void *buf, uint32_t len, uint32_t timeout_ms) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (!s || !buf || len == 0) return -1;
+    if (s->type != SOCK_TYPE_TCP) return -1;
+    if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    uint32_t sent = 0;
+    while (sent < len) {
+        /* 无滑动窗口：上一段没被 ACK 就必须等，否则 rtx 缓冲不够用 */
+        if (s->rtx_len != 0) {
+            if (!wait_cond(cond_sent, s, timeout_ms)) return -1;
+            if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
+        }
+        uint32_t n = len - sent;
+        if (n > TCP_MSS) n = TCP_MSS;
+        if (!s->rtx && !tcp_bufs(s)) return -1;
+        for (uint32_t k = 0; k < n; k++) s->rtx[k] = p[sent + k];
+        s->rtx_len = n;
+        /* 先推进 snd_nxt 再发送：段一上线 IRQ 可能立刻带回 ACK，
+         * 那时 snd_nxt 若还是旧值，后续 ACK/重传全用错序号 */
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt += n;
+        if (tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, s->rtx, n, seq) != 0) {
+            s->rtx_len = 0;                  /* 回滚，不留残状态 */
+            s->snd_nxt = seq;
+            return -1;
+        }
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+        s->rtx_tries = 0;
+        sent += n;
+    }
+    return (int)sent;
+}
+
+int net_tcp_recv(int sid, void *buf, uint32_t maxlen, uint32_t timeout_ms) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (!s || !buf || maxlen == 0) return -1;
+    if (s->type != SOCK_TYPE_TCP) return -1;
+
+    if (!cond_tcp(s) && !wait_cond(cond_tcp, s, timeout_ms)) return -1;
+
+    uint8_t *out = (uint8_t *)buf;
+    uint32_t n = 0;
+    while (n < maxlen && s->rx_r != s->rx_w) {
+        out[n++] = s->rx[s->rx_r];
+        s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+    }
+    /* n==0 且条件满足 => 对端 FIN 且环已空 = 正常 EOF（不是错误） */
+    return (int)n;
+}
+
+void net_tcp_close(int sid) {
+    sock_t *s = sock_get((uint32_t)sid);
+    if (s && s->type == SOCK_TYPE_TCP) tcp_close(s);
+}
+
+uint32_t net_udp_rx(void)      { return g_udp_rx; }
+uint32_t net_udp_tx(void)      { return g_udp_tx; }
+uint32_t net_tcp_rx(void)      { return g_tcp_rx; }
+uint32_t net_tcp_tx(void)      { return g_tcp_tx; }
+uint32_t net_tcp_rtx(void)     { return g_tcp_rtx; }
+uint32_t net_arp_replied(void) { return g_arp_replied; }
+uint32_t net_icmp_replied(void) { return g_icmp_replied; }
+/* 收包侧被 fail closed 丢掉的 IPv4 报文：校验和错 + 分片（无重组） */
+uint32_t net_ip_drops(void) { return g_ip_bad_csum + g_ip_frag_drop; }
+uint32_t net_arp_entries(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < ARP_CACHE; i++) if (g_arp[i].ip != 0) n++;
+    return n;
+}
+uint32_t net_ping_reqs(void)   { return g_ping_reqs; }
+uint32_t net_ping_matched(void){ return g_ping_matched; }
+uint32_t net_sock_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) if (g_socks[i].used) n++;
+    return n;
+}

@@ -1,0 +1,47 @@
+﻿== test_ntp: SNTP client ==
+-- A ok --
+D:\Python315\python3.15t.exe : D:\MyOS\tools\qemu-portable-20241220\qemu-system-x86_64.exe: -serial tcp:127.0.0.1:4418,
+server,wait: info: QEMU waiting for connection on: disconnected:tcp:127.0.0.1:4418,server=on
+所在位置 行:15 字符: 2025
++ ... st_dns")) { D:\Python315\python3.15t.exe -u tests\$t.py *> out_$t.txt ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\MyOS\tools\q...:4418,server=on:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+D:\MyOS\src\tests\test_ntp.py:229: DeprecationWarning: datetime.datetime.utcfromtimestamp() is deprecated and scheduled
+ for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.fromtimes
+tamp(timestamp, datetime.UTC).
+  return datetime.datetime.utcfromtimestamp(TEST_UNIX).strftime("%Y-%m-%d %H:%M:%S")
+   FAIL reported a result
+   FAIL unix seconds exact
+   FAIL utc date+time exact
+   PASS fraction was dropped (no fake precision)
+   FAIL server really got one request
+-- B silent --
+D:\MyOS\tools\qemu-portable-20241220\qemu-system-x86_64.exe: -serial tcp:127.0.0.1:4421,server,wait: info: QEMU waiting
+ for connection on: disconnected:tcp:127.0.0.1:4421,server=on
+Traceback (most recent call last):
+  File "D:\MyOS\src\tests\test_ntp.py", line 346, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "D:\MyOS\src\tests\test_ntp.py", line 335, in main
+    res = fn()
+  File "D:\MyOS\src\tests\test_ntp.py", line 289, in case_silent
+    ok, out = run_cmd(qmp, serial, "ntp 10.0.2.2", "ntp:", 40.0)
+              ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 237, in run_cmd
+    qmp.type_line(cmd)
+    ~~~~~~~~~~~~~^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 192, in type_line
+    self.hmc("sendkey " + key)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 185, in hmc
+    return self.cmd("human-monitor-command", **{"command-line": c})
+           ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 176, in cmd
+    self.f.flush()
+    ~~~~~~~~~~~~^^
+  File "D:\Python315\Lib\socket.py", line 756, in write
+    return self._sock.send(b)
+           ~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。

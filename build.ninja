@@ -1,0 +1,331 @@
+# ===================== 多线程构建说明 =====================
+# 用法：ninja -f build.ninja -j$(NUMBER_OF_PROCESSORS) os-image.bin
+#   或：ninja -f build.ninja -j8 run
+# ninja 默认单线程，-j N 指定并行任务数；bat 脚本已自动传 -j%NUMBER_OF_PROCESSORS%
+# ===================== ????? =====================
+BIN_DIR = D:/MyOS/tools/i686-elf-tools-windows/bin
+ASM     = D:/MyOS/tools/NASM/nasm.exe
+QEMU    = D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe
+
+CC      = $BIN_DIR/i686-elf-gcc.exe
+LD      = $BIN_DIR/i686-elf-ld.exe
+OBJCOPY = $BIN_DIR/i686-elf-objcopy.exe
+ZIG     = D:/MyOS/tools/zig/zig-x86_64-windows-0.15.1/zig.exe
+CARGO   = C:/Users/admin/.cargo/bin/cargo.exe
+
+# ===================== ?????? =====================
+# -O2：见 ci/build.sh 里的同一段说明。**必须和 CI 保持一致**——两边都是
+# -O2。窗口已扩到 576KB（镜像 0x10000..0xA0000；0xA0000 是 VGA aperture；
+# 主栈搬到 1MB..2MB）。以前主栈占着 0x90000，窗口只有 496KB，只能靠 -Os 硬
+# 压换余量——那是拿代码质量换体积，现在不用了。
+#
+# -fno-align-*：只删掉函数/循环/跳转的 16 字节对齐填充（本机实测 -22.7KB），
+# **不动优化档位**——和 -Os 的区别是 -Os 改优化策略，这只是不凑边界。
+CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD -fno-align-functions -fno-align-loops -fno-align-jumps
+LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
+
+# ===================== ???? =====================
+rule asm_bin
+    command = $ASM -f bin $in -o $out
+    description = NASM(bin) $in
+
+rule asm_elf
+    command = $ASM -f elf32 $in -o $out
+    description = NASM(elf) $in
+
+rule cc
+    command = $CC $CFLAGS -MF $out.d -c $in -o $out
+    description = CC $in
+    depfile = $out.d
+    deps = gcc
+
+rule link
+    command = $LD $LDFLAGS -o $out $in
+    description = LINK $out
+
+# ---- 非 C 语言模块（增量试验，见 kernel/rust_bridge.h）----
+# Rust: #![no_std] staticlib，自定义 target i686-ezos.json + -Z build-std
+#   （stable 上要靠 RUSTC_BOOTSTRAP=1 打开 -Z）。RUSTFLAGS 里没有别的依赖。
+# Zig:  x86-freestanding build-obj，产出的 .o 没有任何外部符号引用。
+# 两者都只提供纯计算函数，**不持有内核资源**，链接顺序放在最后即可。
+rule cargo_rs
+    command = cmd /c cd rust\ezos_rs&& set RUSTC_BOOTSTRAP=1&& $CARGO build --release -Z build-std=core,compiler_builtins -Zjson-target-spec --target ../i686-ezos.json
+    description = CARGO libezos_rs.a
+
+rule zig_obj
+    # zig 把 .o 输出到**当前目录**（不接受 -o），所以先 cd 进源目录，
+    # 产物路径才能和下面的 build 行对上。
+    #
+    # -mcpu i686 不能省：默认的 baseline 档允许 SSE2，编译器的
+    # 向量化会生成 movdqa/movaps。内核只做 fninit（x87），从不设
+    # CR4.OSFXSR、也不保存 SSE 上下文——那些指令必然 #UD。
+    # 实测踩过：levenshtein_zig 里一个定长数组的清零被编成 6 条
+    # movdqa，一进 rstest 就 panic（vector 06 Invalid Opcode）。
+    # Rust 侧早就用 target features "-mmx,-sse" 关掉了，这里要对齐。
+    # tools/check_cpu.py 会在回归里核实产物里没有 SSE 指令。
+    command = cmd /c cd rust\ezos_zig&& $ZIG build-obj -target x86-freestanding -mcpu i686 -O ReleaseSafe ezos_zig.zig
+    description = ZIG rust/ezos_zig/ezos_zig.zig
+
+build rust/ezos_rs/target/i686-ezos/release/libezos_rs.a: cargo_rs rust/ezos_rs/src/lib.rs rust/i686-ezos.json
+    pool = console
+
+build rust/ezos_zig/ezos_zig.o: zig_obj rust/ezos_zig/ezos_zig.zig
+    pool = console
+
+# ---- 用户态程序（步骤 5c）：静态 ELF32，链接到 USER_IMAGE_BASE，
+#      保留 ELF 结构（不能 --oformat binary），-s 去掉符号表以缩小体积 ----
+rule cc_user
+    command = $CC -ffreestanding -Os -Wall -Wextra -Iuser -MMD -MF $out.d -c $in -o $out
+    description = CC-USER $in
+    depfile = $out.d
+    deps = gcc
+
+rule link_user
+    command = $LD -m elf_i386 -s -T user/user.ld -o $out $in
+    description = LINK-USER $out
+
+rule cc_bootstrap
+    command = $CC -ffreestanding -Os -Wall -Wextra -Werror -fno-strict-aliasing -fwrapv -fno-pie -fno-pic -fno-stack-protector -Iuser -MMD -MF $out.d -c $in -o $out
+    depfile = $out.d
+    deps = gcc
+    description = CC-BOOTSTRAP $in
+
+rule cc_large_libc
+    command = $CC -ffreestanding -Os -Wall -Wextra -DHEAP_SIZE=524288 -Iuser -MMD -MF $out.d -c $in -o $out
+    depfile = $out.d
+    deps = gcc
+    description = CC-LIBC $in
+
+rule link_cc_runtime
+    command = $LD -m elf_i386 -T user/cc_runtime.ld -o $out $in
+    description = LINK-CC-RUNTIME $out
+
+rule pack_cc_runtime
+    command = cmd /c python tools/make_cc_runtime.py $in $out
+    description = PACK-CC-RUNTIME $out
+
+rule make_image
+    # 内核镜像大小是动态的：tools/make_image.py 按 kernel_raw.bin 的真实大小
+    # 算扇区数（向上取整 + 凑偶数，上限从 boot/layout.inc 解析 = 3MB 窗口），
+    # 把扇区数写进引导扇区偏移 0x1FC 的保留字段，boot/stage2.asm 运行时从内存
+    # 读它 —— stage2 开 unreal mode 把内核搬到 KERNEL_DST（19MB），所以上限
+    # 不再由 BIOS 的 20 位地址决定。三条契约：
+    #   boot/boot.asm + boot/stage2.asm（读 0x1FC）、
+    #   tools/make_image.py（写 0x1FC）、
+    #   uefi/main.c（UEFI 无引导扇区，直接用文件真实大小）
+    # 旧做法 objcopy --pad-to 507904 已废弃：镜像永远占满 496KB，且大小一变
+    # 就要手改 boot.asm 的 KERNEL_SECTORS。
+    command = cmd /c python tools/make_image.py boot/boot.bin boot/stage2.bin kernel_raw.bin kernel.bin os-image.bin
+    description = BUILD os-image.bin
+
+rule make_sysvol
+    # 系统卷数据源：把 user/*.elf 编成 kernel/sysvol_data.c（内置只读卷 /bin + /system）
+    command = cmd /c python tools/make_sysvol.py
+    description = SYSVOL kernel/sysvol_data.c
+
+rule make_disk
+    # 数据盘镜像**直接就是固定 VHD**：gen_diskimg.py 把镜像字节写在文件头
+    # （偏移 0），尾部追加 512 字节 Hard Disk Footer（conectix）。所以同一个
+    # disk.vhd 既能被 Windows 双击挂载（需 UAC 提权），也能给 QEMU 当 raw 盘
+    # ——尾巴那 512 字节内核永远读不到。想单独转换一个 raw 镜像时用
+    # tools/make_vhd.py。
+    # disk.vhd is live user data, not a disposable build artifact.
+    command = cmd /c python tools/gen_diskimg.py disk.vhd --if-missing
+    description = BUILD disk.vhd
+    restat = 1
+
+rule make_usb
+    # 真机 U 盘镜像：LBA0 是带 BPB + 活动 EFI 分区表项的 MBR（真机 BIOS 要 BPB
+    # 才认介质，UEFI 认分区里的 IA32/X64 EFI 加载器），LBA1 起是 stage2+内核，
+    # 引导扇区副本与 ESP 的位置由 make_usb_image.py 按内核上限动态算出来
+    # （写死 1024/2048 会被 3MB 的内核盖掉）。QEMU 自检跑
+    # tests/test_usbboot.py（legacy + OVMF 两条路）。
+    command = cmd /c python tools/make_usb_image.py --require-x64
+    description = BUILD usb-image.bin
+
+rule run_qemu
+    # -icount shift=auto: 虚拟时钟跟踪真实时间（否则 portable QEMU 非 icount 模式
+    # 下虚拟时钟仅按 vCPU 执行进度推进，PIT 实测只有 ~7% 实时，游戏/计时全慢）
+    # 步骤 7 起默认挂 rtl8139（user-net：guest 10.0.2.15 / 宿主 10.0.2.2）。
+    # 无网卡环境下 rtl8139_init 静默跳过，不影响启动。宿主转发（hostfwd
+    # tcp/udp 7000-7001）由 temp/test_step7_sock.py 自带——不放这里，
+    # 常驻 hostfwd 在端口被占时会直接拒绝 QEMU 启动。
+    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd -netdev user,id=n0 -device rtl8139,netdev=n0
+    description = RUN EZOS
+
+# ===================== ???? =====================
+build boot/boot.bin: asm_bin boot/boot.asm | boot/layout.inc
+# stage2：把内核搬到 1MB 以上（低 1MB 只有 576KB 可用，撑不住内核了）。
+# layout.inc 是**隐式**依赖：它被 %include 进来但不在命令行上（asm_bin 的 $in
+# 会把所有显式输入都喂给 nasm）。
+build boot/stage2.bin: asm_bin boot/stage2.asm | boot/layout.inc
+build boot/kernel_entry.o: asm_elf boot/kernel_entry.asm
+build boot/task_switch.o: asm_elf boot/task_switch.asm
+build kernel/bios_thunk_asm.o: asm_elf kernel/bios_thunk.asm
+
+build kernel/kernel.o: cc kernel/kernel.c
+build kernel/tty.o: cc kernel/tty.c
+build kernel/textenc.o: cc kernel/textenc.c
+build kernel/mem.o: cc kernel/mem.c
+build kernel/idt.o: cc kernel/idt.c
+build kernel/isr.o: cc kernel/isr.c
+build kernel/paging.o: cc kernel/paging.c
+build kernel/pmm.o: cc kernel/pmm.c
+build kernel/elf.o: cc kernel/elf.c
+build kernel/exec.o: cc kernel/exec.c
+build kernel/task.o: cc kernel/task.c
+build kernel/fd.o: cc kernel/fd.c
+build kernel/fpu.o: cc kernel/fpu.c
+build kernel/calc.o: cc kernel/calc.c
+build kernel/gdt.o: cc kernel/gdt.c
+build kernel/syscall.o: cc kernel/syscall.c
+build kernel/panic.o: cc kernel/panic.c
+build kernel/kmalloc.o: cc kernel/kmalloc.c
+build kernel/dmesg.o: cc kernel/dmesg.c
+build kernel/fsck.o: cc kernel/fsck.c
+build kernel/user.o: cc kernel/user.c
+build kernel/auth.o: cc kernel/auth.c
+build kernel/trash.o: cc kernel/trash.c
+build kernel/reg.o: cc kernel/reg.c
+build kernel/serial.o: cc kernel/serial.c
+build kernel/acpi.o: cc kernel/acpi.c
+build kernel/ahci.o: cc kernel/ahci.c
+build kernel/nvme.o: cc kernel/nvme.c
+build kernel/keyboard.o: cc kernel/keyboard.c
+build kernel/ata.o: cc kernel/ata.c
+build kernel/pci.o: cc kernel/pci.c
+build kernel/rtc.o: cc kernel/rtc.c
+build kernel/usb.o: cc kernel/usb.c
+build kernel/lockselftest.o: cc kernel/lockselftest.c
+build kernel/uhci.o: cc kernel/uhci.c
+build kernel/usbenum.o: cc kernel/usbenum.c
+build kernel/usbkbd.o: cc kernel/usbkbd.c
+build kernel/usbmsc.o: cc kernel/usbmsc.c
+build kernel/usbmouse.o: cc kernel/usbmouse.c
+build kernel/ehci.o: cc kernel/ehci.c
+build kernel/xhci.o: cc kernel/xhci.c
+build kernel/usbhc.o: cc kernel/usbhc.c
+build kernel/rtl8139.o: cc kernel/rtl8139.c
+build kernel/e1000.o: cc kernel/e1000.c
+build kernel/net.o: cc kernel/net.c
+build kernel/http.o: cc kernel/http.c
+build kernel/webview.o: cc kernel/webview.c
+build kernel/shell.o: cc kernel/shell.c
+build kernel/shell_extra.o: cc kernel/shell_extra.c
+build kernel/exfat.o: cc kernel/exfat.c
+build kernel/fat.o: cc kernel/fat.c
+build kernel/fs.o: cc kernel/fs.c
+build kernel/sysvol_data.c: make_sysvol user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf user/dirwalk.elf user/cc.elf | tools/make_sysvol.py kernel/version.h
+build kernel/sysvol.o: cc kernel/sysvol.c
+build kernel/sysvol_data.o: cc kernel/sysvol_data.c
+build kernel/ext4.o: cc kernel/ext4.c
+build kernel/ntfs.o: cc kernel/ntfs.c
+build kernel/f2fs.o: cc kernel/f2fs.c
+build kernel/erofs.o: cc kernel/erofs.c
+build kernel/refs.o: cc kernel/refs.c
+build kernel/div64.o: cc kernel/div64.c
+build kernel/oomtest.o: cc kernel/oomtest.c
+build kernel/stackchk.o: cc kernel/stackchk.c
+build kernel/sysinfo.o: cc kernel/sysinfo.c
+build kernel/gfx.o: cc kernel/gfx.c
+build kernel/bios_thunk.o: cc kernel/bios_thunk.c
+build kernel/gui.o: cc kernel/gui.c
+build kernel/mouse.o: cc kernel/mouse.c
+build kernel/gfxwin.o: cc kernel/gfxwin.c
+build kernel/cjk.o: cc kernel/cjk.c
+build kernel/cjk_font.o: cc kernel/cjk_font.c
+build kernel/desktop.o: cc kernel/desktop.c
+build kernel/games.o: cc kernel/games.c
+build kernel/hiscore.o: cc kernel/hiscore.c
+
+build user/crt0.o: asm_elf user/crt0.asm
+build user/libc.o: cc_user user/libc.c
+build user/hello.o: cc_user user/hello.c
+build user/hello.elf: link_user user/crt0.o user/hello.o user/libc.o | user/user.ld
+build user/forktest.o: cc_user user/forktest.c
+build user/forktest.elf: link_user user/crt0.o user/forktest.o user/libc.o | user/user.ld
+build user/fdtest.o: cc_user user/fdtest.c
+build user/fdtest.elf: link_user user/crt0.o user/fdtest.o user/libc.o | user/user.ld
+build user/spin.o: cc_user user/spin.c
+build user/spin.elf: link_user user/crt0.o user/spin.o user/libc.o | user/user.ld
+build user/fdleak.o: cc_user user/fdleak.c
+build user/fdleak.elf: link_user user/crt0.o user/fdleak.o user/libc.o | user/user.ld
+build user/netecho.o: cc_user user/netecho.c
+build user/netecho.elf: link_user user/crt0.o user/netecho.o | user/user.ld
+build user/nettcp.o: cc_user user/nettcp.c
+build user/nettcp.elf: link_user user/crt0.o user/nettcp.o | user/user.ld
+build user/segprobe.o: cc_user user/segprobe.c
+build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
+build user/netcli.o: cc_user user/netcli.c
+build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
+build user/dirwalk.o: cc_user user/dirwalk.c
+build user/dirwalk.elf: link_user user/crt0.o user/dirwalk.o user/libc.o | user/user.ld
+build user/cc_runtime_entry.o: asm_elf user/cc_runtime.asm
+build user/cc_runtime.o: cc_user user/cc_runtime.c
+build user/cc_runtime.elf: link_cc_runtime user/cc_runtime_entry.o user/cc_runtime.o | user/cc_runtime.ld
+build user/cc_runtime_data.h: pack_cc_runtime user/cc_runtime.elf | tools/make_cc_runtime.py
+build user/cc.o: cc_bootstrap user/cc.c | user/cc_runtime_data.h
+build user/cc_libc.o: cc_large_libc user/libc.c
+build user/cc.elf: link_user user/crt0.o user/cc.o user/cc_libc.o | user/user.ld
+
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/xhci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/http.o kernel/webview.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/user.o kernel/auth.o kernel/trash.o kernel/reg.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/bios_thunk.o kernel/bios_thunk_asm.o kernel/cjk.o kernel/cjk_font.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
+
+build kernel.bin os-image.bin: make_image boot/boot.bin boot/stage2.bin kernel_raw.bin tools/make_image.py boot/layout.inc
+
+build disk.vhd: make_disk tools/gen_diskimg.py
+
+build boot/mbr_usb.bin: asm_bin boot/mbr_usb.asm
+build usb-image.bin: make_usb os-image.bin kernel.bin boot/mbr_usb.bin tools/make_usb_image.py | uefi/esp/EFI/BOOT/BOOTIA32.EFI uefi/esp/EFI/BOOT/BOOTX64.EFI
+
+build run: run_qemu os-image.bin disk.vhd
+
+# 静态扫描：专挑 -Wall -Wextra 管不了的那类（禁函数、分配不检查、
+# memcpy 长度写成 sizeof(指针)）。故意不进 default——它是"人看一眼"的工具，
+# 不该让一次手滑的 WARN 挡住真机写盘。用法：ninja lint
+rule lint
+    command = cmd /c python tools/lint.py
+    description = LINT kernel+user
+
+build lint: lint tools/lint.py
+
+# 栈帧预算：内核主栈 1MB（0x100000..0x200000）、任务内核栈 TASK_KSIZE 16KB，
+# 栈上放大数组会**静默写穿紧邻的 .data**（历史 bug：shell.c cmd_ls 的
+# fs_dir_entry_t entries[64] = 16.9KB 覆盖了 fs.c 的 ro_cwd，症状是提示符变
+# [A.TXT]、cat/write 全挂，伪装成文件系统损坏）。同 lint 一样不进 default。
+# 用法：ninja stack
+rule stack_check
+    command = cmd /c python tools/check_stack.py
+    description = STACK kernel stack budget
+
+build stack: stack_check tools/check_stack.py
+
+# 编码闸门：源文件必须是合法 UTF-8、不能有 U+FFFD 或"拷"字乱码。历史上有
+# 9 个文件的注释被 GBK/UTF-8 来回转码碾过（4001 处），重写完必须守住——
+# 这个检查纯扫字节、几秒就完事。用法：ninja enc
+rule enc_check
+    command = cmd /c python tools/check_encoding.py
+    description = ENCODING utf-8 clean
+
+build enc: enc_check tools/check_encoding.py
+
+# 命令表/help 一致性：shell 命令表里出现的每个命令都必须在 cmd_help 的
+# 详细条目里有对应分支（否则用户敲 `help xxx` 会掉进 "unknown command"，
+# 等于手册缺页）。纯扫源码、秒级。用法：ninja helpchk
+rule help_check
+    command = cmd /c python tools/check_help.py
+    description = HELP command table vs help entries
+
+build helpchk: help_check tools/check_help.py
+
+# VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
+# 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
+rule make_vmware
+    command = cmd /c python tools/make_vmware.py
+    description = VMWARE vmware/ezos.vmx
+
+build vmware: make_vmware usb-image.bin tools/make_vmware.py
+
+default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf user/dirwalk.elf disk.vhd usb-image.bin
+
+build clean: phony
+    command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

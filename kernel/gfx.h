@@ -1,0 +1,62 @@
+#ifndef GFX_H_INC
+#define GFX_H_INC
+
+#include "types.h"
+
+/* 运行时屏幕分辨率：VBE 多分辨率 LFB（boot.asm 探测存入 0x5000）或回退 VGA 0x13 320x200 */
+extern int GFX_W;
+extern int GFX_H;
+/* 帧缓冲基址：VBE LFB（boot.asm 存入 0x5000 结构首字段）或 0xA0000 */
+extern uint8_t *gfx_fb;
+/* 每像素字节数：1=VGA 0x13 8bpp，2=VBE 16bpp RGB565 */
+extern int gfx_bpp;
+/* U3: scanline stride in pixels (VBE path = width; UEFI GOP PixelsPerScanLine may exceed width) */
+extern int gfx_stride;
+/* U3: 32bpp direct color LUT (index -> 0xAARRGGBB, channel order per gfx_fmt) */
+extern uint32_t gfx_palette32[256];
+/* U3: 32bpp channel order: 1=BGRA (GOP fmt=1, QEMU), 0=RGBA (GOP fmt=0) */
+extern int gfx_fmt;
+/* 颜色索引 -> RGB565 查找表（VBE 16bpp 模式使用；8bpp 走 DAC 调色板） */
+extern uint16_t gfx_palette16[256];
+
+/* boot.asm 在实模式 VBE 探测后写入 0x5000 的结构：
+ *   0x5000: dword LFB 物理地址（0 = 无可用模式，内核回退 VGA 0x13）
+ *   0x5004: word  XRES
+ *   0x5006: word  YRES
+ *   0x5008: byte  BPP（16 = 16bpp RGB565）
+ *   0x500A: word  选中的 VBE 模式号（bios_thunk 实模式回切设模式用） */
+
+/* 调试/E2E 旁路：置 1 后 gfx_init / gfx_restore_text 跳过 Bochs DISPI
+ * 寄存器路径，强制走 bios_thunk 实模式回切 INT 10h——VMware/真机路径
+ * 在 QEMU 上的唯一可测入口（shell 命令 "vbetest force" 设置）。 */
+extern int gfx_skip_dispi;
+
+void gfx_init(void);            // 初始化图形模式（优先 VBE 多分辨率 LFB，失败回退 VGA 0x13 320x200）
+void gfx_restore_text(void);    // 恢复 80x25 文本模式
+void gfx_text_font_init(void);  // 启动时把内置 8x16 字体写入 VGA plane 2，统一文本模式字体
+void gfx_set_palette(void);     // 设置 256 色调色板
+/* 主题强调色刷新 Win10 调色板槽位 F0/F1/F2（8bpp 走 DAC，16/32bpp 走 LUT）。
+ * 切主题时 gfxwin 调用；此前只有 8bpp 的 DAC 被刷新，16bpp 的
+ * gfx_palette16[0xF0..0xF2] 永远是 gfx_set_palette 的默认蓝。 */
+void gfx_theme_accent(uint32_t accent);
+void gfx_load_font(void);       // 从 VGA 字体 ROM 读取 8x8 字体
+void gfx_putpixel(int x, int y, uint8_t color);
+void gfx_fill_rect(int x, int y, int w, int h, uint8_t color);
+void gfx_draw_rect(int x, int y, int w, int h, uint8_t color);
+/* 裁剪矩形：所有绘制都生效（浏览器滚动页面必需，否则文字画到窗口外）。
+ * gfx_set_clip(-1,-1,0,0) 取消裁剪。 */
+void gfx_set_clip(int x, int y, int w, int h);
+void gfx_get_clip(int *x, int *y, int *w, int *h);
+void gfx_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg);
+void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg);
+void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int scale);
+/* UTF-8 文本绘制：多字节序列画成占位方块（内置 8x8 字模只有 ASCII，
+ * 真画不出汉字）。返回结束后的 x —— 调用方需要它算宽度。 */
+int  gfx_draw_text_utf8(int x, int y, const char *s, uint32_t n,
+                        uint8_t fg, uint8_t bg);
+int  gfx_text_width_utf8(const char *s, uint32_t n);   /* 显示宽度（像素） */
+void gfx_clear(uint8_t color);
+void gfx_menu(void);          // 图形界面菜单（原 shell.c cmd_gfx迁移）
+int gfx_eval(const char *s, int *ok); // 表达式求值器（图形计算器与 shell calc 共用）
+
+#endif

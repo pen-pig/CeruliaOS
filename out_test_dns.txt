@@ -1,0 +1,34 @@
+﻿== test_dns: DNS resolver (A record) ==
+-- A same-subnet DNS --
+D:\Python315\python3.15t.exe : Traceback (most recent call last):
+所在位置 行:15 字符: 2025
++ ... st_dns")) { D:\Python315\python3.15t.exe -u tests\$t.py *> out_$t.txt ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\MyOS\src\tests\test_dns.py", line 712, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "D:\MyOS\src\tests\test_dns.py", line 701, in main
+    res = fn()
+  File "D:\MyOS\src\tests\test_dns.py", line 434, in case_local
+    ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+              ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 237, in run_cmd
+    qmp.type_line(cmd)
+    ~~~~~~~~~~~~~^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 192, in type_line
+    self.hmc("sendkey " + key)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 185, in hmc
+    return self.cmd("human-monitor-command", **{"command-line": c})
+           ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\MyOS\src\tests\test_nvme.py", line 178, in cmd
+    r = self._read()
+  File "D:\MyOS\src\tests\test_nvme.py", line 166, in _read
+    line = self.f.readline()
+  File "D:\Python315\Lib\socket.py", line 738, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
