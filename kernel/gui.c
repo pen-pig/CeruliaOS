@@ -4,6 +4,7 @@
  * 功能不变：About / Show Time / Exit 三项文本菜单
  */
 #include "gui.h"
+#include "version.h"
 #include "tty.h"
 #include "keyboard.h"
 #include "port.h"
@@ -90,7 +91,7 @@ static void gui_about(void)
     fill_range(wy + 1, wx + 1, ww - 2, C_TITLE, ' ');
     puts_at(wy + 1, wx + 3, C_TITLE, "About Cerulia");
     fill_range(wy + 2, wx + 1, ww - 2, C_ACCENT, BOX_H[0]);
-    puts_at(wy + 4, wx + 5, C_TEXT, "Cerulia v0.3-gui");
+    puts_at(wy + 4, wx + 5, C_TEXT, "Cerulia v" EZOS_VERSION);
     puts_at(wy + 5, wx + 5, C_NORMAL, "A simple OS written from scratch.");
     puts_at(wy + 7, wx + 5, C_DIM, "Press Enter to return.");
     wait_enter();

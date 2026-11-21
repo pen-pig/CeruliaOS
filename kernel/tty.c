@@ -15,6 +15,7 @@ static uint8_t terminal_color;
 static char *g_capture_buf = NULL;
 static int g_capture_len = 0;
 static int g_capture_max = 0;
+static int g_capture_overflow = 0;
 static void (*g_gfx_hook)(const char *) = NULL;
 
 void terminal_set_gfx_hook(void (*fn)(const char *)) {
@@ -24,6 +25,7 @@ void terminal_set_gfx_hook(void (*fn)(const char *)) {
 void terminal_begin_capture(char *buf, int max) {
     g_capture_buf = buf;
     g_capture_len = 0;
+    g_capture_overflow = 0;
     g_capture_max = max;
 }
 
@@ -33,7 +35,7 @@ int terminal_end_capture(void) {
     if (g_capture_buf && g_capture_len < g_capture_max) g_capture_buf[g_capture_len] = '\0';
     g_capture_buf = NULL;
     g_capture_max = 0;
-    return n;
+    return g_capture_overflow ? -1 : n;
 }
 static uint16_t* terminal_buffer;
 static uint16_t gop_cells[VGA_WIDTH * VGA_HEIGHT];
@@ -202,19 +204,7 @@ void terminal_putchar(char c) {
     if (g_capture_buf) {
         if (g_capture_len < g_capture_max - 1) {
             g_capture_buf[g_capture_len++] = c;
-        }
-        /* 捕获模式下也要更新行列状态，保证执行位置与光标一致 */
-        if (c == '\n') {
-            terminal_column = 0;
-            if (terminal_row < VGA_HEIGHT - 1) terminal_row++;
-        } else if (c == '\r') {
-            terminal_column = 0;
-        } else if (c == '\t') {
-            terminal_column = (terminal_column + 4) & ~3;
-            if (terminal_column >= VGA_WIDTH) { terminal_column = 0; if (terminal_row < VGA_HEIGHT - 1) terminal_row++; }
-        } else {
-            if (++terminal_column == VGA_WIDTH) { terminal_column = 0; if (terminal_row < VGA_HEIGHT - 1) terminal_row++; }
-        }
+        } else g_capture_overflow = 1;
         return;
     }
     /* H1a：控制台输出同步镜像到 COM1——真机无显存时仍能看到全部交互，
@@ -287,7 +277,7 @@ void terminal_write(const char* data, size_t size) {
 }
 
 void terminal_writestring(const char* data) {
-    if (g_gfx_hook) {
+    if (g_gfx_hook && !g_capture_buf) {
         g_gfx_hook(data);
         return;
     }

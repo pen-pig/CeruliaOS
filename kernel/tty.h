@@ -38,6 +38,7 @@ int  terminal_in_scrollback(void);
 
 /* 输出捕获模式：重定向/管道使用 */
 void terminal_begin_capture(char *buf, int max);
+/* Number captured, or -1 if the output did not fit. */
 int terminal_end_capture(void);
 
 /* GUI 模式输出重定向：注册后 terminal_writestring/terminal_putchar 不再写

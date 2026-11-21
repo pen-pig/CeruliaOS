@@ -29,6 +29,8 @@
 /* shell.c 用到 shell_extra.c 中定义的终端数字打印器（无头文件声明） */
 extern void ezos_console_print_dec(uint32_t num);
 
+#include "version.h"
+
 #define CMD_BUFFER_SIZE 1024
 #define HISTORY_SIZE 8
 
@@ -44,6 +46,7 @@ static char cmd_buffer[CMD_BUFFER_SIZE];
 static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
 static int history_count = 0;
+static int history_first = 0;
 static int session_composed;
 static int shell_in_desktop_terminal;
 
@@ -542,7 +545,7 @@ static const command_t commands[] = {
 /* ===== 管道与重定向支持 ===== */
 #define PIPE_BUF_SIZE 4096
 static char pipe_buffer[PIPE_BUF_SIZE];
-static int pipe_len = 0;
+static int pipe_len = -1; /* -1: no pipe, 0: an empty stream */
 
 /* ===== 终端颜色：直接复用 tty 的 vga_color 枚举值（tty.c 里是 static，shell.c 自己调 terminal_setcolor）===== */
 #define CLR_WHITE     15
@@ -644,15 +647,19 @@ static const char *shell_closest_command(const char *name);
 
 /* 执行带重定向/管道的命令 */
 static void shell_execute(char *cmd) {
-    if (history_count < HISTORY_SIZE) {
-        for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
-            history[history_count][i] = cmd[i];
-            if (cmd[i] == '\0') break;
-        }
-        history_count++;
-    }
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
+    int slot = (history_first + history_count) % HISTORY_SIZE;
+    if (history_count == HISTORY_SIZE)
+        history_first = (history_first + 1) % HISTORY_SIZE;
+    else
+        history_count++;
+    int copied = 0;
+    while (copied < CMD_BUFFER_SIZE - 1 && cmd[copied]) {
+        history[slot][copied] = cmd[copied];
+        copied++;
+    }
+    history[slot][copied] = '\0';
 
     /* 解析后台执行标记 `&`：去掉行尾的 `&`，记录到 bg 标志 */
     int bg = shell_strip_bg(cmd);
@@ -668,40 +675,60 @@ static void shell_execute(char *cmd) {
         if (*p == '>') { gt = p; break; }
     }
 
+    if ((gt || pipe) && session_composed) {
+        terminal_writestring("Nested output capture is not supported.\n");
+        return;
+    }
     if (gt) {
+        char *last = gt;
+        while (last > cmd && last[-1] == ' ') last--;
+        if (last == cmd) {
+            terminal_writestring("Redirect: missing command.\n");
+            return;
+        }
         session_composed++;
         /* cmd > file 或 cmd >> file */
         int append = (gt[0] != '\0' && gt[1] == '>');
-        *gt = '\0';
+        *last = '\0';
         char *fname = gt + 1 + (append ? 1 : 0);
         while (*fname == ' ') fname++;
-        if (append) {
-            /* >> 追加：先读回原文件再合并 */
-            /* 追加上限从 8KB 提到 128KB：原 old[4096]+merged[8192] 使
-             * "cmd >> file" 对超过 8KB 的文档静默截断，与 cat/vi 同病。 */
-            static uint8_t merged[131072];
-            int mn = 0;
-            if (fs_init() == 0) {
-                int on = fs_read_file(fname, g_file_buf, FILE_BUF_SIZE);
-                if (on > 0) for (int i = 0; i < on && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = g_file_buf[i];
-            }
+        const char *error = NULL;
+        char target[256];
+        uint32_t generation = fs_mount_generation();
+        if (!*fname) error = "Redirect: missing filename.\n";
+        else if (fs_init() != 0) error = "Redirect: no data volume mounted.\n";
+        else if (fs_absolute_path(fname, target, sizeof(target)) != 0)
+            error = "Redirect: invalid target path.\n";
+        else {
             static char cap[PIPE_BUF_SIZE];
-            terminal_begin_capture(cap, PIPE_BUF_SIZE);
+            terminal_begin_capture(cap, sizeof(cap));
             shell_execute_raw(cmd, 0);
             int n = terminal_end_capture();
-            for (int i = 0; i < n && mn < (int)sizeof(merged) - 1; i++) merged[mn++] = (uint8_t)cap[i];
-            if (mn > 0 && fs_init() == 0) {
-                fs_create_file(fname, merged, mn);
-            }
-        } else {
-            static char cap[PIPE_BUF_SIZE];
-            terminal_begin_capture(cap, PIPE_BUF_SIZE);
-            shell_execute_raw(cmd, 0);
-            int n = terminal_end_capture();
-            if (n > 0 && fs_init() == 0) {
-                fs_create_file(fname, (const uint8_t*)cap, n);
+            if (n < 0) error = "Redirect: output too large; not saved.\n";
+            else {
+                /* Do not hold the filesystem lock while running a command. */
+                fs_operation_lock();
+                static uint8_t merged[131072];
+                uint32_t size = 0;
+                uint8_t dir = 0;
+                int same_mount = generation == fs_mount_generation();
+                int exists = same_mount && fs_stat(target, &size, &dir) == 0;
+                if (!same_mount) error = "Redirect: target volume changed; not saved.\n";
+                else if (exists && dir) error = "Redirect: target is a directory.\n";
+                else if (append && exists && size > sizeof(merged) - (uint32_t)n)
+                    error = "Redirect: append exceeds 128 KiB; not saved.\n";
+                else if (append && exists && fs_read_file(target, merged, size) != (int)size)
+                    error = "Redirect: cannot read entire target; not saved.\n";
+                else {
+                    if (!append || !exists) size = 0;
+                    for (int i = 0; i < n; i++) merged[size + i] = (uint8_t)cap[i];
+                    if (!(append && exists && !n) && fs_create_file(target, merged, size + n) != 0)
+                        error = "Redirect: write failed.\n";
+                }
+                fs_operation_unlock();
             }
         }
+        if (error) terminal_writestring(error);
         session_composed--;
         return;
     }
@@ -709,18 +736,30 @@ static void shell_execute(char *cmd) {
     if (pipe) {
         session_composed++;
         /* cmd1 | cmd2 */
-        *pipe = '\0';
+        char *last = pipe;
+        while (last > cmd && last[-1] == ' ') last--;
+        *last = '\0';
         char *left = cmd;
         char *right = pipe + 1;
         while (*right == ' ') right++;
+        if (!*left || !*right) {
+            session_composed--;
+            terminal_writestring("Pipe: missing command.\n");
+            return;
+        }
         static char pbuf[PIPE_BUF_SIZE];
         terminal_begin_capture(pbuf, PIPE_BUF_SIZE);
         shell_execute_raw(left, 0);
         pipe_len = terminal_end_capture();
-        if (pipe_len > PIPE_BUF_SIZE) pipe_len = PIPE_BUF_SIZE - 1;
+        if (pipe_len < 0) {
+            pipe_len = -1;
+            session_composed--;
+            terminal_writestring("Pipe: output too large; next command not run.\n");
+            return;
+        }
         for (int i = 0; i < pipe_len; i++) pipe_buffer[i] = pbuf[i];
         shell_execute_raw(right, 0);
-        pipe_len = 0;
+        pipe_len = -1;
         session_composed--;
         return;
     }
@@ -737,7 +776,7 @@ static int account_command(const char *cmd) {
 }
 
 static const char *const personal_commands[] = {
-    "help", "exit", "clear", "cls", "echo", "version", "time", "date", "about",
+    "help", "exit", "clear", "cls", "echo", "version", "ver", "time", "date", "about",
     "history", "ls", "pwd", "cd", "cat", "write", "rm", "grep", "wc", "head",
     "tail", "touch", "cp", "mv", "mkdir", "rmdir", "vi", "exec", "jobs",
     "whoami", "users", "login", "su", "passwd", "logout", "desktop", "chmod", 0
@@ -886,6 +925,7 @@ int shell_complete_command(const char *prefix, char *out, int outsz,
     const char *first = NULL;
     for (int i = 0; commands[i].name != 0; i++) {
         const char *name = commands[i].name;
+        if (user_confined() && !personal_command(name)) continue;
         int nlen = 0;
         while (name[nlen]) nlen++;
         if (nlen < plen) continue;
@@ -1053,7 +1093,8 @@ void shell_forget_session(void) {
     auth_wipe(g_file_buf, sizeof(g_file_buf));
     auth_wipe(g_bg_jobs, sizeof(g_bg_jobs));
     history_count = 0;
-    pipe_len = 0;
+    history_first = 0;
+    pipe_len = -1;
     gw_forget_session();
     keyboard_discard_boot_input();
 }
@@ -1198,7 +1239,7 @@ void shell_run(void) {
         } else if (c == KEY_UP) {
             if (history_count > 0 && history_index < history_count - 1) {
                 history_index++;
-                int hist_pos = history_count - 1 - history_index;
+                int hist_pos = (history_first + history_count - 1 - history_index) % HISTORY_SIZE;
                 for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
                     cmd_buffer[i] = history[hist_pos][i];
                     if (cmd_buffer[i] == '\0') break;
@@ -1214,7 +1255,7 @@ void shell_run(void) {
         } else if (c == KEY_DOWN) {
             if (history_index > 0) {
                 history_index--;
-                int hist_pos = history_count - 1 - history_index;
+                int hist_pos = (history_first + history_count - 1 - history_index) % HISTORY_SIZE;
                 for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
                     cmd_buffer[i] = history[hist_pos][i];
                     if (cmd_buffer[i] == '\0') break;
@@ -1395,7 +1436,7 @@ static void cmd_echo(const char *args) {
 
 static void cmd_version(const char *args) {
     (void)args;
-    terminal_writestring("Cerulia v0.3-gui\n");
+    terminal_writestring("Cerulia v" EZOS_VERSION "\n");
 }
 
 static void cmd_time(const char *args) {
@@ -1661,12 +1702,14 @@ static void cmd_beep(const char *args) {
 
 static void cmd_about(const char *args) {
     (void)args;
-    terminal_writestring("Cerulia v0.3-gui - A hobby operating system\n");
-    terminal_writestring("Written in C and Assembly\n");
+    terminal_writestring("Cerulia v" EZOS_VERSION " - A hobby operating system\n");
+    terminal_writestring("Written in C, Assembly, Rust and Zig\n");
 }
 
 static void cmd_history(const char *args) {
-    if (args[0] == '-' && args[1] == 'c') {
+    if (my_strcasecmp(args, "-c") == 0) {
+        auth_wipe(history, sizeof(history));
+        history_first = 0;
         history_count = 0;
         terminal_writestring("History cleared.\n");
         return;
@@ -1674,7 +1717,7 @@ static void cmd_history(const char *args) {
     for (int i = 0; i < history_count; i++) {
         print_dec(i + 1);
         terminal_writestring(": ");
-        terminal_writestring(history[i]);
+        terminal_writestring(history[(history_first + i) % HISTORY_SIZE]);
         terminal_putchar('\n');
     }
 }
@@ -1873,7 +1916,7 @@ static void cmd_cat(const char *args) {
     }
     filename[i] = '\0';
     if (i == 0) {
-        if (pipe_len > 0) {
+        if (pipe_len >= 0) {
             for (int j = 0; j < pipe_len; j++) terminal_putchar(pipe_buffer[j]);
             terminal_putchar('\n');
             return;
@@ -1911,6 +1954,10 @@ static void cmd_write(const char *args) {
         filename[i++] = *args++;
     }
     filename[i] = '\0';
+    if (*args && *args != ' ') {
+        terminal_writestring("Not saved: filename too long.\n");
+        return;
+    }
     if (*args == ' ') args++;
     if (i == 0 || *args == '\0') {
         terminal_writestring("Usage: write <filename> <content>\n");
@@ -2401,7 +2448,7 @@ static void cmd_grep(const char *args) {
         terminal_writestring("Usage: grep <pattern> [file]\n");
         return;
     }
-    if (filename[0] == '\0' && pipe_len > 0) {
+    if (filename[0] == '\0' && pipe_len >= 0) {
         /* 从管道里读输入 */
         int plen = my_strlen(pattern);
         int line_start = 0, line_end = 0;
@@ -2464,7 +2511,7 @@ static void cmd_wc(const char *args) {
     }
     parse_token(args, filename, 128);
     if (filename[0] == '\0') {
-        if (pipe_len > 0) {
+        if (pipe_len >= 0) {
             int lines = 0, words = 0, chars = 0;
             int in_word = 0;
             for (int i = 0; i < pipe_len; i++) {
@@ -2562,20 +2609,6 @@ static void cmd_tail(const char *args) {
     }
 }
 
-static void cmd_touch(const char *args) {
-    char filename[128];
-    parse_token(args, filename, 128);
-    if (filename[0] == '\0') {
-        terminal_writestring("Usage: touch <file>\n");
-        return;
-    }
-    if (fs_create_file(filename, 0, 0) != 0) {
-        terminal_writestring("Failed to create file.\n");
-    } else {
-        puts_c("File created.\n", CLR_SUCCESS);
-    }
-}
-
 /* Reject overlong tokens rather than treating a truncated name as another file. */
 static const char *transfer_arg(const char *p, char *out, uint32_t cap) {
     uint32_t n = 0;
@@ -2588,6 +2621,25 @@ static const char *transfer_arg(const char *p, char *out, uint32_t cap) {
     out[n] = 0;
     while (*p == ' ') p++;
     return p;
+}
+
+static void cmd_touch(const char *args) {
+    char name[128];
+    const char *end = transfer_arg(args, name, sizeof(name));
+    if (!end || *end) {
+        terminal_writestring("Usage: touch <file>\n");
+        return;
+    }
+    uint32_t size;
+    uint8_t dir;
+    const char *message;
+    fs_operation_lock();
+    if (fs_stat(name, &size, &dir) == 0)
+        message = dir ? "Failed to create file.\n" : "File already exists; contents unchanged.\n";
+    else
+        message = fs_create_file(name, 0, 0) == 0 ? "File created.\n" : "Failed to create file.\n";
+    fs_operation_unlock();
+    terminal_writestring(message);
 }
 
 static const char *transfer_file(const char *src, const char *dst, int move) {
@@ -2804,6 +2856,7 @@ static int vi_top = 0;
 static int vi_left = 0;
 static char vi_filename[128];
 static int vi_modified = 0;
+static int vi_final_newline;
 static int vi_mode = 0;
 static const char *vi_msg = NULL;
 
@@ -3334,19 +3387,26 @@ static void vi_delete_line(void) {
 }
 
 // 保存到文件
-static void vi_save(void) {
+static int vi_save(void) {
     static uint8_t out_buf[FILE_BUF_SIZE];
     int o = 0;
-    for (int k = 0; k < vi_count && o < (int)sizeof(out_buf) - 1; k++) {
+    for (int k = 0; k < vi_count; k++) {
         int L = vi_len[k];
-        for (int m = 0; m < L && o < (int)sizeof(out_buf) - 1; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
-        if (o < (int)sizeof(out_buf) - 1) out_buf[o++] = '\n';
+        int newline = k + 1 < vi_count || vi_final_newline;
+        if (L + newline > (int)sizeof(out_buf) - o) {
+            vi_msg = "save failed: document too large";
+            return 0;
+        }
+        for (int m = 0; m < L; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
+        if (newline) out_buf[o++] = '\n';
     }
     if (fs_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
         vi_msg = "saved";
         vi_modified = 0;
+        return 1;
     } else {
         vi_msg = "save failed";
+        return 0;
     }
 }
 
@@ -3379,7 +3439,7 @@ static int vi_read_command(char *buf, int max) {
 
 static void cmd_uname(const char *args) {
     if (args[0] == '-') {
-        terminal_writestring("Cerulia localhost 0.3-gui i686\n");
+        terminal_writestring("Cerulia localhost " EZOS_VERSION " i686\n");
     } else {
         terminal_writestring("Cerulia\n");
     }
@@ -3481,15 +3541,27 @@ static void cmd_du(const char *args) {
 
 static void cmd_vi(const char *args) {
     char filename[128];
-    parse_token(args, filename, 128);
-    if (filename[0] == '\0') {
+    const char *end = transfer_arg(args, filename, sizeof(filename));
+    if (!end || *end) {
         terminal_writestring("Usage: vi <file>\n");
         return;
     }
     for (int i = 0; i < 128; i++) { vi_filename[i] = filename[i]; if (filename[i] == '\0') break; }
 
     vi_count = 0;
+    uint32_t size = 0;
+    uint8_t dir = 0;
+    int exists = fs_stat(filename, &size, &dir) == 0;
+    if (exists && (dir || size > FILE_BUF_SIZE)) {
+        terminal_writestring("vi: not a file or exceeds 64 KiB; not opened.\n");
+        return;
+    }
     int bytes = fs_read_file(filename, g_file_buf, FILE_BUF_SIZE);
+    if ((exists && bytes != (int)size) || (!exists && bytes != -1)) {
+        terminal_writestring("vi: could not read entire file; not opened.\n");
+        return;
+    }
+    vi_final_newline = !exists || (bytes > 0 && g_file_buf[bytes - 1] == '\n');
     if (bytes > 0) {
         int i = 0;
         while (i < bytes && vi_count < VI_MAX_LINES) {
@@ -3500,7 +3572,14 @@ static void cmd_vi(const char *args) {
             vi_lines[vi_count][j] = '\0';
             vi_len[vi_count] = j;
             vi_count++;
-            if (i < bytes && g_file_buf[i] == '\n') i++;
+            if (i < bytes && g_file_buf[i++] != '\n') {
+                terminal_writestring("vi: line exceeds 127 bytes; not opened.\n");
+                return;
+            }
+        }
+        if (i != bytes) {
+            terminal_writestring("vi: more than 512 lines; not opened.\n");
+            return;
         }
     }
     if (vi_count == 0) {
@@ -3596,8 +3675,7 @@ static void cmd_vi(const char *args) {
                     if (my_strcasecmp(cmd, "w") == 0) {
                         vi_save();
                     } else if (my_strcasecmp(cmd, "wq") == 0) {
-                        vi_save();
-                        running = 0;
+                        if (vi_save()) running = 0;
                     } else if (my_strcasecmp(cmd, "q") == 0) {
                         if (vi_modified) {
                             vi_msg = "E37: no write (use :q! or :wq)";

@@ -946,10 +946,7 @@ int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
         if (fs_check_write(full) != 0) return -2;
     } else if (fs_check_parent_write(full) != 0) return -2;
     if (fs_type_cur == FS_EXFAT) return exfat_create_file(full, data, size);
-    if (fs_is_fat()) {
-        fat_delete_file(full);
-        return fat_create_file(full, data, size);
-    }
+    if (fs_is_fat()) return fat_create_file(full, data, size);
     if (fs_is_ro()) {
         char abs[512];
         if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;

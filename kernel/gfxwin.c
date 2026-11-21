@@ -16,6 +16,7 @@
  */
 
 #include "gfx.h"
+#include "version.h"
 #include "port.h"
 #include "webview.h"
 #include "keyboard.h"
@@ -1794,14 +1795,18 @@ static int np_row = 0, np_col = 0, np_scroll = 0;
 static int np_menu = 0;   /* 0=无菜单 1=File 2=Edit */
 static char np_fname[13] = "NOTE.TXT";   /* 当前文件名（8.3，exFAT 根目录） */
 static int np_dirty = 0;                 /* 有未保存修改 */
+static int np_lines = 1, np_loaded = 0;
+static int np_crlf = 0;
+static char np_path[256];
+static uint32_t np_mount;
+static const char *np_status;
 
-/* 把文本缓冲载入记事本（Files 打开 .TXT / Open 菜单共用）。
- * \n 换行、\r 忽略、控制字符替换为空格；超行/超宽截断。 */
+/* np_open has already checked row lengths, row count and line endings. */
 static void np_load_text(const char *name, const char *buf, int len)
 {
     for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
     int r = 0, c = 0;
-    for (int i = 0; i < len && r < NP_ROWS; i++) {
+    for (int i = 0; i < len; i++) {
         char ch = buf[i];
         if (ch == '\r') continue;
         if (ch == '\n') { r++; c = 0; continue; }
@@ -1809,6 +1814,7 @@ static void np_load_text(const char *name, const char *buf, int len)
         if (c < NP_COLS) { np_buf[r][c++] = ch; np_buf[r][c] = 0; }
     }
     np_row = 0; np_col = 0; np_scroll = 0; np_dirty = 0;
+    np_lines = r + 1;
     int n = 0;
     while (name[n] && n < 12) { np_fname[n] = name[n]; n++; }
     np_fname[n] = 0;
@@ -1826,30 +1832,62 @@ static void np_load_text(const char *name, const char *buf, int len)
     }
 }
 
-/* 保存：np_buf 序列化（每行追加 \n）后 exfat_create_file 覆盖写 */
+/* Serialize just the document, not the entire display grid. */
 static void np_save(void)
 {
-    static uint8_t sbuf[NP_ROWS * (NP_COLS + 1) + 1];
+    static uint8_t sbuf[NP_ROWS * (NP_COLS + 2) + 1];
     int n = 0;
     int lim = (int)sizeof(sbuf) - 1;
-    for (int r = 0; r < NP_ROWS; r++) {
-        for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
-        if (n < lim) sbuf[n++] = '\n';
+    if (!np_path[0] || np_mount != fs_mount_generation()) {
+        np_status = "Volume changed";
+        return;
     }
-    if (fs_create_file(np_fname, sbuf, (uint32_t)n) == 0)
-        np_dirty = 0;
+    uint32_t old_size;
+    uint8_t dir;
+    if (!np_loaded && fs_stat(np_path, &old_size, &dir) == 0) {
+        np_status = "Open file first";
+        return;
+    }
+    for (int r = 0; r < np_lines; r++) {
+        for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
+        if (r + 1 < np_lines) {
+            if (np_crlf) sbuf[n++] = '\r';
+            sbuf[n++] = '\n';
+        }
+    }
+    if (fs_create_file(np_path, sbuf, (uint32_t)n) == 0) {
+        np_dirty = 0; np_loaded = 1; np_status = "Saved";
+    } else np_status = "Save failed";
 }
 
 /* 打开：读当前文件名文件载入（失败提示保留原内容） */
 static int np_open(void)
 {
-    static uint8_t rbuf[NP_ROWS * (NP_COLS + 1) + 1];
-    uint32_t sz = fs_get_file_size(np_fname);
-    if (sz == 0) return 0;                       /* 文件不存在 */
-    if (sz > sizeof(rbuf) - 1) sz = sizeof(rbuf) - 1;
-    if (fs_read_file(np_fname, rbuf, sz) != (int)sz) return 0;
-    rbuf[sz] = 0;
+    static uint8_t rbuf[NP_ROWS * (NP_COLS + 2) + 1];
+    uint32_t sz;
+    uint8_t dir;
+    if (np_dirty) { np_status = "Unsaved edits"; return 0; }
+    np_status = "Open failed";
+    if (!np_path[0] || np_mount != fs_mount_generation() ||
+        fs_stat(np_path, &sz, &dir) != 0 || dir) return 0;
+    if (sz > sizeof(rbuf) - 1) { np_status = "Too large"; return 0; }
+    if (fs_read_file(np_path, rbuf, sz) != (int)sz) return 0;
+    /* Reject text the grid cannot reproduce, before replacing the buffer. */
+    int row = 0, col = 0, crlf = -1;
+    for (uint32_t i = 0; i < sz; i++) {
+        int cr = rbuf[i] == '\r' && i + 1 < sz && rbuf[i+1] == '\n';
+        if (cr) i++;
+        if (rbuf[i] == '\n') {
+            if (crlf >= 0 && crlf != cr) { np_status = "Mixed newlines"; return 0; }
+            crlf = cr;
+            if (++row >= NP_ROWS) { np_status = "Too many lines"; return 0; }
+            col = 0;
+        } else if (rbuf[i] < 32 || ++col > NP_COLS) {
+            np_status = "Unsupported text"; return 0;
+        }
+    }
     np_load_text(np_fname, (const char *)rbuf, (int)sz);
+    np_loaded = 1; np_crlf = crlf > 0; np_status = NULL;
     return 1;
 }
 
@@ -1869,7 +1907,8 @@ static void notepad_draw(gw_window_t *w)
         while (np_fname[n] && n < 12) { fb[n] = np_fname[n]; n++; }
         if (np_dirty && n < 17) fb[n++] = '*';
         fb[n] = 0;
-        gfx_draw_text(ox + iw - 8 * n - 4, oy + 3, fb, np_dirty ? 0x0E : 0x07, 0x0F);
+        const char *label = np_status ? np_status : fb;
+        gfx_draw_text(ox + iw - 8 * gw_strlen(label) - 4, oy + 3, label, np_dirty ? 0x0E : 0x07, 0x0F);
     }
     /* 文本区（先画，下拉菜单必须在其上，否则菜单被文本区背景覆盖） */
     gw_fill(ox, oy + 15, iw, ih - 15, CLR_EDIT_BG);
@@ -1921,20 +1960,39 @@ static void notepad_key(gw_window_t *w, int key)
             line[np_col] = (char)key;
             line[len + 1] = 0;
             np_col++;
+            np_dirty = 1; np_status = NULL;
+            if (np_lines <= np_row) np_lines = np_row + 1;
         }
     } else if (key == 8 || key == 127) {
         char *line = np_buf[np_row];
         if (np_col > 0) {
             for (int k = np_col - 1; k < NP_COLS; k++) line[k] = line[k + 1];
             np_col--;
+            np_dirty = 1; np_status = NULL;
         } else if (np_row > 0) {
-            np_row--;
-            np_col = gw_strlen(np_buf[np_row]);
-            if (np_col > NP_COLS) np_col = NP_COLS;
+            int prev = gw_strlen(np_buf[np_row - 1]), len = gw_strlen(line);
+            if (prev + len > NP_COLS) { np_status = "Line too long"; return; }
+            for (int i = 0; i <= len; i++) np_buf[np_row - 1][prev + i] = line[i];
+            for (int r = np_row; r + 1 < np_lines; r++)
+                for (int c = 0; c <= NP_COLS; c++) np_buf[r][c] = np_buf[r+1][c];
+            np_buf[--np_lines][0] = 0;
+            np_row--; np_col = prev;
+            np_dirty = 1; np_status = NULL;
             if (np_row < np_scroll) np_scroll = np_row;
         }
     } else if (key == '\n' || key == '\r') {
-        if (np_row < NP_ROWS - 1) {
+        if (np_lines < NP_ROWS && np_row < NP_ROWS - 1) {
+            for (int r = np_lines; r > np_row + 1; r--)
+                for (int c = 0; c <= NP_COLS; c++) np_buf[r][c] = np_buf[r-1][c];
+            int n = 0;
+            while (np_buf[np_row][np_col + n]) {
+                np_buf[np_row+1][n] = np_buf[np_row][np_col + n];
+                n++;
+            }
+            np_buf[np_row+1][n] = 0;
+            np_buf[np_row][np_col] = 0;
+            np_lines++;
+            np_dirty = 1; np_status = NULL;
             np_row++;
             np_col = 0;
             if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1;
@@ -1942,15 +2000,16 @@ static void notepad_key(gw_window_t *w, int key)
     } else if (key == KEY_UP) {
         if (np_row > 0) { np_row--; if (np_row < np_scroll) np_scroll = np_row; }
     } else if (key == KEY_DOWN) {
-        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
+        if (np_row + 1 < np_lines) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
     } else if (key == KEY_LEFT) {
         if (np_col > 0) np_col--;
         else if (np_row > 0) { np_row--; np_col = gw_strlen(np_buf[np_row]); }
     } else if (key == KEY_RIGHT) {
         int len = gw_strlen(np_buf[np_row]);
         if (np_col < len) np_col++;
-        else if (np_row < NP_ROWS - 1) { np_row++; np_col = 0; }
+        else if (np_row + 1 < np_lines) { np_row++; np_col = 0; }
     }
+    if (np_col > gw_strlen(np_buf[np_row])) np_col = gw_strlen(np_buf[np_row]);
 }
 
 static void notepad_click(gw_window_t *w, int lx, int ly)
@@ -1967,9 +2026,11 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
     if (np_menu == 1 && lx >= 2 && lx < 92 && ly >= 14 && ly < 14 + 4 * 16 + 2) {
         int item = (ly - 14) / 16;
         if (item == 0) {   /* New：清空并回到 NOTE.TXT */
+            if (np_dirty) { np_status = "Unsaved edits"; np_menu = 0; return; }
             for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
             np_row = 0; np_col = 0; np_scroll = 0;
             np_load_text("NOTE.TXT", "", 0);
+            np_loaded = 0; np_crlf = 0; np_status = NULL;
         } else if (item == 1) {   /* Open：读当前文件名（失败保留原内容） */
             np_open();
         } else if (item == 2) {   /* Save：序列化后 exFAT 覆盖写 */
@@ -1978,6 +2039,7 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
             for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
             np_row = 0; np_col = 0; np_scroll = 0;
             np_dirty = 1;
+            np_lines = 1; np_status = NULL;
         }
         np_menu = 0;
         return;
@@ -1985,7 +2047,7 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
     if (np_menu == 2 && lx >= 2 && lx < 92 && ly >= 14 && ly < 48) {
         int item = (ly - 14) / 16;
         if (item == 0) { np_row = 0; np_col = 0; np_scroll = 0; }
-        else if (item == 1) { np_row = NP_ROWS - 1; np_col = gw_strlen(np_buf[np_row]); np_scroll = np_row - 9; if (np_scroll < 0) np_scroll = 0; }
+        else if (item == 1) { np_row = np_lines - 1; np_col = gw_strlen(np_buf[np_row]); np_scroll = np_row - 9; if (np_scroll < 0) np_scroll = 0; }
         np_menu = 0;
         return;
     }
@@ -2809,7 +2871,7 @@ static void about_draw(gw_window_t *w)
 {
     int ox = gw_ox(w), oy = gw_oy(w);
     gfx_draw_text(ox + 4, oy + 6, "Cerulia - Windows 10 style UI", 0x00, 0x0F);
-    gfx_draw_text(ox + 4, oy + 20, "Version 0.3-gui (v0.7 gfxwin)", 0x00, 0x0F);
+    gfx_draw_text(ox + 4, oy + 20, "Version " EZOS_VERSION, 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 34, "Base: RetrOS-32 (MIT)", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 48, "UI ref: sinwindows v2", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 62, "VBE 16bpp LFB, i686, QEMU", 0x00, 0x0F);
@@ -2858,11 +2920,20 @@ static gw_window_t *gw_spawn_app(int idx)
         for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
         np_row = 0; np_col = 0; np_scroll = 0;
         np_menu = 0; np_dirty = 0;
+        np_lines = 1; np_loaded = 0; np_crlf = 0; np_status = NULL;
+        np_mount = fs_mount_generation();
+        if (fs_absolute_path("NOTE.TXT", np_path, sizeof(np_path)) != 0) np_path[0] = 0;
         {
             const char *defname = "NOTE.TXT";
             int fn = 0;
             while (defname[fn] && fn < 12) { np_fname[fn] = defname[fn]; fn++; }
             np_fname[fn] = 0;
+        }
+        {
+            uint32_t existing_size;
+            uint8_t is_dir;
+            if (np_path[0] && fs_stat(np_path, &existing_size, &is_dir) == 0)
+                np_open();
         }
         break;
     case GW_APP_SYSINFO:
@@ -4714,6 +4785,8 @@ static int gw_session_dialog(int mode)
     for (;;) {
         if (retry_at && (int32_t)(g_pit_ticks - retry_at) >= 0) {
             retry_at = 0;
+            hint = "Ready to try again.";
+            serial_write("DESKTOP: retry ready\n");
             redraw = 1;
         }
         int mx = mouse_get_x(), my = mouse_get_y(), bt = mouse_get_buttons() & 1;
@@ -4751,7 +4824,7 @@ static int gw_session_dialog(int mode)
                     auth_wipe(pass, sizeof(pass));
                     pn = excess = 0;
                     if (ok) break;
-                    hint = mode == GW_SESSION_LOCK ? "Incorrect password." : "Sign-in failed.";
+                    hint = mode == GW_SESSION_LOCK ? "Incorrect password; please wait." : "Sign-in failed; please wait.";
                     retry_at = g_pit_ticks + 750u;
                     serial_write("DESKTOP: authentication failed\n");
                 }
@@ -4840,6 +4913,7 @@ void gw_forget_session(void)
     fm_count = fm_scroll = fm_sel = fm_mode = fm_file_len = fm_file_scroll = 0;
     auth_wipe(np_buf, sizeof(np_buf));
     auth_wipe(np_fname, sizeof(np_fname));
+    auth_wipe(np_path, sizeof(np_path));
     np_row = np_col = np_scroll = np_menu = np_dirty = 0;
     auth_wipe(term_buf, sizeof(term_buf));
     auth_wipe(term_hist, sizeof(term_hist));

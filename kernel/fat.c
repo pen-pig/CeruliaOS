@@ -75,15 +75,19 @@ static int my_strlen(const char *s) {
     return n;
 }
 
-/* 读取卷内一个 FAT 扇区（bps 可能 > 512，按 512 组合） */
+/* BPB offsets are logical sectors, block device addresses are 512-byte LBAs. */
+static uint32_t fat_lba(uint32_t sector) {
+    return fat_part_start + sector * (fi.bytes_per_sector / 512u);
+}
+
 static int fat_read_vol_sector(uint32_t vol_sec, uint8_t *buf) {
-    uint32_t lba = fat_part_start + vol_sec;
+    uint32_t lba = fat_lba(vol_sec);
     return ata_read_sectors(fat_drive, lba,
                             (uint32_t)fi.bytes_per_sector / 512, buf);
 }
 
 static int fat_write_vol_sector(uint32_t vol_sec, const uint8_t *buf) {
-    uint32_t lba = fat_part_start + vol_sec;
+    uint32_t lba = fat_lba(vol_sec);
     return ata_write_sectors(fat_drive, lba,
                              (uint32_t)fi.bytes_per_sector / 512, buf);
 }
@@ -98,6 +102,7 @@ static int fat_cache_load(uint32_t byte_off, uint32_t len) {
     if (n < 1) n = 1;
     if (n > 2) return -1;
     if (fat_cache_sec == sec && fat_cache_n >= n) return 0;
+    fat_cache_n = 0;  /* partial reads must not look like the previous cache line */
     for (int i = 0; i < n; i++) {
         if (fat_read_vol_sector(sec + (uint32_t)i,
                                 fat_cache + (uint32_t)i * fi.bytes_per_sector) != 0)
@@ -157,8 +162,10 @@ static int fat_entry_set(uint32_t n, uint32_t val) {
     for (uint32_t f = 0; f < fi.num_fats; f++) {
         for (int i = 0; i < fat_cache_n; i++) {
             if (fat_write_vol_sector(sec0 + f * fi.fat_sectors + (uint32_t)i,
-                                     fat_cache + (uint32_t)i * fi.bytes_per_sector) != 0)
+                                     fat_cache + (uint32_t)i * fi.bytes_per_sector) != 0) {
+                fat_cache_n = 0;
                 return -1;
+            }
         }
     }
     return 0;
@@ -233,6 +240,8 @@ int fat_probe(const uint8_t *bs) {
     if (fat_size == 0) return 0;
 
     uint32_t root_dir_sectors = (root_entries * 32 + bps - 1) / bps;
+    if (reserved + root_dir_sectors >= total ||
+        fat_size > (total - reserved - root_dir_sectors) / nfats) return 0;
     uint32_t first_data = reserved + nfats * fat_size + root_dir_sectors;
     if (first_data >= total) return 0;
     uint32_t clusters = (total - first_data) / spc;
@@ -272,6 +281,8 @@ int fat_mount(uint8_t drive, uint32_t part_start) {
     fi.total_sectors = bs[19] | ((uint32_t)bs[20] << 8);
     if (fi.total_sectors == 0)
         fi.total_sectors = bs[32] | ((uint32_t)bs[33] << 8) | ((uint32_t)bs[34] << 16) | ((uint32_t)bs[35] << 24);
+    if ((uint64_t)part_start + (uint64_t)fi.total_sectors * (bps / 512u) > (1ull << 32))
+        return 0;
     uint32_t fat_size16 = bs[22] | ((uint32_t)bs[23] << 8);
     fi.fat_sectors = fat_size16 ? fat_size16 :
         (bs[36] | ((uint32_t)bs[37] << 8) | ((uint32_t)bs[38] << 16) | ((uint32_t)bs[39] << 24));
@@ -631,12 +642,12 @@ static int fat_dir_walk_next(fat_dir_walk_t *w) {
 }
 
 static int fat_read_block(const dir_block_t *b, uint8_t *buf) {
-    return ata_read_sectors(fat_drive, fat_part_start + b->sector,
+    return ata_read_sectors(fat_drive, fat_lba(b->sector),
                             b->bytes / 512, buf);
 }
 
 static int fat_write_block(const dir_block_t *b, const uint8_t *buf) {
-    return ata_write_sectors(fat_drive, fat_part_start + b->sector,
+    return ata_write_sectors(fat_drive, fat_lba(b->sector),
                              b->bytes / 512, buf);
 }
 
@@ -819,7 +830,7 @@ static int fat_find_entry(uint32_t dir_cluster, const char *name, fat_dirent_t *
     fc.want = name;
     fc.hit = 0;
     fc.found.name[0] = '\0';
-    fat_dir_foreach(dir_cluster, find_cb, &fc);
+    if (fat_dir_foreach(dir_cluster, find_cb, &fc) < 0) return -2;
     if (!fc.hit) return -1;
     if (out) *out = fc.found;
     return 0;
@@ -1070,14 +1081,14 @@ static int fat_read_cluster(uint32_t c, uint8_t *buf) {
     if (c < 2 || c >= fi.cluster_count + 2) return -1;
     uint32_t sec = fi.first_data_sector + (c - 2) * fi.sectors_per_cluster;
     uint32_t n = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster / 512;
-    return ata_read_sectors(fat_drive, fat_part_start + sec, n, buf);
+    return ata_read_sectors(fat_drive, fat_lba(sec), n, buf);
 }
 
 static int fat_write_cluster(uint32_t c, const uint8_t *buf) {
     if (c < 2 || c >= fi.cluster_count + 2) return -1;
     uint32_t sec = fi.first_data_sector + (c - 2) * fi.sectors_per_cluster;
     uint32_t n = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster / 512;
-    return ata_write_sectors(fat_drive, fat_part_start + sec, n, buf);
+    return ata_write_sectors(fat_drive, fat_lba(sec), n, buf);
 }
 
 /* 释放簇链 */
@@ -1468,18 +1479,19 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     name_len = my_strlen(leaf);
     if (name_len == 0 || name_len > 255) return -1;
 
-    /* 重名检查 */
+    /* An overwrite stages a fresh chain; do not unlink the original. */
     fat_dirent_t de;
-    if (fat_find_entry(dir, leaf, &de) == 0) return -1;
+    int lookup = fat_find_entry(dir, leaf, &de);
+    if (lookup == -2 || (lookup == 0 && (de.is_dir || (de.attr & ATTR_READONLY)))) return -1;
 
     uint8_t sn11[11];
-    int lfn_entries = prepare_names(leaf, dir, sn11);
+    int lfn_entries = lookup == 0 ? 0 : prepare_names(leaf, dir, sn11);
     if (lfn_entries < 0) return -1;
     int need = 1 + lfn_entries;
 
     /* 分配数据簇链并写入数据 */
     uint32_t cluster_size = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster;
-    uint32_t data_clusters = (size + cluster_size - 1) / cluster_size;
+    uint32_t data_clusters = size / cluster_size + (size % cluster_size != 0);
     uint32_t first_cluster = 0;
     if (data_clusters > 0) {
         uint32_t prev = 0;
@@ -1519,6 +1531,28 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
             written += to_copy;
             if (i + 1 < data_clusters) cur = fat_entry_get(cur);
         }
+    }
+
+    if (lookup == 0) {
+        /* Keep the existing short entry and all LFN slots. Publish the size
+         * and start cluster together in one 512-byte directory sector. */
+        uint32_t lba = fat_lba(de.block_sector) + de.entry_off / 512;
+        if (ata_read_sector(fat_drive, lba, io_scratch) != 0) {
+            fat_free_chain(first_cluster);
+            return -1;
+        }
+        uint8_t *entry = io_scratch + de.entry_off % 512;
+        if (fat_type == 32) put16le(entry + 20, (uint16_t)(first_cluster >> 16));
+        put16le(entry + 26, (uint16_t)first_cluster);
+        put32le(entry + 28, size);
+        uint8_t stamp[32];
+        write_timestamp(stamp);
+        for (int i = 22; i < 26; i++) entry[i] = stamp[i];
+        entry[11] |= ATTR_ARCHIVE;
+        /* On an indeterminate write error neither chain is safe to free. */
+        if (ata_write_sector(fat_drive, lba, io_scratch) != 0) return -1;
+        if (de.first_cluster >= 2) fat_free_chain(de.first_cluster);
+        return 0;
     }
 
     /* 找空闲目录项并写入 */
