@@ -17,6 +17,14 @@
 
 在开发机可先运行 `python tests/test_autofmt.py`（空盘和未知盘不被改写、手动初始化后冷启动读回）以及 `python tests/test_save_exfat.py`（空间不足时覆盖失败，旧文件仍在）。两项使用临时虚拟数据盘，不能替代上述真机验证。
 
+日常保存另有三组可独立运行的 QEMU 回归：
+
+- `python tests/test_redirect_save.py`：整盘读回核对大文件追加、满盘覆盖和不同逻辑扇区大小的 FAT 卷。
+- `python tests/test_vi_big.py`：编辑 200 行文档后，在宿主机逐字节核对完整文件。
+- `python tests/test_notepad_save.py`：用鼠标点击保存，验证冷启动读回、Windows 换行及不支持的文件不会被覆盖。
+
+当前限制：Shell 单次捕获最多 4095 字节，`>>` 合并后最多 128 KiB；`vi` 最多 512 行，每行 127 字节。桌面记事本是 24 行 × 40 字节的小编辑器，可保留 LF 或 CRLF，不支持混合换行。这些限制不是硬盘或内存故障。
+
 ---
 
 ## 0. 一句话结论
