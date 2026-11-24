@@ -176,12 +176,23 @@ typedef struct {
  * 返回节点数（>=0）。**任何截断只置 truncated 标志而不返回错误** ——
  * 半个页面仍然比报错有用，但调用方必须能看见那个标志。
  */
+typedef struct {
+    char action[256], name[48], id[64], value[128], extras[192], handler[384];
+    uint8_t state, scripts, submitter, required, policy;
+    char secret_name[48],secret[128];
+    uint8_t method,secret_required,plain_kind;
+} html_form_t;
+_Static_assert(sizeof(html_form_t)==1256, "Rust form ABI");
+/* 1=submit, 0=prevented, -1=unsupported handler */
+int32_t form_event_rs(html_form_t *form);
+int32_t form_query_rs(const html_form_t *form, uint8_t *out, uint32_t cap);
 int32_t html_parse_rs(const uint8_t *html, uint32_t len,
                       html_node_t *nodes, uint32_t max_nodes,
                       uint8_t *text, uint32_t text_cap,
                       uint8_t *href, uint32_t href_cap,
                       uint8_t *scratch, uint32_t st_cap,
-                      uint32_t *stats);
+                      uint32_t *stats, html_form_t *form, uint32_t problem_reader,
+                      void (*css)(uint32_t,const uint8_t*,uint32_t,const uint8_t*,uint32_t));
 
 /* 文本的显示宽度（字符数，不是字节数） */
 uint32_t utf8_width_rs(const uint8_t *s, uint32_t n);

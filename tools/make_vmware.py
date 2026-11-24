@@ -8,6 +8,7 @@ PhoenixBIOS + 更接近真机的芯片组，是介于 QEMU 和真机之间的第
 用法：
     python tools/make_vmware.py                 # 默认 usb-image.bin -> vmware/
     python tools/make_vmware.py --image X.bin
+    python tools/make_vmware.py --profile cerulia  # separate VM and data disk
 
 产物：vmware/ezos-usb.vmdk（磁盘）+ vmware/ezos.vmx（虚拟机配置）
 【重要】VMware 侧请用 **legacy BIOS** 启动（firmware = "bios"）：
@@ -16,12 +17,16 @@ PhoenixBIOS + 更接近真机的芯片组，是介于 QEMU 和真机之间的第
 """
 import argparse
 import os
+from pathlib import Path
+import tempfile
+import uuid
 
 import sys as _sys
 _sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ezos_env as _ezos  # noqa: E402
 import subprocess
 import sys
+from gen_diskimg import gen_exfat
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -52,6 +57,10 @@ ide0:0.deviceType = "disk"
 scsi0.present = "FALSE"
 sata0.present = "FALSE"
 floppy0.present = "FALSE"
+ethernet0.present = "TRUE"
+ethernet0.connectionType = "nat"
+ethernet0.virtualDev = "e1000"
+ethernet0.addressType = "generated"
 
 # 串口 -> 文件：内核的 COM1 诊断全落到这里，E2E 也是按行抓的。
 serial0.present = "TRUE"
@@ -73,37 +82,65 @@ def main():
                     default=os.path.join(ROOT, "usb-image.bin"),
                     help="raw 镜像（默认 usb-image.bin，双通道混合镜像）")
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "vmware"))
+    ap.add_argument("--profile", choices=("ezos", "cerulia"), default="ezos",
+                    help="cerulia creates a separate, persistent exFAT data disk")
     args = ap.parse_args()
 
     img = os.path.abspath(args.image)
     if not os.path.isfile(img):
         print("MISSING image: %s" % img)
         return 1
-    if not os.path.isdir(args.out_dir):
-        os.makedirs(args.out_dir)
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    name = args.profile
+    vmx, boot, data = [out / (name + suffix) for suffix in (".vmx", "-usb.vmdk", "-data.vmdk")]
 
-    vmdk = os.path.join(args.out_dir, "ezos-usb.vmdk")
-    if os.path.exists(vmdk):
-        os.remove(vmdk)
-    # monolithicSparse：36MB 镜像里绝大部分是 FAT32 空白，稀疏后只有 1MB 出头。
-    # 用 raw 直通也行，但 sparse 更适合分发。
-    rc = subprocess.call([QEMU_IMG, "convert", "-f", "raw", "-O", "vmdk",
-                          img, vmdk])
-    if rc != 0 or not os.path.isfile(vmdk):
-        print("qemu-img convert failed (rc=%d)" % rc)
+    def check_idle():
+        for disk in (vmx, boot, data):
+            if disk.with_name(disk.name + ".lck").exists():
+                raise OSError(f"Power off the VM before rebuilding: {disk}")
+        # Replacing the base while a suspend/snapshot still points to it is unsafe.
+        if vmx.exists() and (list(out.glob(f"{name}*.vmss")) or
+                             list(out.glob(f"{name}*.vmsn")) or
+                             list(out.glob(f"{name}-usb-*.vmdk"))):
+            raise OSError(f"Resume/power off or consolidate snapshots before rebuilding {vmx}")
+
+    try:
+        check_idle()
+        with tempfile.TemporaryDirectory(prefix="vmware-build-", dir=out) as temp:
+            stage = Path(temp)
+            # Convert to a temporary file first; a failed conversion cannot truncate an existing VM.
+            subprocess.run([QEMU_IMG, "convert", "-f", "raw", "-O", "vmdk", img,
+                            str(stage / boot.name)], check=True)
+            if name == "cerulia" and not data.exists():
+                raw = stage / "data.vhd"
+                gen_exfat(str(raw))
+                subprocess.run([QEMU_IMG, "convert", "-f", "vpc", "-O", "vmdk",
+                                str(raw), str(stage / data.name)], check=True)
+            if not vmx.exists():
+                cfg = VMX.format(disk=boot.name)
+                if name == "cerulia":
+                    uid = uuid.uuid4().hex
+                    pairs = " ".join(uid[i:i+2] for i in range(0, len(uid), 2))
+                    cfg = (cfg.replace('displayName = "EZOS"', 'displayName = "Cerulia"')
+                           .replace("56 4d 0f 96 11 01 ec 21-23 2c f1 83 14 80 32 68",
+                                    pairs[:23] + "-" + pairs[24:])
+                           .replace("ezos-serial.log", "cerulia-serial.log"))
+                    cfg += ('nvram = "cerulia.nvram"\nide0:1.present = "TRUE"\n'
+                            f'ide0:1.fileName = "{data.name}"\nide0:1.deviceType = "disk"\n')
+                (stage / vmx.name).write_text(cfg, encoding="utf-8", newline="\r\n")
+            check_idle()
+            if (stage / data.name).exists() and not data.exists():
+                os.replace(stage / data.name, data)
+            os.replace(stage / boot.name, boot)
+            if not vmx.exists():
+                os.replace(stage / vmx.name, vmx)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"VMware build failed: {exc}", file=sys.stderr)
         return 1
 
-    # 行尾必须 CRLF：宿主是 Windows，VMware 的 vmx 解析器对纯 LF 不友好。
-    # 之前用 newline="\n" 写出 LF 文件，叠加缺 virtualHW.version 一起触发
-    # "Internal error. Remove from library?"。
-    with open(os.path.join(args.out_dir, "ezos.vmx"), "w",
-              encoding="utf-8", newline="\r\n") as f:
-        f.write(VMX.format(disk="ezos-usb.vmdk"))
-
-    print("OK %s (%d bytes)" % (vmdk, os.path.getsize(vmdk)))
-    print("OK %s" % os.path.join(args.out_dir, "ezos.vmx"))
-    print("")
-    print("用 VMware 打开 ezos.vmx -> 开机。串口日志: vmware/ezos-serial.log")
+    print(f"OK {boot} ({boot.stat().st_size} bytes)")
+    print(f"Open in VMware: {vmx.resolve()}")
     return 0
 
 

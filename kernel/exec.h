@@ -18,6 +18,8 @@
 /* 单个 ELF 映像的最大字节数。受内核堆（384KB）限制：ELF 要先整块读进
  * 内核缓冲才能解析程序头。将来有了按段流式读取就不再需要这个上限。 */
 #define EXEC_MAX_IMAGE   (64u * 1024u)
+struct web_ipc;
+int exec_webjs(struct web_ipc *ipc,int *out_pid);
 
 /* 命令行参数上限（不含 argv[0] 的终止 NULL） */
 #define EXEC_MAX_ARGV    8

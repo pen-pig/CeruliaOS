@@ -53,11 +53,11 @@ def _find_objdump():
 
 OBJDUMP, OBJDUMP_ARGS = _find_objdump()
 
-# 检查对象：只查外来语言产物。内核自己的 C 代码由 CFLAGS 里的
-# -mno-sse -mno-sse2 -mno-mmx 约束着（见 build.ninja），不需要这里重复查。
+# 检查独立构建的产物，包括不使用内核 CFLAGS 的用户态 QuickJS。
 TARGETS = [
     ("rust/ezos_zig/ezos_zig.o", "Zig"),
     ("rust/ezos_rs/target/i686-ezos/release/libezos_rs.a", "Rust"),
+    ("user/webjs.elf", "WebJS"),
 ]
 
 # SSE/SSE2 指令助记符（含 movdqa/movaps/movups/movdqu 这些"搬 XMM"的，
@@ -67,7 +67,6 @@ TARGETS = [
 SSE_PAT = re.compile(
     r"\b(movdq[au]|movap[sd]|movup[sd]|movnt[di]|maskmov[qd]|"
     r"ldmxcsr|stmxcsr|sfence|lfence|mfence|emms|"
-    r"p[a-z]{1,4}(?:[bwdq]|ss|us)\b|"
     r"pshuf[bdw]|pslldq|psrldq|palignr|pextr[bdwq]|pinsr[bdw]|"
     r"pextrw|insertps|roundp[sd]|blendp[sd]|dp[sd]|rounds[sd]|"
     r"cvtp[sd]2|cvtt?s[sd]2|comis[sd]|ucomis[sd]|"
@@ -86,7 +85,7 @@ def objdump_all(path):
                            timeout=180)
     except Exception:
         return None
-    return r.stdout.decode("utf-8", "replace")
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
 
 
 def scan(path, label):
@@ -108,7 +107,7 @@ def scan(path, label):
         if not m2:
             continue
         mnem = m2.group(1)
-        if SSE_PAT.search(mnem):
+        if SSE_PAT.search(mnem) or re.search(r"%(?:[xyz]mm\d+|mm[0-7])\b", line):
             hits.append((cur, mnem, line.strip()[:100]))
     return hits
 
@@ -120,7 +119,7 @@ def main():
               "（装 i686-elf-tools，或让 CI 装 gcc-multilib）")
         return 1
 
-    print("check_cpu: 非 C 语言产物的指令集闸门")
+    print("check_cpu: Rust、Zig 和 QuickJS 产物的指令集闸门")
     bad = 0
     skipped = []
     for rel, label in TARGETS:

@@ -173,6 +173,8 @@ void keyboard_handler(void) {
             case 0x4B: key = KEY_LEFT; break;
             case 0x4D: key = KEY_RIGHT; break;
             case 0x49: key = KEY_PGUP; break;
+            case 0x47: key = KEY_HOME; break;
+            case 0x4F: key = KEY_END; break;
             case 0x51: key = KEY_PGDN; break;
             case 0x3B: key = KEY_F1; break;
             case 0x3C: key = KEY_F2; break;

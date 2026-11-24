@@ -905,6 +905,11 @@ class Fuzzer(object):
                 self.qmp.click(foc["x"] + foc["w"] - 7,
                                foc["y"] + TITLE_CY_OFF)
                 time.sleep(0.8)
+                if foc["app"] == APP_IDX["notepad"]:
+                    # Confirm discard only if this window remained focused.
+                    _, after = self.gw_state()
+                    if any(w["app"] == foc["app"] and w["foc"] for w in (after or [])):
+                        self.qmp.key("y")
                 continue
             cand = None
             for w in wins:

@@ -53,7 +53,7 @@ _TAG_IDS['strike'] = 34
 _VOID = {'br', 'hr', 'img', 'input', 'meta', 'link', 'base', 'area',
          'embed', 'param', 'source', 'col'}
 
-_OPAQUE = {'noscript', 'template', 'iframe', 'svg', 'canvas', 'object',
+_OPAQUE = {'noscript', 'template', 'textarea', 'iframe', 'svg', 'canvas', 'object',
            'audio', 'video', 'map', 'picture'}
 
 _BLOCK = {'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li',
@@ -316,7 +316,7 @@ def parse(html, max_nodes=3000, text_cap=40 * 1024, str_cap=16 * 1024):
 
     def href_add(data):
         nonlocal truncated
-        if not data or len(data) > 1024:
+        if not data or len(data) > 2047 or b'\0' in data:
             return 0
         if len(strs) + len(data) + 1 >= str_cap:
             truncated = 1
@@ -482,6 +482,12 @@ def parse(html, max_nodes=3000, text_cap=40 * 1024, str_cap=16 * 1024):
             i = _skip_opaque(src, i, name)
             continue
 
+        aid = read_attr(attr_from, attr_to, b'id') or (read_attr(attr_from, attr_to, b'name') if name == 'a' else b'')
+        if aid and len(aid) <= 255 and b'\0' not in aid and len(strs)+len(aid)<str_cap:
+            flush()
+            emit(5,t,0,len(strs),len(aid),0)
+            strs.extend(aid+b'\0')
+
         if name == 'br':
             flush()
             emit(NODE_BR, T_BR if False else 3, 0, 0, 0, 0)
@@ -491,13 +497,19 @@ def parse(html, max_nodes=3000, text_cap=40 * 1024, str_cap=16 * 1024):
             emit(NODE_HR, 22, 0, 0, 0, 0)
             continue
         if name == 'img':
+            flush()
+            url = read_attr(attr_from, attr_to, b'src')
+            has_src = bool(url and len(url)<=2047 and b'\0' not in url and len(strs)+len(url)<str_cap)
+            if has_src:
+                emit(6,42,0,len(strs),len(url),href_off)
+                strs.extend(url+b'\0')
             alt = read_attr(attr_from, attr_to, b'alt')
             if alt:
                 off = len(strs)
                 if len(strs) + len(alt) + 1 < str_cap:
                     strs.extend(alt)
                     strs.append(0)
-                    emit(NODE_IMG, 42, 0, off, len(alt), 0)
+                    emit(NODE_IMG, 42, int(has_src), off, len(alt), href_off)
             continue
         if name == 'a':
             # 顺序：先 flush（带旧 href）再 push（存旧 href）最后改

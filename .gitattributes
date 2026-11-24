@@ -4,3 +4,11 @@
 # 只能靠人工维持 LF（易碎，release/setup_and_run.sh 就已经是 CRLF 了）。
 # 这里显式钉住，跟 .bat 必须纯 ASCII 是同一类约束。
 *.sh text eol=lf
+third_party/bearssl/roots.pem text eol=lf
+third_party/bearssl/*.tar.gz binary
+third_party/unifont/*.hex.gz binary
+third_party/wuffs/wuffs-v0.4.c text eol=lf
+third_party/tjpgdec/tjpgd.c text eol=lf
+third_party/tjpgdec/*.h text eol=lf
+third_party/webjs/*.tar.gz binary
+third_party/webjs/*.tar.xz binary

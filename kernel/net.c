@@ -71,7 +71,7 @@
 
 /* socket 表 */
 #define NET_MAX_SOCKS 8u
-#define NET_SOCK_BUF  4096u          /* 每 socket 接收环 */
+#define NET_SOCK_BUF  16384u         /* Per socket, allocated only on use. */
 
 /* TCP 状态 */
 enum {
@@ -98,6 +98,7 @@ typedef struct {
     int      parent;                /* TCP：所属监听 socket 下标，-1 = 独立 */
     uint8_t *rx;                    /* 接收环（kmalloc，槽位复用） */
     uint32_t rx_r, rx_w;            /* 环读写指针（字节，模 NET_SOCK_BUF） */
+    uint16_t rx_window_sent;       /* last successfully advertised free space */
     uint32_t snd_nxt, rcv_nxt;      /* TCP 序号 */
 
     /* ---- 步骤 7.4：可靠性 ----
@@ -1512,11 +1513,16 @@ int net_ntp(uint32_t server_ip_be, uint32_t *out_unix_sec, uint32_t timeout_ms) 
 
 /* seq 显式传入：正常发送用 snd_nxt，重传必须用 snd_una（重传不改变
  * snd_nxt，否则序号空间会被重传段推着走）。 */
+static uint32_t tcp_rx_free(const sock_t *s) {
+    return (NET_SOCK_BUF-1u+s->rx_r-s->rx_w)%NET_SOCK_BUF;
+}
+
 static int tcp_send_seg_ex(sock_t *s, uint8_t flags, const uint8_t *data,
                            uint32_t n, uint32_t seq) {
     if (n > NET_BUILD_MAX - IP_HDR_MIN - TCP_HDR_MIN) return -1;
+    uint32_t irq=irq_save_disable();
     const uint8_t *dst_mac = arp_lookup(s->peer_ip);
-    if (!dst_mac) return -1;
+    if (!dst_mac) {irq_restore(irq);return -1;}
 
     uint8_t *r = g_build;
     for (int i = 0; i < 6; i++) r[i] = dst_mac[i];
@@ -1542,7 +1548,8 @@ static int tcp_send_seg_ex(sock_t *s, uint8_t flags, const uint8_t *data,
     put32(t + 8, s->rcv_nxt);
     t[12] = (uint8_t)(TCP_HDR_MIN << 2);
     t[13] = flags;
-    put16(t + 14, 4096);                           /* 固定通告窗口 */
+    uint16_t window=(uint16_t)tcp_rx_free(s);
+    put16(t + 14, window);
     put16(t + 16, 0); put16(t + 18, 0);
     for (uint32_t i = 0; i < n; i++) t[TCP_HDR_MIN + i] = data[i];
 
@@ -1560,9 +1567,13 @@ static int tcp_send_seg_ex(sock_t *s, uint8_t flags, const uint8_t *data,
 
     put16(ip + 10, cksum(ip, IP_HDR_MIN));
 
-    if (netdev_send(r, ETH_HDR_LEN + iplen) != 0) return -1;
-    g_tcp_tx++;
-    return 0;
+    int rc=netdev_send(r, ETH_HDR_LEN + iplen);
+    if(rc==0) {
+        s->rx_window_sent=window;
+        g_tcp_tx++;
+    }
+    irq_restore(irq);
+    return rc==0 ? 0 : -1;
 }
 
 static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t n) {
@@ -2214,13 +2225,7 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
             }
             return (int)n;
         }
-        /* TCP：字节流；对端 FIN 且读空 → 0（EOF） */
-        uint32_t n = 0;
-        while (n < a[2] && s->rx_r != s->rx_w) {
-            buf[n++] = s->rx[s->rx_r];
-            s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
-        }
-        return (int)n;
+        return net_tcp_recv((int)a[0],buf,a[2],a[3]);
     }
     case SC_CLOSE: {
         sock_t *s = sock_get(a[0]);
@@ -2421,6 +2426,15 @@ int net_tcp_recv(int sid, void *buf, uint32_t maxlen, uint32_t timeout_ms) {
     while (n < maxlen && s->rx_r != s->rx_w) {
         out[n++] = s->rx[s->rx_r];
         s->rx_r = (s->rx_r + 1) % NET_SOCK_BUF;
+    }
+    if(n && s->state==TS_ESTABLISHED){
+        uint32_t irq=irq_save_disable();
+        uint32_t space=tcp_rx_free(s);
+        /* Wake a zero-window sender, or reopen at least one full segment.
+         * Without a window update a sender can idle until its persist timer. */
+        if(space && (!s->rx_window_sent || space>=s->rx_window_sent+TCP_MSS))
+            tcp_send_seg(s,TCP_ACK,0,0);
+        irq_restore(irq);
     }
     /* n==0 且条件满足 => 对端 FIN 且环已空 = 正常 EOF（不是错误） */
     return (int)n;

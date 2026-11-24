@@ -177,7 +177,9 @@ irq0:
     cli
     pusha
     save_kernel_segments
+    push dword [esp + 52]        ; saved CS (16 selectors + 32 pusha + 4 EIP)
     call irq0_handler
+    add esp, 4
     restore_segments
     popa
     sti
@@ -455,15 +457,16 @@ syscall_entry:
     ; A task may have started with stale/null selectors; the pops
     ; above would restore them verbatim and the next user memory
     ; access faults. CS sits right after EIP in the iret frame.
-    ; EDX is scratch (cdecl) - EAX must survive: it is the return value.
-    mov edx, [esp + 4]
-    test dl, 3
+    ; This is an interrupt ABI, not a cdecl call. Only EAX may change.
+    test byte [esp + 4], 3
     jz .sys_ring0_out
+    push edx
     mov dx, 0x23
     mov ds, dx
     mov es, dx
     mov fs, dx
     mov gs, dx
+    pop edx
 .sys_ring0_out:
     iret
 

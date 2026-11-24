@@ -94,7 +94,7 @@ jobs:
       # #UD。实测踩过：Zig 的 levenshtein_zig 里一个数组清零被编成
       # movdqa，rstest 一跑就 panic（vector 06）。Zig 默认 baseline 档
       # 允许 SSE，必须显式 -mcpu i686。
-      - name: CPU feature guard (no SSE in Rust/Zig objects)
+      - name: CPU feature guard (no SSE in Rust/Zig/QuickJS objects)
         run: python3 tools/check_cpu.py
 
       # VMware 配置闸门：vmx 缺 virtualHW.version / config.version 时，
@@ -132,6 +132,14 @@ jobs:
           cp disk.img dist/disk.vhd
           cp tools/gen_diskimg.py tools/make_vhd.py dist/
           cp release/setup_and_run.bat release/setup_and_run.sh dist/
+          mkdir -p dist/licenses/unifont
+          mkdir -p dist/licenses/wuffs
+          mkdir -p dist/licenses/webjs
+          cp third_party/webjs/LICENSE.quickjs third_party/webjs/COPYRIGHT.musl third_party/webjs/README.md dist/licenses/webjs/
+          mkdir -p dist/licenses/tjpgdec
+          cp third_party/tjpgdec/README.md third_party/tjpgdec/tjpgd.h third_party/tjpgdec/tjpgd.c dist/licenses/tjpgdec/
+          cp third_party/wuffs/LICENSE* third_party/wuffs/README.md dist/licenses/wuffs/
+          cp third_party/unifont/LICENSE.txt third_party/unifont/README.md dist/licenses/unifont/
           # 附上构建配置清单，方便用户在真机复现
           cp linker.ld dist/ 2>/dev/null || true
           cp boot/boot.asm dist/ 2>/dev/null || true

@@ -23,6 +23,8 @@
  *     用户程序传进来的指针由内核解引用前还要再过一次 user_range_ok。
  */
 #include "exec.h"
+#include "webipc.h"
+#include "fpu.h"
 #include "mem.h"       /* memset：内核唯一实现 */
 #include "elf.h"
 #include "fs.h"
@@ -101,7 +103,8 @@ static void restore_borrow(uint32_t save_pde1) {
  * 抽出来的"spawn"部分被 exec_file（前台阻塞）和 exec_file_bg（后台）
  * 共用：前者在它之后 task_wait_pid，后者直接返回让 shell 去管。
  */
-static int exec_spawn(const char *name, const char *args, const char **why, int *out_pid) {
+extern const uint8_t webjs_elf_start[],webjs_elf_end[];
+static int exec_spawn(const char *name,const char *args,const char **why,int *out_pid,web_ipc *web) {
     #define FAIL(v, m) do { if (why) *why = (m); return (v); } while (0)
 
     if (name == 0 || name[0] == '\0') FAIL(-1, "missing file name");
@@ -111,32 +114,33 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     char syspath[64];
     const char *src = name;
     int from_sysvol = 0;
-    if (sysvol_resolve_bin(name, syspath, sizeof(syspath)) == 0) {
+    if (!web&&sysvol_resolve_bin(name, syspath, sizeof(syspath)) == 0) {
         src = syspath;
         from_sysvol = 1;
     }
 
-    if (!from_sysvol && !fs_ready())   FAIL(-1, "no filesystem mounted");
+    if (!web&&!from_sysvol && !fs_ready())   FAIL(-1, "no filesystem mounted");
 
-    uint32_t size = from_sysvol ? sysvol_size(src) : fs_get_file_size(src);
+    uint32_t size = web?(uint32_t)(webjs_elf_end-webjs_elf_start):
+                    from_sysvol ? sysvol_size(src) : fs_get_file_size(src);
     if (size == 0)                     FAIL(-2, "file not found or empty");
-    if (!from_sysvol && fs_check_exec(src) != 0) FAIL(-2, "execute permission denied");
-    if (size > EXEC_MAX_IMAGE)         FAIL(-3, "file too large");
+    if (!web&&!from_sysvol && fs_check_exec(src) != 0) FAIL(-2, "execute permission denied");
+    if (!web&&size > EXEC_MAX_IMAGE)         FAIL(-3, "file too large");
 
-    uint8_t *buf = (uint8_t *)kmalloc(size);
+    uint8_t *buf = web?(uint8_t*)webjs_elf_start:(uint8_t *)kmalloc(size);
     if (buf == 0)                      FAIL(-3, "out of kernel heap");
     /* fs_read_file 成功时返回读取字节数（>0），失败返回 -1：
      * 必须核对字节数而不是判 0——判 0 会把成功当失败。 */
-    int got = from_sysvol ? sysvol_read(src, buf, size)
+    int got = web?(int)size:from_sysvol ? sysvol_read(src, buf, size)
                           : fs_read_file(src, buf, size);
     if (got != (int)size) {
-        kfree(buf);
+        if(!web) kfree(buf);
         FAIL(-2, "read failed");
     }
 
     const char *ewhy = 0;
     if (elf_validate(buf, size, &ewhy) != 0) {
-        kfree(buf);
+        if(!web) kfree(buf);
         if (why) *why = (ewhy ? ewhy : "not a valid ELF32 image");
         return -4;
     }
@@ -148,7 +152,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     if (pd_phys == 0 || pt_phys == 0) {
         if (pd_phys) pmm_free_page(pd_phys);
         if (pt_phys) pmm_free_page(pt_phys);
-        kfree(buf);
+        if(!web) kfree(buf);
         FAIL(-4, "out of pages for process address space");
     }
     /* pmm 契约：返回的页内容未定义，交出去前必须自己清零 */
@@ -177,20 +181,20 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     if (elf_load(buf, size, &img, &ewhy) != 0) {
         spawn_teardown(0, 0, 0, 0, pd_phys, pt_phys);
         restore_borrow(save_pde1);
-        kfree(buf);
+        if(!web) kfree(buf);
         if (why) *why = (ewhy ? ewhy : "ELF load failed");
         return -4;
     }
 
     /* ---- 3) 用户栈：连续物理页，整块清零后才交出去 ---- */
-    const uint32_t pages = USER_STACK_PAGES;
+    const uint32_t pages = web?32u:USER_STACK_PAGES;
     const uint32_t stack_base = USER_STACK_TOP - pages * PMM_PAGE_SIZE;
 
     uint32_t sphys = pmm_alloc_pages(pages);
     if (sphys == 0) {
         spawn_teardown(&img, stack_base, 0, 0, pd_phys, pt_phys);
         restore_borrow(save_pde1);
-        kfree(buf);
+        if(!web) kfree(buf);
         FAIL(-5, "out of physical pages for user stack");
     }
     for (uint32_t k = 0; k < pages; k++) {
@@ -204,7 +208,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
             pmm_free_pages(sphys + k * PMM_PAGE_SIZE, pages - k);
             spawn_teardown(&img, 0, 0, 0, pd_phys, pt_phys);
             restore_borrow(save_pde1);
-            kfree(buf);
+            if(!web) kfree(buf);
             FAIL(-5, "user stack mapping failed");
         }
     }
@@ -255,7 +259,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     if (fail_argv != 0) {
         spawn_teardown(&img, stack_base, sphys, pages, pd_phys, pt_phys);
         restore_borrow(save_pde1);
-        kfree(buf);
+        if(!web) kfree(buf);
         FAIL(-5, fail_argv);
     }
 
@@ -264,7 +268,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     if (pid < 0) {
         spawn_teardown(&img, stack_base, sphys, pages, pd_phys, pt_phys);
         restore_borrow(save_pde1);
-        kfree(buf);
+        if(!web) kfree(buf);
         FAIL(-4, "out of process slots");
     }
     task_t *tp = task_find(pid);
@@ -273,11 +277,12 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
         tp->user_stack_phys = sphys;
         tp->user_stack_pages = pages;
         tp->pt_phys = pt_phys;
+        tp->web = web;
     }
 
     /* ---- 6) 还原内核 PDE[1] 并刷掉装载期间建立的用户映射缓存 ---- */
     restore_borrow(save_pde1);
-    kfree(buf);                            /* 映像已进进程页表，缓冲可以还回去 */
+    if(!web) kfree(buf);                            /* 映像已进进程页表，缓冲可以还回去 */
 
     *out_pid = pid;
     return 0;
@@ -287,7 +292,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
 
 int exec_file(const char *name, const char *args, const char **why) {
     int pid;
-    int rc = exec_spawn(name, args, why, &pid);
+    int rc = exec_spawn(name, args, why, &pid,0);
     if (rc < 0) return rc;
     /* ---- 7) 阻塞等待子进程结束（wait 语义），返回它的退出码 ---- */
     panic_set_context(name);
@@ -300,5 +305,9 @@ int exec_file_bg(const char *name, const char *args, int *out_pid) {
     /* 后台启动：spawn 完立刻把 pid 交回调用方，不阻塞。
      * why 仅内部用于失败诊断，调用方通常忽略。 */
     const char *why = 0;
-    return exec_spawn(name, args, &why, out_pid);
+    return exec_spawn(name, args, &why, out_pid,0);
+}
+int exec_webjs(web_ipc *ipc,int *out_pid){
+    if(!ipc||!out_pid||!fpu_available())return -1;
+    return exec_spawn("web-js","",0,out_pid,ipc);
 }

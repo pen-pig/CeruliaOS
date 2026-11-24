@@ -147,8 +147,9 @@ def build_probe(rustc):
     src_m = os.path.getmtime(PROBE_RS)
     html_m = os.path.getmtime(os.path.join(ROOT, "rust", "ezos_rs",
                                            "src", "html.rs"))
+    form_m = os.path.getmtime(os.path.join(ROOT, "rust", "ezos_rs","src","webform.rs"))
     if (os.path.isfile(PROBE_EXE)
-            and os.path.getmtime(PROBE_EXE) > max(src_m, html_m)):
+            and os.path.getmtime(PROBE_EXE) > max(src_m, html_m, form_m, os.path.getmtime(os.path.join(ROOT,"rust","ezos_rs","src","samples.rs")))):
         return True
     p = subprocess.run([rustc, "--edition", "2021", "-O", "-o", PROBE_EXE,
                         PROBE_RS],
@@ -173,10 +174,10 @@ def _run(mode, payload_hex, extra=None):
     return p.stdout.splitlines()
 
 
-def probe_parse(html):
+def probe_parse(html, mode="parse"):
     """-> (nodes, stats, title)；nodes 与 ref_html.Node 同构"""
     src = html if isinstance(html, bytes) else html.encode("utf-8")
-    lines = _run("parse", src.hex())
+    lines = _run(mode, src.hex())
     nodes = []
     stats = None
     title = b""
@@ -253,6 +254,7 @@ EXTRA_PARSE = {
     "textarea": b"<p>a<textarea><p>hidden</p></textarea>b</p>",
     # title 里也有标签和实体
     "title2": b"<title>a<b>c</b>&amp;d</title><p>x</p>",
+    "title_offset": b'<a href="/before">a</a><title>Page T</title><a href="/after">b</a>',
     # 超长属性名不匹配
     "longattr": b'<p class="aaaaaaaaaaaaaaaaaaaa">t</p>',
     # 尖括号裸奔
@@ -297,6 +299,11 @@ def main():
     if not build_probe(rustc):
         print("FAIL: 探针编译失败")
         return 1
+    unit = os.path.join(os.path.dirname(PROBE_EXE), "webform-tests"+(".exe" if os.name=="nt" else ""))
+    if subprocess.run([rustc, "--edition", "2021", "--test", PROBE_RS, "-o", unit]).returncode:
+        return 1
+    if subprocess.run([unit]).returncode:
+        return 1
 
     cases = dict(R.CASES)
     cases.update(EXTRA_PARSE)
@@ -312,6 +319,8 @@ def main():
             fails.append("%s: 探针异常 %s" % (name, e))
             continue
         py = R.parse(html)
+        if ptitle != py.title:
+            fails.append("parse/%s title rust=%r py=%r" % (name, ptitle, py.title))
         pytext = py.text
         got = _fmt_nodes(pnodes)
         want = _py_nodes(py)
@@ -339,6 +348,24 @@ def main():
                              % (name, expect, mine))
         if verbose:
             print("  parse/%-12s ok" % name)
+
+    # The problem adapter must never turn sample output into links or HTML.
+    import json
+    payload = {"decoy":{"samples":[["wrong","wrong"]]},
+               "data":{"problem":{"samples":[["  3\n4", "<a>😀</a>\n"],["","0"]]}}}
+    raw = json.dumps(payload)
+    def problem_nodes(raw, mode="problem"):
+        return probe_parse('<script id="lentille-context" type="application/json">'+raw+'</script>', mode)[0]
+    marked = [n for n in problem_nodes(raw) if n.style==16]
+    checked += 1
+    if [(n.body,n.href_off) for n in marked] != [(b"  3\n4",0),("<a>😀</a>\n".encode(),0),(b"0",0)]:
+        fails.append("problem samples: whitespace, surrogate, inert output or empty input")
+    checked += 1
+    if problem_nodes(raw, "parse") or problem_nodes(raw.replace('"0"', 'null')):
+        fails.append("problem samples: wrong origin mode or partial malformed sample was published")
+    checked += 1
+    dests=[n.body for n in probe_parse('<div id="a&amp;b">x</div><a name="top">y</a><script>"<p id=fake>"</script>')[0] if n.kind==5]
+    if dests!=[b'a&b',b'top']: fails.append("anchor markers: "+repr(dests))
 
     # ---- 断行对拍 ----
     for data, cols, _expect in R.WRAP_CASES:

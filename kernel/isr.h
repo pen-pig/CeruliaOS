@@ -11,6 +11,7 @@
 
 void irq_install(void);
 void pit_init(void);
+void pic_restore_kernel(uint8_t master_mask, uint8_t slave_mask);
 
 /* PIT 1000Hz 系统时钟 tick 计数（每 tick = 1ms），供启动日志真实计时 */
 extern volatile uint32_t g_pit_ticks;

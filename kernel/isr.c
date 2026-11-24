@@ -3,6 +3,7 @@
 #include "port.h"
 #include "task.h"
 #include "net.h"
+#include "webipc.h"
 
 extern void irq0();
 extern void irq1();
@@ -31,17 +32,27 @@ void pit_init(void) {
  * 顺序必须是“先 EOI、再调度”：schedule() 切到别的任务之后，本任务
  * 就回不来了，如果 EOI 被排到调度后面，PIC 在收到 EOI 之前不会再投递
  * 任何中断，整个系统的 IRQ 会被这个“睡着了”的任务卡住。 */
-void irq0_handler(void) {
+void irq0_handler(uint32_t saved_cs) {
     g_in_irq++;
     g_pit_ticks++;
     outb(0x20, 0x20);   /* 主 PIC EOI（必须在 schedule 之前） */
     task_timer_tick();  /* 唤醒定时睡眠到期的任务（置 READY 后再切换） */
     net_tick();         /* TCP 重传定时器，内部按 100ms 步进 */
     g_in_irq--;         /* 必须在 schedule() 之前，原因见定义处注释 */
+    /* The VM interrupt callback covers bytecode. A native QuickJS helper
+     * may not poll, so independently enforce the same lifetime in Ring 3.
+     * Never reap a renderer while it is inside a kernel syscall. */
+    if ((saved_cs & 3) == 3) {
+        task_t *task = task_current();
+        const web_ipc *ipc = task ? task->web : 0;
+        if (ipc && ((int32_t)(g_pit_ticks - ipc->deadline) >= 0 ||
+            __atomic_load_n(ipc->generation,__ATOMIC_RELAXED)!=ipc->expected))
+            process_fault_exit(124);
+    }
     schedule();
 }
 
-void irq_install(void) {
+void pic_restore_kernel(uint8_t master_mask, uint8_t slave_mask) {
     /* 初始化 PIC */
     outb(0x20, 0x11);
     outb(0xA0, 0x11);
@@ -53,8 +64,12 @@ void irq_install(void) {
     outb(0xA1, 0x01);
 
     /* 开启 IRQ0（PIT）、IRQ1（键盘），以及 IRQ2（级联从 PIC） */
-    outb(0x21, 0xF8);   /* 主 PIC: 只开 IRQ0 + IRQ1 + IRQ2 */
-    outb(0xA1, 0xEF);   /* 从 PIC: 只开 IRQ4（也就是 IRQ12，PS/2 鼠标） */
+    outb(0x21, master_mask);
+    outb(0xA1, slave_mask);
+}
+
+void irq_install(void) {
+    pic_restore_kernel(0xF8,0xEF);
 
     /* 注册 IRQ0、IRQ1 与 IRQ12 的处理函数 */
     idt_set_gate(32, (uint32_t)irq0, 0x08, 0x8E);

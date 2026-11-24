@@ -55,14 +55,14 @@ PY = sys.executable
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
              "termwrap", "stackchk", "systest", "oomtest", "userfs", "cc", "foundation",
-             "boot_compat"],
+             "boot_compat", "shell_daily"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
-             "fsck", "save_exfat"],
+             "fsck", "save_exfat", "redirect_save"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
-    "net":  ["netapp", "dhcp", "dns", "fetch"],
-    "gui":  ["vi", "vi_big", "vi_color", "cjk", "uefi3", "exitmode", "html"],
+    "net":  ["netapp", "dhcp", "dns", "fetch", "browser_network", "browser_images", "browser_css", "browser_boxes", "browser_js"],
+    "gui":  ["vi", "vi_big", "vi_color", "notepad_save", "cjk", "uefi3", "exitmode", "html"],
     # gprobe：GUI 交互探针（tests/probe_*.py）。与 gui 层不同——gui 层是
     # 像素/OCR 判据，gprobe 层是**交互行为**判据（点击生效、双击最大化、
     # 焦点排他、9 应用 + 7 游戏巡检、随机组合流）。两者互补：gui 红了说明
@@ -129,7 +129,12 @@ WATCH = [
     # USB-MSC 的块设备接受判据（512 字节扇区 / 容量未知哨兵）在
     # QEMU 上永远走不到 —— 挂的是标准盘。要改判据就得跑这个闸门。
     ("usbmsc", "static hw"),
-    ("gfx", "gui gprobe"), ("gui", "gui gprobe"),
+    ("gfx", "gui gprobe"), ("gui", "gui gprobe"), ("notepad", "notepad_save interact"),
+    ("bearssl", "browser_network"), ("build_tls", "browser_network"),
+    ("webimage", "browser_images"), ("wuffs", "browser_images"),
+    ("webcss", "browser_css"),
+    ("webcss", "browser_boxes"), ("tjpgdec", "browser_boxes"),
+    ("webjs", "browser_js"), ("webipc", "browser_js"), ("webcompat", "browser_js"),
     ("desktop", "gui gprobe"), ("games", "gui gprobe"),
     # exitmode 守的是"进桌面只有 desktop 一条路"：shell.c 的 cmd_exit /
     # kernel.c 的主循环一改就可能把隐式通道放回来
@@ -137,7 +142,7 @@ WATCH = [
     # 浏览器链路：解析在 Rust、排版在 webview.c，两边任一改都可能红。
     # 对拍走 static 的 check_html（宿主探针，几秒），webview/gfxwin 要真跑 QEMU。
     ("html.rs", "static check_html"), ("ref_html", "static check_html"),
-    ("webview", "gui check_html"), ("browser", "gui"), ("http.c", "net gui"),
+    ("webview", "gui check_html browser_js"), ("browser", "gui"), ("http.c", "net gui"),
     ("kmalloc", "static"), ("pmm", "static"),
     # 堆的耗尽演练（oomtest）：改 kmalloc.c 必须跑
     # 栈守卫：改 task.c 的栈池布局或 stackchk.c 的判据，都会让"写穿了没人
@@ -246,7 +251,8 @@ def pick_changed():
     # 静态检查（编码闸门 + 栈预算）看的是整个仓库，几秒就跑完，不管改了
     # 哪个文件都一起过一遍，免得"改 docs 顺手带进一串乱码"这种事溜过去
     layers.add("static")
-    return sorted({n for lay in layers for n in LAYERS[lay]}), out
+    # WATCH may name a single regression as well as a whole layer.
+    return sorted({n for lay in layers for n in LAYERS.get(lay, (lay,))}), out
 
 
 def kill_stale_qemu():

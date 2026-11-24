@@ -16,6 +16,7 @@
  */
 
 #include "gfx.h"
+#include "cjk.h"
 #include "version.h"
 #include "port.h"
 #include "webview.h"
@@ -852,6 +853,7 @@ gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
 void gw_close(gw_window_t *w)
 {
     if (!w) return;
+    if (w->app == GW_APP_BROWSER) wv_close();
     w->used = 0;
     w->hidden = 0;
     if (gw_focused_wnd == w) gw_focused_wnd = NULL;
@@ -1580,6 +1582,7 @@ static void files_key(gw_window_t *w, int key);
 static void notepad_draw(gw_window_t *w);
 static void notepad_key(gw_window_t *w, int key);
 static void notepad_click(gw_window_t *w, int lx, int ly);
+static void np_edit_file(const char *path, uint32_t mount);
 static void sysinfo_draw(gw_window_t *w);
 static void clock_draw(gw_window_t *w);
 static void settings_draw(gw_window_t *w);
@@ -1595,6 +1598,8 @@ static int fm_scroll = 0;
 static int fm_sel = 0;
 static int fm_mode = 0;          /* 0=目录浏览 1=文件查看 */
 static char fm_file_name[64];
+static char fm_file_path[256];
+static uint32_t fm_file_mount;
 static uint8_t fm_file_buf[2048];
 static int fm_file_len = 0;
 static int fm_file_scroll = 0;
@@ -1629,6 +1634,8 @@ static void fm_enter(int idx)
     if (sz > 2047) sz = 2047;
     int ok = fs_read_file(e->name, fm_file_buf, sz);
     if (ok >= 0) {
+        fm_file_mount = fs_mount_generation();
+        if (fs_absolute_path(e->name, fm_file_path, sizeof(fm_file_path))) fm_file_path[0] = 0;
         fm_file_len = ok;
         fm_file_scroll = 0;
         fm_mode = 1;
@@ -1706,7 +1713,7 @@ static void files_draw(gw_window_t *w)
         /* 文件查看 */
         gw_fill(ox, oy, iw, 16, 0x0078D7u);
         gfx_draw_text(ox + 3, oy + 4, fm_file_name, 0x0F, GW_C_BLUE);
-        gfx_draw_text(ox + iw - 13 * 8, oy + 4, "[Esc] back", 0x0F, GW_C_BLUE);
+        gfx_draw_text(ox + iw - 16 * 8, oy + 4, "E:Edit Esc:Back", 0x0F, GW_C_BLUE);
         int row_h = 8;
         int vis = (ih - 18) / row_h;
         int max_scroll = fm_file_len / row_h - vis;
@@ -1755,6 +1762,7 @@ static void files_key(gw_window_t *w, int key)
 {
     (void)w;
     if (fm_mode == 1) {
+        if (key == 'e' || key == 'E') { np_edit_file(fm_file_path, fm_file_mount); return; }
         int vis = (w->inner_h - 18) / 8;
         int max_scroll = fm_file_len / 8 - vis;
         if (max_scroll < 0) max_scroll = 0;
@@ -1788,271 +1796,7 @@ static void files_key(gw_window_t *w, int key)
 /* ==================================================================
  * 应用：记事本
  * ================================================================== */
-#define NP_ROWS 24
-#define NP_COLS 40
-static char np_buf[NP_ROWS][NP_COLS + 1];
-static int np_row = 0, np_col = 0, np_scroll = 0;
-static int np_menu = 0;   /* 0=无菜单 1=File 2=Edit */
-static char np_fname[13] = "NOTE.TXT";   /* 当前文件名（8.3，exFAT 根目录） */
-static int np_dirty = 0;                 /* 有未保存修改 */
-static int np_lines = 1, np_loaded = 0;
-static int np_crlf = 0;
-static char np_path[256];
-static uint32_t np_mount;
-static const char *np_status;
-
-/* np_open has already checked row lengths, row count and line endings. */
-static void np_load_text(const char *name, const char *buf, int len)
-{
-    for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
-    int r = 0, c = 0;
-    for (int i = 0; i < len; i++) {
-        char ch = buf[i];
-        if (ch == '\r') continue;
-        if (ch == '\n') { r++; c = 0; continue; }
-        if ((unsigned char)ch < 32) ch = ' ';
-        if (c < NP_COLS) { np_buf[r][c++] = ch; np_buf[r][c] = 0; }
-    }
-    np_row = 0; np_col = 0; np_scroll = 0; np_dirty = 0;
-    np_lines = r + 1;
-    int n = 0;
-    while (name[n] && n < 12) { np_fname[n] = name[n]; n++; }
-    np_fname[n] = 0;
-    /* 同步窗口标题 */
-    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
-        gw_window_t *w = &gw_windows[i];
-        if (w->used && (unsigned long)w->user == GW_APP_NOTEPAD) {
-            int k = 0;
-            const char *p = "Notepad - ";
-            while (p[k] && k < GW_TITLE_MAX - 1) { w->title[k] = p[k]; k++; }
-            int j = 0;
-            while (np_fname[j] && k < GW_TITLE_MAX - 1) w->title[k++] = np_fname[j++];
-            w->title[k] = 0;
-        }
-    }
-}
-
-/* Serialize just the document, not the entire display grid. */
-static void np_save(void)
-{
-    static uint8_t sbuf[NP_ROWS * (NP_COLS + 2) + 1];
-    int n = 0;
-    int lim = (int)sizeof(sbuf) - 1;
-    if (!np_path[0] || np_mount != fs_mount_generation()) {
-        np_status = "Volume changed";
-        return;
-    }
-    uint32_t old_size;
-    uint8_t dir;
-    if (!np_loaded && fs_stat(np_path, &old_size, &dir) == 0) {
-        np_status = "Open file first";
-        return;
-    }
-    for (int r = 0; r < np_lines; r++) {
-        for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
-        if (r + 1 < np_lines) {
-            if (np_crlf) sbuf[n++] = '\r';
-            sbuf[n++] = '\n';
-        }
-    }
-    if (fs_create_file(np_path, sbuf, (uint32_t)n) == 0) {
-        np_dirty = 0; np_loaded = 1; np_status = "Saved";
-    } else np_status = "Save failed";
-}
-
-/* 打开：读当前文件名文件载入（失败提示保留原内容） */
-static int np_open(void)
-{
-    static uint8_t rbuf[NP_ROWS * (NP_COLS + 2) + 1];
-    uint32_t sz;
-    uint8_t dir;
-    if (np_dirty) { np_status = "Unsaved edits"; return 0; }
-    np_status = "Open failed";
-    if (!np_path[0] || np_mount != fs_mount_generation() ||
-        fs_stat(np_path, &sz, &dir) != 0 || dir) return 0;
-    if (sz > sizeof(rbuf) - 1) { np_status = "Too large"; return 0; }
-    if (fs_read_file(np_path, rbuf, sz) != (int)sz) return 0;
-    /* Reject text the grid cannot reproduce, before replacing the buffer. */
-    int row = 0, col = 0, crlf = -1;
-    for (uint32_t i = 0; i < sz; i++) {
-        int cr = rbuf[i] == '\r' && i + 1 < sz && rbuf[i+1] == '\n';
-        if (cr) i++;
-        if (rbuf[i] == '\n') {
-            if (crlf >= 0 && crlf != cr) { np_status = "Mixed newlines"; return 0; }
-            crlf = cr;
-            if (++row >= NP_ROWS) { np_status = "Too many lines"; return 0; }
-            col = 0;
-        } else if (rbuf[i] < 32 || ++col > NP_COLS) {
-            np_status = "Unsupported text"; return 0;
-        }
-    }
-    np_load_text(np_fname, (const char *)rbuf, (int)sz);
-    np_loaded = 1; np_crlf = crlf > 0; np_status = NULL;
-    return 1;
-}
-
-static void notepad_draw(gw_window_t *w)
-{
-    int ox = gw_ox(w), oy = gw_oy(w);
-    int iw = w->inner_w, ih = w->inner_h;
-    /* 菜单栏 */
-    gw_fill(ox, oy, iw, 14, 0xF0F0F0u);
-    gw_fill(ox, oy + 14, iw, 1, 0xD0D0D0u);
-    gfx_draw_text(ox + 4, oy + 3, "File", 0x00, np_menu == 1 ? 0x0E : 0x0F);
-    gfx_draw_text(ox + 36, oy + 3, "Edit", 0x00, np_menu == 2 ? 0x0E : 0x0F);
-    /* 菜单栏右侧：文件名 + 修改标记 */
-    {
-        char fb[18];
-        int n = 0;
-        while (np_fname[n] && n < 12) { fb[n] = np_fname[n]; n++; }
-        if (np_dirty && n < 17) fb[n++] = '*';
-        fb[n] = 0;
-        const char *label = np_status ? np_status : fb;
-        gfx_draw_text(ox + iw - 8 * gw_strlen(label) - 4, oy + 3, label, np_dirty ? 0x0E : 0x07, 0x0F);
-    }
-    /* 文本区（先画，下拉菜单必须在其上，否则菜单被文本区背景覆盖） */
-    gw_fill(ox, oy + 15, iw, ih - 15, CLR_EDIT_BG);
-    int row_h = 10;
-    int vis = (ih - 15) / row_h;
-    int mx = mouse_get_x();
-    for (int r = 0; r < vis; r++) {
-        int idx = np_scroll + r;
-        if (idx >= NP_ROWS) break;
-        int ry = oy + 15 + r * row_h;
-        int is_cur = (idx == np_row);
-        if (is_cur) gw_fill(ox, ry, iw, row_h, 0xF0F7FDu);
-        /* 无行号：文本从左侧 ox+2 起画 */
-        gfx_draw_text(ox + 2, ry + 1, np_buf[idx], 0x00, is_cur ? 0x0E : 0x0F);
-        if (is_cur && np_col < NP_COLS && mx >= ox && mx < ox + iw) {
-            /* 光标：反色块（静态，不闪烁以免引起视觉抖动） */
-            gw_fill(ox + 2 + np_col * 8, ry + 1, 1, 8, 0x0078D7u);
-        }
-    }
-    /* 下拉菜单（最后画，置顶显示） */
-    if (np_menu == 1) {
-        int my0 = oy + 14;
-        gw_fill(ox + 2, my0, 90, 4 * 16 + 2, 0xF0F0F0u);
-        gw_fill(ox + 2, my0, 90, 1, 0xD0D0D0u);
-        gw_fill(ox + 2, my0 + 4 * 16, 90, 1, 0xD0D0D0u);
-        gfx_draw_text(ox + 10, my0 + 4,  "New",  0x00, 0x0F);
-        gfx_draw_text(ox + 10, my0 + 20, "Open", 0x00, 0x0F);
-        gfx_draw_text(ox + 10, my0 + 36, "Save", 0x00, 0x0F);
-        gfx_draw_text(ox + 10, my0 + 52, "Clear", 0x00, 0x0F);
-    } else if (np_menu == 2) {
-        int my0 = oy + 14;
-        gw_fill(ox + 2, my0, 90, 2 * 16 + 2, 0xF0F0F0u);
-        gw_fill(ox + 2, my0, 90, 1, 0xD0D0D0u);
-        gw_fill(ox + 2, my0 + 32, 90, 1, 0xD0D0D0u);
-        gfx_draw_text(ox + 10, my0 + 4, "Home", 0x00, 0x0F);
-        gfx_draw_text(ox + 10, my0 + 20, "End", 0x00, 0x0F);
-    }
-}
-
-static void notepad_key(gw_window_t *w, int key)
-{
-    int vis = (w->inner_h - 15) / 10;
-    if (vis < 1) vis = 1;
-    if (key >= 32 && key < 127 && np_col < NP_COLS) {
-        char *line = np_buf[np_row];
-        int len = gw_strlen(line);
-        if (len < NP_COLS) {
-            for (int k = len; k > np_col; k--) line[k] = line[k - 1];
-            line[np_col] = (char)key;
-            line[len + 1] = 0;
-            np_col++;
-            np_dirty = 1; np_status = NULL;
-            if (np_lines <= np_row) np_lines = np_row + 1;
-        }
-    } else if (key == 8 || key == 127) {
-        char *line = np_buf[np_row];
-        if (np_col > 0) {
-            for (int k = np_col - 1; k < NP_COLS; k++) line[k] = line[k + 1];
-            np_col--;
-            np_dirty = 1; np_status = NULL;
-        } else if (np_row > 0) {
-            int prev = gw_strlen(np_buf[np_row - 1]), len = gw_strlen(line);
-            if (prev + len > NP_COLS) { np_status = "Line too long"; return; }
-            for (int i = 0; i <= len; i++) np_buf[np_row - 1][prev + i] = line[i];
-            for (int r = np_row; r + 1 < np_lines; r++)
-                for (int c = 0; c <= NP_COLS; c++) np_buf[r][c] = np_buf[r+1][c];
-            np_buf[--np_lines][0] = 0;
-            np_row--; np_col = prev;
-            np_dirty = 1; np_status = NULL;
-            if (np_row < np_scroll) np_scroll = np_row;
-        }
-    } else if (key == '\n' || key == '\r') {
-        if (np_lines < NP_ROWS && np_row < NP_ROWS - 1) {
-            for (int r = np_lines; r > np_row + 1; r--)
-                for (int c = 0; c <= NP_COLS; c++) np_buf[r][c] = np_buf[r-1][c];
-            int n = 0;
-            while (np_buf[np_row][np_col + n]) {
-                np_buf[np_row+1][n] = np_buf[np_row][np_col + n];
-                n++;
-            }
-            np_buf[np_row+1][n] = 0;
-            np_buf[np_row][np_col] = 0;
-            np_lines++;
-            np_dirty = 1; np_status = NULL;
-            np_row++;
-            np_col = 0;
-            if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1;
-        }
-    } else if (key == KEY_UP) {
-        if (np_row > 0) { np_row--; if (np_row < np_scroll) np_scroll = np_row; }
-    } else if (key == KEY_DOWN) {
-        if (np_row + 1 < np_lines) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
-    } else if (key == KEY_LEFT) {
-        if (np_col > 0) np_col--;
-        else if (np_row > 0) { np_row--; np_col = gw_strlen(np_buf[np_row]); }
-    } else if (key == KEY_RIGHT) {
-        int len = gw_strlen(np_buf[np_row]);
-        if (np_col < len) np_col++;
-        else if (np_row + 1 < np_lines) { np_row++; np_col = 0; }
-    }
-    if (np_col > gw_strlen(np_buf[np_row])) np_col = gw_strlen(np_buf[np_row]);
-}
-
-static void notepad_click(gw_window_t *w, int lx, int ly)
-{
-    (void)w;
-    /* 菜单栏 */
-    if (ly < 14) {
-        if (lx >= 2 && lx < 34) np_menu = (np_menu == 1) ? 0 : 1;
-        else if (lx >= 34 && lx < 66) np_menu = (np_menu == 2) ? 0 : 2;
-        else np_menu = 0;
-        return;
-    }
-    /* File 下拉菜单项（宽 90，4 项 x 16，与绘制高度 4*16+2 一致） */
-    if (np_menu == 1 && lx >= 2 && lx < 92 && ly >= 14 && ly < 14 + 4 * 16 + 2) {
-        int item = (ly - 14) / 16;
-        if (item == 0) {   /* New：清空并回到 NOTE.TXT */
-            if (np_dirty) { np_status = "Unsaved edits"; np_menu = 0; return; }
-            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
-            np_row = 0; np_col = 0; np_scroll = 0;
-            np_load_text("NOTE.TXT", "", 0);
-            np_loaded = 0; np_crlf = 0; np_status = NULL;
-        } else if (item == 1) {   /* Open：读当前文件名（失败保留原内容） */
-            np_open();
-        } else if (item == 2) {   /* Save：序列化后 exFAT 覆盖写 */
-            np_save();
-        } else if (item == 3) {   /* Clear：仅清空缓冲，文件不变 */
-            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
-            np_row = 0; np_col = 0; np_scroll = 0;
-            np_dirty = 1;
-            np_lines = 1; np_status = NULL;
-        }
-        np_menu = 0;
-        return;
-    }
-    if (np_menu == 2 && lx >= 2 && lx < 92 && ly >= 14 && ly < 48) {
-        int item = (ly - 14) / 16;
-        if (item == 0) { np_row = 0; np_col = 0; np_scroll = 0; }
-        else if (item == 1) { np_row = np_lines - 1; np_col = gw_strlen(np_buf[np_row]); np_scroll = np_row - 9; if (np_scroll < 0) np_scroll = 0; }
-        np_menu = 0;
-        return;
-    }
-    np_menu = 0;   /* 点击其他区域：关闭菜单 */
-}
+#include "notepad.inc"
 
 /* ==================================================================
  * 应用：画板（Paint）
@@ -2772,7 +2516,7 @@ static void browser_key(gw_window_t *w, int key)
         if (!wv_bar_has_focus()) { dino_key(key); return; }
     }
     if (wv_bar_has_focus()) { wv_bar_key(key); return; }
-    if (key == KEY_LEFT || key == KEY_RIGHT) {
+    if (!wv_field_active() && (key == KEY_LEFT || key == KEY_RIGHT)) {
         /* 左右键留给历史（上下键给滚动） */
         if (key == KEY_LEFT) { wv_back(); return; }
         wv_forward();
@@ -2793,8 +2537,7 @@ static void browser_click(gw_window_t *w, int lx, int ly)
     }
     if (wv_is_dino_url()) { dino_click(); return; }
     /* 页面区：命中链接就跟随 */
-    uint16_t href = wv_hit_link(lx, ly + wv_scroll_get());
-    if (href) wv_follow(href);
+    wv_page_click(lx,ly-BR_TOOLBAR_H);
 }
 
 static void browser_mousedown(gw_window_t *w, int lx, int ly)
@@ -2915,26 +2658,7 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_NOTEPAD:
         w->draw = notepad_draw; w->key = notepad_key;
         w->click = notepad_click;
-        /* np_buf/np_row/np_col 是全局静态：上次关窗残留的文本会带进新窗
-           （实测：打 "ab" 退格关窗重开，残留 "a"）。关闭重开应是空白文档。 */
-        for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
-        np_row = 0; np_col = 0; np_scroll = 0;
-        np_menu = 0; np_dirty = 0;
-        np_lines = 1; np_loaded = 0; np_crlf = 0; np_status = NULL;
-        np_mount = fs_mount_generation();
-        if (fs_absolute_path("NOTE.TXT", np_path, sizeof(np_path)) != 0) np_path[0] = 0;
-        {
-            const char *defname = "NOTE.TXT";
-            int fn = 0;
-            while (defname[fn] && fn < 12) { np_fname[fn] = defname[fn]; fn++; }
-            np_fname[fn] = 0;
-        }
-        {
-            uint32_t existing_size;
-            uint8_t is_dir;
-            if (np_path[0] && fs_stat(np_path, &existing_size, &is_dir) == 0)
-                np_open();
-        }
+        np_start(w);
         break;
     case GW_APP_SYSINFO:
         w->draw = sysinfo_draw;
@@ -3159,8 +2883,10 @@ static void gw_end_drags(void)
 void gw_handle_mouse(int mx, int my, int buttons)
 {
     static int last_btn = 0;
+    static gw_window_t *click_owner;
     int pressed = (buttons & 1) && !(last_btn & 1);
     int released = !(buttons & 1) && (last_btn & 1);
+    if (pressed) click_owner = NULL;
 
     /* 拖动中：桌面层拦截（开始菜单/任务栏/图标双击）一律让位给拖动态。
      * 否则窗口拖到图标列即死锁：光标在图标上→事件被图标吞→窗口收不到
@@ -3292,7 +3018,12 @@ void gw_handle_mouse(int mx, int my, int buttons)
     int title_btn = gw_title_btn_hit(hit, mx, my);
     if (title_btn) {
         if (pressed) {
-            if (title_btn == 2) { gw_close(hit); gw_tbtn_arm(mx, my); }
+            if (title_btn == 2) {
+                if (hit->app == GW_APP_NOTEPAD && np_dirty) {
+                    gw_bring_front(hit); np_prompt(NP_CLOSE); gw_dirty = 1;
+                } else gw_close(hit);
+                gw_tbtn_arm(mx, my);
+            }
             else if (title_btn == 1) { gw_minimize(hit); gw_tbtn_arm(mx, my); }
         }
         last_btn = buttons;
@@ -3353,10 +3084,14 @@ void gw_handle_mouse(int mx, int my, int buttons)
 
     /* 内容区 */
     if (pressed) {
+        click_owner = hit;
         gw_bring_front(hit);
         if (hit->mousedown) hit->mousedown(hit, mx - gw_ox(hit), my - gw_oy(hit));
     } else if (released) {
-        if (hit->click) hit->click(hit, mx - gw_ox(hit), my - gw_oy(hit));
+        /* Opening an app consumes the press in the Start menu. Don't place
+         * its caret (or open a file underneath) on the following release. */
+        if (click_owner == hit && hit->click) hit->click(hit, mx - gw_ox(hit), my - gw_oy(hit));
+        click_owner = NULL;
     }
     /* 内容区鼠标移动回调（Paint 拖画：每帧调用，回调内自行读按键状态） */
     if (hit->mousemove)
@@ -3512,6 +3247,22 @@ static void gw_dump_state_serial(void)
         buf[n] = 0;
         serial_write(buf);
     }
+    if (gw_focused_wnd && gw_focused_wnd->app == GW_APP_BROWSER) {
+        n=gw_skey(buf,0,"[GW] browser status=");
+        n=gw_sdec(buf,n,wv_http_status());
+        n=gw_skey(buf,n," bytes="); n=gw_sdec(buf,n,wv_byte_count());
+        n=gw_skey(buf,n," nodes="); n=gw_sdec(buf,n,wv_nodes_parsed());
+        n=gw_skey(buf,n," form="); n=gw_sdec(buf,n,wv_form_available());
+        n=gw_skey(buf,n," headinglinks="); n=gw_sdec(buf,n,wv_heading_links());
+        n=gw_skey(buf,n," images="); n=gw_sdec(buf,n,wv_image_count());
+        n=gw_skey(buf,n," css="); n=gw_sdec(buf,n,wv_css_count());
+        n=gw_skey(buf,n," bg="); n=gw_sdec(buf,n,wv_css_backgrounds());
+        n=gw_skey(buf,n," err="); n=gw_sdec(buf,n,wv_error_number());
+        n=gw_skey(buf,n," js="); n=gw_sdec(buf,n,wv_scripts_done());
+        n=gw_skey(buf,n," jserr="); n=gw_sdec(buf,n,wv_scripts_error());
+        n=gw_skey(buf,n," ticks="); n=gw_sdec(buf,n,g_pit_ticks);
+        buf[n++]='\n'; buf[n]=0; serial_write(buf);
+    }
     serial_write("[GW] end\n");
 }
 
@@ -3553,6 +3304,7 @@ void gw_handle_key(int key)
         if (key == 'm' || key == 'M') { gw_start_menu_active = !gw_start_menu_active; return; }
         if (key == 'q' || key == 'Q') { gw_quit = 1; return; }
         if (key == 't' || key == 'T') { gw_launch_app(GW_APP_TERMINAL); return; }
+        if (key == 'n' || key == 'N') { gw_launch_app(GW_APP_NOTEPAD); return; }
         if (key == 'b' || key == 'B') { gw_launch_app(GW_APP_BROWSER); return; }
         if (key == 's' || key == 'S' || key == 'd' || key == 'D') {
             gw_launch_game((key == 's' || key == 'S') ? 3 : 4);
@@ -4776,6 +4528,7 @@ static int gw_session_dialog(int mode)
     gw_cursor_bg_valid = 0;
     gfx_set_clip(0, 0, GFX_W, GFX_H);
     gw_fill(0, 0, GFX_W, GFX_H, 0x0E1B2Au);
+    wv_forget_session();
     keyboard_discard_boot_input();
     mouse_btn_ev_flush();
     int last_bt = mouse_get_buttons() & 1;
@@ -4910,11 +4663,13 @@ void gw_forget_session(void)
     auth_wipe(fm_entries, sizeof(fm_entries));
     auth_wipe(fm_file_buf, sizeof(fm_file_buf));
     auth_wipe(fm_file_name, sizeof(fm_file_name));
+    auth_wipe(fm_file_path, sizeof(fm_file_path));
     fm_count = fm_scroll = fm_sel = fm_mode = fm_file_len = fm_file_scroll = 0;
     auth_wipe(np_buf, sizeof(np_buf));
-    auth_wipe(np_fname, sizeof(np_fname));
+    auth_wipe(np_read, sizeof(np_read));
+    auth_wipe(np_input, sizeof(np_input));
     auth_wipe(np_path, sizeof(np_path));
-    np_row = np_col = np_scroll = np_menu = np_dirty = 0;
+    np_len = np_pos = np_top = np_width = np_mode = np_menu = np_dirty = 0;
     auth_wipe(term_buf, sizeof(term_buf));
     auth_wipe(term_hist, sizeof(term_hist));
     auth_wipe(term_input, sizeof(term_input));
@@ -4952,6 +4707,7 @@ void gw_demo(void)
     int last_mx = -1, last_my = -1, last_sec = -1, last_bt = 0;
     int changed_user = 0;
     for (;;) {
+        if (wv_poll()) gw_dirty = 1;
         int mx = mouse_get_x(), my = mouse_get_y();
         int bt = mouse_get_buttons();
         int c = keyboard_getchar();
@@ -4968,8 +4724,8 @@ void gw_demo(void)
         gw_dmg_reset();
 
         if (c) {
-            if (c == 0x1B) {
-                if (gw_start_menu_active) gw_start_menu_active = 0;
+            if (c == 0x1B && gw_start_menu_active) {
+                gw_start_menu_active = 0;
             } else {
                 gw_handle_key(c);
             }

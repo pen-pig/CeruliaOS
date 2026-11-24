@@ -2439,11 +2439,11 @@ const char *shell_extra_help(const char *cmd) {
                "  E2E can assert on layout instead of squinting at pixels.";
     }
     if (x_strcasecmp(cmd, "cjk") == 0) {
-        return "cjk - GB2312 Chinese glyph demo in graphics mode\n"
+        return "cjk - Unicode Chinese glyph demo in graphics mode\n"
                "  usage: cjk\n"
                "  Enters the framebuffer and draws Chinese text at fixed\n"
                "  positions (64,64 / 64,96 / 64,128), then waits for any key\n"
-               "  and returns to text mode. The font is a 16x16 GB2312\n"
+               "  and returns to text mode. The font is a 16px GNU Unifont\n"
                "  bitmap compiled into the kernel - no disk needed.";
     }
     if (x_strcasecmp(cmd, "help") == 0) {
@@ -2990,8 +2990,15 @@ static const char *fetch_err(int rc) {
     case -4: return "send failed";
     case -5: return "bad or truncated response";
     case -6: return "malformed status line / headers";
-    case -7: return "https needs TLS, not implemented";
-    case -8: return "too many redirects";
+    case -7: return "unsupported URL scheme";
+    case -8: return "redirect failed";
+    case -9: return "network client busy";
+    case -10: return "TLS handshake or transport failed";
+    case -11: return "TLS needs a valid UTC clock";
+    case -12: return "TLS needs a secure random source";
+    case -13: return "TLS certificate verification failed";
+    case -14: return "blocked HTTPS downgrade";
+    case -15: return "HTTPS requires a DNS name";
     default:  return "unknown error";
     }
 }
@@ -3381,9 +3388,10 @@ void cmd_cjk(const char *args) {
     gfx_init();
     gfx_clear(0x00);
     /* 固定坐标：tests/test_cjk.py 直接按点阵比对这些区域 */
-    gfx_draw_text_utf8(64, 64,  "中文渲染", 8, 0x0A, 0x00);
-    gfx_draw_text_utf8(64, 96,  "蔚蓝系统", 8, 0x0F, 0x00);
-    gfx_draw_text_utf8(64, 128, "GB2312 16x16", 12, 0x0B, 0x00);
+    gfx_draw_text_utf8(64, 64,  "中文渲染", sizeof("中文渲染")-1, 0x0A, 0x00);
+    gfx_draw_text_utf8(64, 96,  "蔚蓝系统", sizeof("蔚蓝系统")-1, 0x0F, 0x00);
+    gfx_draw_text_utf8(64, 128, "Unicode 16px", sizeof("Unicode 16px")-1, 0x0B, 0x00);
+    gfx_draw_text_utf8_row(64,160,"龘　㐂 café，繁體中文",sizeof("龘　㐂 café，繁體中文")-1,0x0F,0x00);
     /* 等任意键退出 */
     while (keyboard_getchar() == 0) {
     }

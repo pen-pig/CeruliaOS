@@ -11,6 +11,9 @@
 #include "fd.h"
 #include "fs.h"
 #include "net.h"
+#include "webipc.h"
+#include "isr.h"
+#include "mem.h"
 
 /* kernel_entry.asm */
 extern void syscall_entry(void);
@@ -75,6 +78,42 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
 
     g_syscalls++;
     task_t *cur = task_current();
+    if(cur&&cur->web){
+        web_ipc *p=cur->web;
+        int stopped=(int32_t)(g_pit_ticks-p->deadline)>=0 ||
+            __atomic_load_n(p->generation,__ATOMIC_RELAXED)!=p->expected;
+        if(num==SYS_EXIT){process_exit((int)a1);return -1;}
+        if(num==105)return stopped; /* QuickJS interrupt callback */
+        if(stopped)return -1;
+        if(num==106){
+            if(!user_range_ok(a1,4,1))return -1;
+            memcpy((void*)a1,&p->utc,4);return 0;
+        }
+        if(num==107){
+            if(!p->dom_text||!a2||!user_range_ok(a1,a2,0))return -1;
+            int n=p->dom_text((const uint8_t*)a1,a2,0);
+            if(n<=0||!a3)return n;
+            if(!user_range_ok(a3,(uint32_t)n,1))return -1;
+            /* Copy from the same immutable document. The caller's source
+             * and destination must not alias across the two lookups. */
+            if(a3<a1+a2&&a1<a3+(uint32_t)n)return -1;
+            return p->dom_text((const uint8_t*)a1,a2,(uint8_t*)a3);
+        }
+        if(num==SYS_READ&&a1==0){
+            uint32_t n=p->source_len-p->in_at;
+            if(n>a3)n=a3;
+            if(!n)return 0;
+            if(!user_range_ok(a2,n,1))return -1;
+            memcpy((void*)a2,p->source+p->in_at,n);p->in_at+=n;return (int)n;
+        }
+        if(num==SYS_WRITE&&a1==1){
+            if(a3>p->cap-p->out_at||!user_range_ok(a2,a3,0))return -1;
+            memcpy(p->output+p->out_at,(const void*)a2,a3);p->out_at+=a3;return (int)a3;
+        }
+        /* Even under the root desktop, no fd, filesystem, network, or
+         * process operations are available to the page's renderer. */
+        return -1;
+    }
 
     switch (num) {
     case SYS_WRITE: {

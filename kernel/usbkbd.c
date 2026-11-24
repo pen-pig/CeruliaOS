@@ -97,6 +97,10 @@ static int hid_map(uint8_t k, int shift) {
     case 0x37u: return shift ? '>'  : '.';
     case 0x38u: return shift ? '?'  : '/';
     case 0x39u: return 0;                    /* CapsLock：无字符 */
+    case 0x4Au: return KEY_HOME;
+    case 0x4Bu: return KEY_PGUP;
+    case 0x4Du: return KEY_END;
+    case 0x4Eu: return KEY_PGDN;
     case 0x4Fu: return KEY_RIGHT;
     case 0x50u: return KEY_LEFT;
     case 0x51u: return KEY_DOWN;

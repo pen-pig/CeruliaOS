@@ -110,9 +110,15 @@ done
 
 OBJS=""
 for src in $(find kernel -name '*.c' | sort); do
+    # Legacy Windows font generator output is not linked.
+    [ "$src" != kernel/cjk_font.c ] || continue
     obj="${src%.c}.o"
     echo "[ci] CC ${src}"
-    "$CC" $CFLAGS -c "$src" -o "$obj"
+    if [ "$src" = kernel/webimage.c ]; then
+        "$CC" $CFLAGS -Os -Ithird_party/wuffs/include -c "$src" -o "$obj"
+    else
+        "$CC" $CFLAGS -c "$src" -o "$obj"
+    fi
     OBJS="$OBJS $obj"
 done
 
@@ -132,6 +138,11 @@ echo "[ci] ASM boot/task_switch.asm (elf32)"
 "$ASM" -f elf32 boot/task_switch.asm -o boot/task_switch.o
 echo "[ci] ASM kernel/bios_thunk.asm (elf32)"
 "$ASM" -f elf32 kernel/bios_thunk.asm -o kernel/bios_thunk_asm.o
+"$PYTHON" tools/build_cjk.py temp/cjk_bitmap.bin temp/gbk_unicode.bin
+"$ASM" -f elf32 kernel/cjk_bitmap.asm -o kernel/cjk_bitmap.o
+"$PYTHON" tools/build_webjs.py "$CC" "$LD" user/webjs.elf
+"$ASM" -f elf32 kernel/webjs_blob.asm -o kernel/webjs_blob.o
+OBJS="$OBJS kernel/webjs_blob.o"
 
 # ---- 非 C 增量（Rust / Zig） ----
 # kernel/rust_bridge.h 里 EZ_EXFAT_IMPL 默认 1 = Rust：exFAT 的卷校验和 /
@@ -182,8 +193,9 @@ fi
 # 顺序与 build.ninja 一致：启动/切换 .o → 内核 .o → Zig → Rust 静态库
 # （静态库必须放最后，否则归档里的符号可能解析不到）。
 echo "[ci] LD kernel_raw.bin"
+"$PYTHON" tools/build_tls.py "$CC" temp/libcerulia_tls.a
 if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
-        $OBJS kernel/bios_thunk_asm.o "$ZIG_OBJ" "$RUST_LIB" > ci-ld.log 2>&1; then
+        $OBJS kernel/bios_thunk_asm.o kernel/cjk_bitmap.o "$ZIG_OBJ" temp/libcerulia_tls.a "$RUST_LIB" > ci-ld.log 2>&1; then
     echo "[ci] FATAL: link failed, tail:" >&2
     tail -40 ci-ld.log >&2
     ann_log ci-ld.log ld

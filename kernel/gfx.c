@@ -729,6 +729,60 @@ void gfx_putpixel(int x, int y, uint8_t color) {
     }
 }
 
+/* Render only the visible rectangle, into the same surface as desktop text.
+ * 8-bit VGA has a different DAC on some adapters; use the standard 16 slots. */
+void gfx_bitmap565(int x,int y,int w,int h,const uint16_t *src,int sw,int sh){
+    if(!src || w<=0 || h<=0 || sw<=0 || sh<=0)return;
+    int l=x<0?0:x,t=y<0?0:y,r=x+w,b=y+h;
+    if(r>GFX_W)r=GFX_W;
+    if(b>GFX_H)b=GFX_H;
+    if(clip_w>0){
+        if(l<clip_x)l=clip_x;
+        if(t<clip_y)t=clip_y;
+        if(r>clip_x+clip_w)r=clip_x+clip_w;
+        if(b>clip_y+clip_h)b=clip_y+clip_h;
+    }
+    for(int j=t;j<b;j++){
+        const uint16_t *row=src+(j-y)*sh/h*sw;
+        for(int i=l;i<r;i++){
+            uint16_t p=row[(i-x)*sw/w];
+            unsigned off=(unsigned)j*gfx_stride+i;
+            if(gfx_bpp==2){((uint16_t*)gfx_fb)[off]=p;continue;}
+            unsigned red=p>>11,green=(p>>5)&63,blue=p&31;
+            red=red<<3|red>>2;green=green<<2|green>>4;blue=blue<<3|blue>>2;
+            if(gfx_bpp==4)((uint32_t*)gfx_fb)[off]=0xff000000u|(green<<8)|
+                (gfx_fmt?((red<<16)|blue):((blue<<16)|red));
+            else gfx_fb[off]=(red>=128?4:0)|(green>=128?2:0)|(blue>=128?1:0)|
+                             (red+green+blue>=520?8:0);
+        }
+    }
+}
+
+void gfx_rgb_fill(int x,int y,int w,int h,uint32_t rgb){
+    if(w<=0||h<=0)return;
+    if(gfx_bpp==1){
+        unsigned r=(rgb>>16)&255,g=(rgb>>8)&255,b=rgb&255;
+        gfx_fill_rect(x,y,w,h,(r>=128?4:0)|(g>=128?2:0)|(b>=128?1:0)|(r+g+b>=520?8:0));
+        return;
+    }
+    int l=x<0?0:x,t=y<0?0:y,r=x+w,b=y+h;
+    if(r>GFX_W)r=GFX_W;
+    if(b>GFX_H)b=GFX_H;
+    if(clip_w>0){
+        if(l<clip_x)l=clip_x;
+        if(t<clip_y)t=clip_y;
+        if(r>clip_x+clip_w)r=clip_x+clip_w;
+        if(b>clip_y+clip_h)b=clip_y+clip_h;
+    }
+    uint16_t p=rgb565(rgb>>16,rgb>>8,rgb);
+    uint32_t q=0xff000000u|(gfx_fmt?rgb:((rgb>>16)|(rgb&0xff00)|((rgb&255)<<16)));
+    for(int j=t;j<b;j++)for(int i=l;i<r;i++){
+        unsigned off=(unsigned)j*gfx_stride+i;
+        if(gfx_bpp==2)((uint16_t*)gfx_fb)[off]=p;
+        else ((uint32_t*)gfx_fb)[off]=q;
+    }
+}
+
 /* 8bpp 下按行整段写：fill_rect 是最热的绘制调用（浏览器刷背景、窗口
  * 边框、桌面全屏都走它），逐像素 putpixel 在 TCG 下慢一个数量级。 */
 void gfx_fill_rect(int x, int y, int w, int h, uint8_t color) {
@@ -812,60 +866,89 @@ static void gfx_draw_tofu(int x, int y, uint8_t fg, uint8_t bg) {
     }
 }
 
-/* 与 Rust 的 utf8_seq_len 保持一致（非法首字节按 1 走，画成豆腐块） */
-static uint32_t gfx_seq_len(const uint8_t *s, uint32_t i, uint32_t n) {
-    uint8_t b = s[i];
-    if (b < 0x80) return 1;
-    if (b == 0xC0 || b == 0xC1 || b >= 0xF5) return 1;
-    uint32_t l = (b & 0xE0) == 0xC0 ? 2u : (b & 0xF0) == 0xE0 ? 3u : 4u;
-    if (i + l > n) return 1;
-    for (uint32_t k = 1; k < l; k++)
-        if ((s[i + k] & 0xC0) != 0x80) return 1;
-    return l;
+static int gfx_variation_selector(uint32_t cp) {
+    return (cp>=0xfe00 && cp<=0xfe0f) || (cp>=0xe0100 && cp<=0xe01ef);
+}
+
+int gfx_utf8_cell(const char *s, uint32_t n, uint32_t *bytes) {
+    uint32_t cp=cjk_utf8_decode(s,n,bytes);
+    if(!n || gfx_variation_selector(cp)) return 0;
+    int width=8;
+    cjk_lookup(cp,&width);
+    return width;
 }
 
 int gfx_text_width_utf8(const char *sp, uint32_t n) {
-    const uint8_t *s = (const uint8_t *)sp;
     uint32_t i = 0;
     int w = 0;
     while (i < n) {
-        uint32_t l = gfx_seq_len(s, i, n);
-        if (l == 1) {
-            w += 8;
-        } else {
-            /* 与 gfx_draw_text_utf8 的步进一致：有字形 16px，否则 tofu 8px */
-            uint32_t adv = 0;
-            uint32_t cp = cjk_utf8_decode(sp + i, n - i, &adv);
-            w += (cp && cjk_lookup(cp)) ? cjk_glyph_width() : 8;
-        }
+        uint32_t l;
+        w+=gfx_utf8_cell(sp+i,n-i,&l);
         i += l;
     }
     return w;
 }
 
-int gfx_draw_text_utf8(int x, int y, const char *sp, uint32_t n,
-                       uint8_t fg, uint8_t bg) {
-    const uint8_t *s = (const uint8_t *)sp;
+static int gfx_utf8_draw(int x,int y,const char *s,uint32_t n,
+                         uint8_t fg,uint8_t bg,int ascii_pad) {
     uint32_t i = 0;
     while (i < n) {
-        uint32_t l = gfx_seq_len(s, i, n);
-        if (l == 1) {
-            if (s[i] >= 0x20 && s[i] < 0x7F) gfx_draw_char(x, y, (char)s[i], fg, bg);
-            else gfx_draw_tofu(x, y, fg, bg);   /* 控制字符也不该画出字形 */
+        uint32_t l;
+        uint32_t cp=cjk_utf8_decode(s+i,n-i,&l);
+        if (cp>=0x20 && cp<0x7F) {
+            if(ascii_pad) gfx_fill_rect(x,y,8,16,bg);
+            gfx_draw_char(x,y+ascii_pad,(char)cp,fg,bg);
             x += 8;
-        } else {
-            /* 多字节序列：有字形画汉字（16px 宽），没有才退回豆腐块。
-             * 2026-10-18 前这里一律 tofu——中文网页整页空白。 */
-            uint32_t adv = 0;
-            uint32_t cp = cjk_utf8_decode((const char *)(s + i), n - i, &adv);
-            if (cp && cjk_draw_glyph(x, y, cp, fg, bg)) {
-                x += cjk_glyph_width();
-            } else {
-                gfx_draw_tofu(x, y, fg, bg);
-                x += 8;
+        } else if(!gfx_variation_selector(cp)) {
+            int advance=cjk_draw_glyph(x,y,cp,fg,bg);
+            if(!advance) {
+                if(ascii_pad) gfx_fill_rect(x,y,8,16,bg);
+                gfx_draw_tofu(x,y+ascii_pad,fg,bg);
+                advance=8;
             }
+            x+=advance;
         }
         i += l;
+    }
+    return x;
+}
+
+int gfx_draw_text_utf8(int x,int y,const char *s,uint32_t n,uint8_t fg,uint8_t bg) {
+    return gfx_utf8_draw(x,y,s,n,fg,bg,0);
+}
+
+int gfx_draw_text_utf8_row(int x,int y,const char *s,uint32_t n,uint8_t fg,uint8_t bg) {
+    return gfx_utf8_draw(x,y,s,n,fg,bg,4);
+}
+
+int gfx_css_cell(const char *s,uint32_t n,uint32_t *bytes,unsigned size){
+    int w=gfx_utf8_cell(s,n,bytes);
+    return w?(int)((w*size+15)/16):0;
+}
+int gfx_css_text(int x,int y,const char *s,uint32_t n,unsigned size,uint32_t rgb){
+    while(n){
+        uint32_t bytes,cp=cjk_utf8_decode(s,n,&bytes);
+        s+=bytes;n-=bytes;
+        if(gfx_variation_selector(cp))continue;
+        int ascii=cp>=32&&cp<127,w=8;
+        const uint8_t *bm=ascii?font8x8[cp]:cjk_lookup(cp,&w);
+        unsigned outw=(w*size+15)/16;
+        for(unsigned dy=0;dy<size;dy++){
+            int top=(int)(dy*16/size);
+            int rows=size<16?(int)((dy+1)*16/size):top+1;
+            for(unsigned dx=0;dx<outw;dx++){
+                int left=(int)(dx*w/outw),cols=outw<(unsigned)w?(int)((dx+1)*w/outw):left+1,ink=0;
+                /* When shrinking a bitmap, keep thin strokes that lie
+                 * between the sample points of nearest-neighbour scaling. */
+                for(int sy=top;sy<rows&&!ink;sy++)for(int sx=left;sx<cols&&!ink;sx++){
+                    if(ascii)ink=(sy>=4&&sy<12)&&(bm[sy-4]&(1u<<sx));
+                    else if(bm)ink=bm[sy*2+sx/8]&(128u>>(sx%8));
+                    else ink=(sy==2||sy==13||sx==1||sx==w-2);
+                }
+                if(ink)gfx_rgb_fill(x+(int)dx,y+(int)dy,1,1,rgb);
+            }
+        }
+        x+=(int)outw;
     }
     return x;
 }

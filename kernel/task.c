@@ -13,6 +13,7 @@
 #include "stackchk.h"   /* 任务内核栈守卫（水位 + canary + guard） */
 #include "dmesg.h"      /* 栈守卫巡检告警 */
 #include "irqflags.h"
+#include "fpu.h"
 
 /* ---------- 内核栈池 ----------
  * 每任务 16KB，.bss.kstack 由链接器放进内核 .bss 工作区。
@@ -147,6 +148,8 @@ void task_init(void) {
         g_tasks[i].name[0] = '\0';
         g_tasks[i].cr3 = 0;
         g_tasks[i].is_user = 0;
+        g_tasks[i].web = 0;
+        g_tasks[i].x87_saved = 0;
         g_tasks[i].exit_code = 0;
         g_tasks[i].user_stack_phys = 0;
         g_tasks[i].user_stack_pages = 0;
@@ -204,6 +207,8 @@ int task_create(const char *name, void (*fn)(void *), void *arg) {
     t->switches   = 0;
     t->cr3        = 0;              /* 内核线程：用内核页目录 */
     t->is_user    = 0;
+    t->web        = 0;
+    t->x87_saved  = 0;
     t->exit_code  = 0;
     t->user_stack_phys = 0;
     t->user_stack_pages = 0;
@@ -269,6 +274,8 @@ int task_create_process(const char *name, uint32_t entry, uint32_t user_esp,
     t->switches   = 0;
     t->cr3        = pd_phys;
     t->is_user    = 1;
+    t->web        = 0;
+    t->x87_saved  = 0;
     t->exit_code  = 0;
     t->user_stack_phys = 0;
     t->user_stack_pages = 0;
@@ -544,6 +551,8 @@ int task_fork(void *syscall_frame) {
     c->switches   = 0;
     c->cr3        = pd_phys;
     c->is_user    = 1;
+    c->web        = 0;
+    c->x87_saved  = 0;
     c->exit_code  = 0;
     c->user_stack_phys   = child_stack;
     c->user_stack_pages  = parent->user_stack_pages;
@@ -811,6 +820,13 @@ void schedule(void) {
     uint32_t cr3_new = n->cr3 ? n->cr3 : PAGING_PD_ADDR;
     if (cr3_new != cr3_cur) paging_switch_cr3(cr3_new);
 
+    /* Interrupt-driven preemption can arrive mid x87 expression. The JS
+     * renderer (and any other task) must not inherit another task's regs. */
+    if (fpu_available()) {
+        asm volatile("fnsave %0" : "=m"(cur->x87));
+        cur->x87_saved=1;
+        if(n->x87_saved)asm volatile("frstor %0"::"m"(n->x87));
+    }
     switch_to(&g_tasks[old_idx].esp, n->esp);
 
     /* 切换回来后收割 ZOMBIE 槽位（含 fd 表释放）。

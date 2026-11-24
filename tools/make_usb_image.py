@@ -303,7 +303,7 @@ def has_efi_signature(data, pe_magic):
     return 8 < cert_size <= length and revision == 0x200 and kind == 2
 
 
-def check_image(path, require_x64=False):
+def check_image(path, require_x64=False, kernel_source=None):
     """只读自检：分区表 / BPB / 引导扇区副本 / 内核位置 / FAT32 卷"""
     size = os.path.getsize(path)
     assert size % SECTOR == 0, "size not sector aligned"
@@ -361,7 +361,7 @@ def check_image(path, require_x64=False):
                 problems.append('KERNEL.BIN first 4KB are all zero')
             else:
                 # 与源内核逐字节比对（KERNEL.BIN 是裸二进制，不是 ELF）
-                src = os.path.join(ROOT, 'kernel.bin')
+                src = kernel_source if kernel_source is not None else os.path.join(ROOT, 'kernel.bin')
                 if os.path.isfile(src):
                     with open(src, 'rb') as f:
                         if f.read() != data:

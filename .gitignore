@@ -102,6 +102,9 @@ tests/disk_fs.vhd
 tests/disk_edge.vhd
 tests/_vhd_regen/
 usb-image.bin
+!tests/fixtures/browser/halves.png
+!tests/fixtures/browser/halves.jpg
+!tests/fixtures/browser/large-baseline.jpg
 
 # VMware 侧验证产物（vmx 入库，磁盘镜像与串口日志不入库）
 vmware/*.vmdk
@@ -116,6 +119,8 @@ vmware/*.scoreboard
 vmware/*.vmsd
 vmware/*.vmxf
 vmware/nvram
+vmware/cerulia.vmx
+vmware/cerulia.nvram
 vmware/vmware.log
 
 # Rust 构建产物（target/ 下的中间产物不入库；源码与 Cargo.lock 入库）

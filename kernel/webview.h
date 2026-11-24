@@ -54,6 +54,7 @@
 #define WV_FX_IN_STR   0x08   /* 文本在 str 竞技场     */
 #define WV_FX_LITERAL  0x10   /* text_off 是字面量地址 */
 #define WV_FX_TITLE    0x20   /* 页面标题              */
+#define WV_FX_JS       0x40   /* replacement plain text in renderer result */
 
 /* ---- 节点种类（与 Rust 的 NODE_* 一致） ---- */
 #define WV_N_TEXT   0
@@ -61,6 +62,7 @@
 #define WV_N_BR     2
 #define WV_N_HR     3
 #define WV_N_IMG    4
+#define WV_N_ANCHOR 5
 
 /* ---- 标签 id（与 Rust 的 T_* 一致；只列渲染用到的） ---- */
 #define WV_T_OTHER      0
@@ -84,18 +86,31 @@
 
 /* 排版后的一行。12 字节 x 1400 行 = 16.8KB，static 放 .bss。 */
 typedef struct {
-    int16_t  y;         /* 相对页面顶的像素 */
-    uint8_t  indent;
+    int32_t  y;         /* 相对页面顶的像素 */
+    uint16_t indent;
     uint8_t  fs;        /* 来自 Rust 的 S_*  */
     uint8_t  fx;        /* 渲染层扩展位     */
     uint8_t  scale;
     uint16_t text_off;
     uint16_t text_len;
     uint16_t href;      /* 0 = 非链接；否则 = str 竞技场偏移 + 1 */
+    uint16_t size;
+    uint16_t extent;
+    uint32_t fg,bg;
 } wv_line_t;
 
 /* ---- 生命周期 ---- */
 void wv_init(void);
+void wv_cancel(void);
+void wv_close(void);
+void wv_forget_session(void);
+void wv_script_register(const uint8_t *src,unsigned len);
+unsigned wv_scripts_done(void);
+unsigned wv_scripts_error(void);
+unsigned wv_image_count(void);
+unsigned wv_css_count(void);
+unsigned wv_css_backgrounds(void);
+int wv_poll(void);
 
 /* 抓 URL 并排版。成功返回 0；失败返回 http_fetch 的错误码。 */
 int  wv_go(const char *url);
@@ -111,6 +126,7 @@ const char *wv_current_url(void);
 const char *wv_current_title(void);
 uint32_t    wv_byte_count(void);
 int32_t     wv_http_status(void);
+unsigned    wv_error_number(void);
 const char *wv_err_text(int rc);
 
 /* ---- 绘制（浏览器窗口调用） ---- */
@@ -124,6 +140,7 @@ void     wv_bar_set_focus(int f);
 int      wv_bar_has_focus(void);
 void     wv_bar_key(int key);
 void     wv_page_key(int key);
+void     wv_page_click(int x,int y); /* relative to page, not toolbar */
 void     wv_scroll_by(int dy);
 void     wv_scroll_to_top(void);
 uint16_t wv_hit_link(int px, int py);   /* 命中返回 href 偏移，否则 0 */
@@ -138,6 +155,9 @@ int  wv_follow(uint16_t href);          /* 跟随链接（href 取自 wv_hit_lin
 void wv_dump(const char *label);
 uint16_t wv_line_count(void);
 uint32_t wv_nodes_parsed(void);   /* 解析出的节点数 */
+int wv_form_available(void);
+int wv_field_active(void);
+uint32_t wv_heading_links(void);
 const wv_line_t *wv_line_at(uint16_t i);
 const char *wv_line_text(const wv_line_t *ln);   /* NUL 结尾，指向内部缓冲 */
 uint32_t wv_is_truncated(void);   /* 正文/行数被截断（竞技场或行表满了） */

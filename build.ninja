@@ -66,7 +66,7 @@ rule zig_obj
     command = cmd /c cd rust\ezos_zig&& $ZIG build-obj -target x86-freestanding -mcpu i686 -O ReleaseSafe ezos_zig.zig
     description = ZIG rust/ezos_zig/ezos_zig.zig
 
-build rust/ezos_rs/target/i686-ezos/release/libezos_rs.a: cargo_rs rust/ezos_rs/src/lib.rs rust/i686-ezos.json
+build rust/ezos_rs/target/i686-ezos/release/libezos_rs.a: cargo_rs rust/ezos_rs/Cargo.toml rust/ezos_rs/src/lib.rs rust/ezos_rs/src/html.rs rust/ezos_rs/src/webform.rs rust/ezos_rs/src/samples.rs rust/i686-ezos.json
     pool = console
 
 build rust/ezos_zig/ezos_zig.o: zig_obj rust/ezos_zig/ezos_zig.zig
@@ -144,13 +144,9 @@ rule make_usb
     description = BUILD usb-image.bin
 
 rule run_qemu
-    # -icount shift=auto: 虚拟时钟跟踪真实时间（否则 portable QEMU 非 icount 模式
-    # 下虚拟时钟仅按 vCPU 执行进度推进，PIT 实测只有 ~7% 实时，游戏/计时全慢）
-    # 步骤 7 起默认挂 rtl8139（user-net：guest 10.0.2.15 / 宿主 10.0.2.2）。
-    # 无网卡环境下 rtl8139_init 静默跳过，不影响启动。宿主转发（hostfwd
-    # tcp/udp 7000-7001）由 temp/test_step7_sock.py 自带——不放这里，
-    # 常驻 hostfwd 在端口被占时会直接拒绝 QEMU 启动。
-    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd -netdev user,id=n0 -device rtl8139,netdev=n0
+    # SLiRP uses live host I/O. On the portable Windows QEMU, -icount
+    # shift=auto can stall TCP with this guest even after DHCP succeeds.
+    command = "$QEMU" -cpu max -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd -netdev user,id=n0 -device e1000,netdev=n0
     description = RUN EZOS
 
 # ===================== ???? =====================
@@ -210,6 +206,10 @@ build kernel/e1000.o: cc kernel/e1000.c
 build kernel/net.o: cc kernel/net.c
 build kernel/http.o: cc kernel/http.c
 build kernel/webview.o: cc kernel/webview.c
+build kernel/webcss.o: cc kernel/webcss.c
+build kernel/websession.o: cc kernel/websession.c
+build kernel/webimage.o: cc kernel/webimage.c
+    CFLAGS = -ffreestanding -Os -Wall -Wextra -Werror -Ikernel -Ithird_party/wuffs/include -MMD
 build kernel/shell.o: cc kernel/shell.c
 build kernel/shell_extra.o: cc kernel/shell_extra.c
 build kernel/exfat.o: cc kernel/exfat.c
@@ -233,7 +233,12 @@ build kernel/gui.o: cc kernel/gui.c
 build kernel/mouse.o: cc kernel/mouse.c
 build kernel/gfxwin.o: cc kernel/gfxwin.c
 build kernel/cjk.o: cc kernel/cjk.c
-build kernel/cjk_font.o: cc kernel/cjk_font.c
+rule pack_cjk
+    command = cmd /c python tools/build_cjk.py $out
+    description = CJK $out
+
+build temp/cjk_bitmap.bin temp/gbk_unicode.bin: pack_cjk tools/build_cjk.py third_party/unifont/unifont-17.0.04.hex.gz
+build kernel/cjk_bitmap.o: asm_elf kernel/cjk_bitmap.asm | temp/cjk_bitmap.bin temp/gbk_unicode.bin
 build kernel/desktop.o: cc kernel/desktop.c
 build kernel/games.o: cc kernel/games.c
 build kernel/hiscore.o: cc kernel/hiscore.c
@@ -268,7 +273,19 @@ build user/cc.o: cc_bootstrap user/cc.c | user/cc_runtime_data.h
 build user/cc_libc.o: cc_large_libc user/libc.c
 build user/cc.elf: link_user user/crt0.o user/cc.o user/cc_libc.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/xhci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/http.o kernel/webview.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/user.o kernel/auth.o kernel/trash.o kernel/reg.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/bios_thunk.o kernel/bios_thunk_asm.o kernel/cjk.o kernel/cjk_font.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
+rule build_webjs
+    command = python tools/build_webjs.py "$CC" "$LD" $out
+    description = BUILD QuickJS renderer (ring 3)
+build user/webjs.elf: build_webjs user/crt0.o user/user.ld user/webjs.c user/webcompat.c user/libc.c user/libc.h tools/build_webjs.py third_party/webjs/quickjs-2026-06-04.tar.xz third_party/webjs/musl-1.2.5.tar.gz $
+    user/webcompat/assert.h user/webcompat/ctype.h user/webcompat/endian.h user/webcompat/fenv.h user/webcompat/inttypes.h user/webcompat/limits.h user/webcompat/setjmp.h $
+    user/webcompat/stdint.h user/webcompat/stdio.h user/webcompat/stdlib.h user/webcompat/string.h user/webcompat/time.h user/webcompat/bits/alltypes.h user/webcompat/sys/time.h
+build kernel/webjs_blob.o: asm_elf kernel/webjs_blob.asm | user/webjs.elf
+
+rule tls_archive
+    command = python tools/build_tls.py "$CC" $out
+    description = CC BearSSL (freestanding)
+build temp/libcerulia_tls.a: tls_archive tools/build_tls.py third_party/bearssl/port.c third_party/bearssl/roots.pem third_party/bearssl/bearssl-0.6.tar.gz third_party/bearssl/compat/string.h third_party/bearssl/compat/stdlib.h
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/xhci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/http.o kernel/webview.o kernel/webcss.o kernel/websession.o kernel/webimage.o kernel/webjs_blob.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/user.o kernel/auth.o kernel/trash.o kernel/reg.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/stackchk.o kernel/oomtest.o kernel/gfx.o kernel/bios_thunk.o kernel/bios_thunk_asm.o kernel/cjk.o kernel/cjk_bitmap.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o temp/libcerulia_tls.a rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 
 build kernel.bin os-image.bin: make_image boot/boot.bin boot/stage2.bin kernel_raw.bin tools/make_image.py boot/layout.inc
 
@@ -320,10 +337,11 @@ build helpchk: help_check tools/check_help.py
 # VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
 # 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
 rule make_vmware
-    command = cmd /c python tools/make_vmware.py
-    description = VMWARE vmware/ezos.vmx
+    command = cmd /c python tools/make_vmware.py --profile cerulia
+    description = VMWARE vmware/cerulia.vmx
 
-build vmware: make_vmware usb-image.bin tools/make_vmware.py
+build vmware/cerulia.vmx vmware/cerulia-usb.vmdk vmware/cerulia-data.vmdk: make_vmware usb-image.bin tools/make_vmware.py tools/gen_diskimg.py
+build vmware: phony vmware/cerulia.vmx vmware/cerulia-usb.vmdk vmware/cerulia-data.vmdk
 
 default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf user/dirwalk.elf disk.vhd usb-image.bin
 

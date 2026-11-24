@@ -89,8 +89,7 @@ def exercise(qmp, serial, scratch):
         key(qmp, name)
     key(qmp, "esc")  # discard the q from the password box
     assert "[GW]" not in serial.tail_from(start) and ROOT_PROMPT not in serial.tail_from(start)
-    inputs(qmp, serial, "wrong password", "DESKTOP: authentication failed")
-    time.sleep(0.9)
+    inputs(qmp, serial, "wrong password", "DESKTOP: authentication failed", "DESKTOP: retry ready")
     inputs(qmp, serial, ROOT_PASS, "DESKTOP: unlocked")
     assert state(qmp, serial)[0] == 1  # the original terminal survived
     _, _, unlocked = screenshot(qmp, scratch / "unlocked.ppm")

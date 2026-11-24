@@ -63,7 +63,7 @@ fn main() {
     let _ = std::io::stdin().read_to_string(&mut input);
 
     match mode {
-        "parse" => {
+        "parse" | "problem" => {
             let src = unhex(&input);
             // 用字节缓冲而不是 vec![HtmlNode{..}]：后者要求 Clone，
             // 而为了编探针去给生产结构体加 derive 是不该发生的改动。
@@ -88,6 +88,9 @@ fn main() {
                     scratch.as_mut_ptr(),
                     ST_CAP as u32,
                     stats.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                    (mode == "problem") as u32,
+                    None,
                 )
             };
             println!("ret {}", n);
@@ -107,7 +110,7 @@ fn main() {
                 // 正文**不一定在 text 竞技场**：<img alt=...> 的 alt 存在
                 // href 竞技场（那里还塞了 href 和 title），按 text_off 去
                 // text[] 里取会越界。判据用 kind：IMG=4 走 href[]。
-                let (buf, base): (&Vec<u8>, usize) = if nd.kind == 4 {
+                let (buf, base): (&Vec<u8>, usize) = if matches!(nd.kind, 4..=6) {
                     (&href, 0)
                 } else {
                     (&text, 0)

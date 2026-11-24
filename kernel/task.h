@@ -59,6 +59,9 @@ typedef struct {
     /* ---- 步骤 6c：用户进程（is_user=1）才有意义 ---- */
     uint32_t     cr3;               /* 进程页目录物理地址；0 = 用内核页目录 */
     uint8_t      is_user;           /* 1 = 用户进程：有独立地址空间，ring3 执行 */
+    struct web_ipc *web;
+    uint8_t      x87_saved;
+    uint8_t      x87[108] __attribute__((aligned(4)));
     int          exit_code;         /* 退出码（ZOMBIE 时有效） */
     uint32_t     user_stack_phys;   /* 用户栈首物理页（连续 user_stack_pages 页） */
     uint32_t     user_stack_pages;

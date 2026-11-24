@@ -16,6 +16,8 @@
 #include "dmesg.h"
 #include "port.h"
 #include "mouse.h"
+#include "irqflags.h"
+#include "isr.h"
 
 extern char bios_stub16_begin[];  /* bios_thunk.asm */
 extern char bios_stub16_end[];
@@ -161,7 +163,17 @@ int bios_int10(uint16_t ax, uint16_t bx, uint16_t cx, uint16_t di) {
     *(volatile uint16_t *)BT_PARM_CX = cx;
     *(volatile uint16_t *)BT_PARM_DI = di;
 
+    /* VMware's video BIOS can leave IRQ0 undelivered after a mode switch.
+     * The real-mode IVT must not receive our protected-mode PIC vectors.
+     * On return restore the kernel vectors, driver masks and 1 kHz clock
+     * before allowing a pending interrupt to dispatch. */
+    uint32_t flags = irq_save_disable();
+    uint8_t master = inb(0x21), slave = inb(0xA1);
+    outb(0x21, 0xff); outb(0xA1, 0xff);
     bios_thunk_enter();
+    pic_restore_kernel(master,slave);
+    pit_init();
+    irq_restore(flags);
 
     /* 防御：BIOS 若重编程过 8042（SeaBIOS 实测没有，VMware 未知），
      * 按内核既定意图恢复——否则桌面收不到任何键。want==cb 时零副作用 */

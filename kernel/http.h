@@ -6,12 +6,12 @@
  * 后续 HTML 渲染共用。
  *
  * 范围（刻意收窄，缺什么就明说，不做半吊子降级）：
- *   ✓ http:// 明文；GET；Host 头；Connection: close
+ *   ✓ http:// 明文 GET；Host 头；Connection: close
+ *   ✓ 浏览器 HTTPS 导航可带内存 Cookie 与同源 HTML 表单 POST。
  *   ✓ Content-Length 与 chunked 两种响应体
  *   ✓ 301/302/303/307/308 重定向（相对/绝对 URL，有环与跳数上限）
  *   ✓ 分块传输的逐块长度解析（含 ;ext 扩展丢弃）
- *   ✗ HTTPS/TLS  —— 没有 TLS 就没有 HTTPS。遇到 https:// 直接报错，
- *     绝不"去掉 s 降级成 http"冒充成功（那会把请求明文发出去还报错成功）。
+ *   ✓ HTTPS: verified TLS 1.2; HTTPS redirects never downgrade to plaintext.
  *   ✗ 分块编码的 Trailer 头 —— 直接忽略，不影响正文。
  *   ✗ keep-alive 复用 —— 一律 Connection: close，取完就关。
  *
@@ -25,9 +25,9 @@
 
 #define HTTP_MAX_REDIR   5      /* 重定向跳数上限（防环） */
 #define HTTP_MAX_HDRS    24     /* 保存的头字段条数上限 */
-#define HTTP_URL_MAX     256    /* URL 缓冲 */
+#define HTTP_URL_MAX     2048   /* long links, including search redirect URLs */
 #define HTTP_HOST_MAX    128    /* 主机名缓冲 */
-#define HTTP_PATH_MAX    384    /* 路径+查询缓冲 */
+#define HTTP_PATH_MAX    HTTP_URL_MAX
 
 /* fetch 的结果码。0 成功，其余见 http_fetch() 注释。 */
 typedef struct {
@@ -37,7 +37,9 @@ typedef struct {
     uint32_t redirects;         /* 跟随的重定向次数                   */
     uint8_t  chunked;           /* 1 = 响应体是 chunked               */
     uint8_t  truncated;         /* 1 = 超出 out 容量，被截断           */
+    uint8_t  form_policy;       /* conservative CSP subset: 1=no JS, 2=no forms */
     char     content_type[48];  /* Content-Type 的值（截断保护）      */
+    char     final_url[HTTP_URL_MAX];
 } http_result_t;
 
 /*
@@ -54,6 +56,15 @@ typedef struct {
  */
 int http_fetch(const char *url, void *out, uint32_t outcap,
                uint32_t timeout_ms, http_result_t *r);
+/* Anonymous subresource. Validate each redirect and the actual address used
+ * for a cross-origin connection; do not contact a private service via a CDN. */
+int http_fetch_image(const char *url,const char *origin,void *out,uint32_t cap,
+                     uint32_t timeout_ms,http_result_t *r,int (*cancelled)(void));
+int http_fetch_style(const char *url,const char *origin,void *out,uint32_t cap,
+                     uint32_t timeout_ms,http_result_t *r,int (*cancelled)(void));
+int http_fetch_web(const char *url,void *out,uint32_t cap,uint32_t timeout_ms,http_result_t *r,
+                   unsigned token,int cookies,const void *body,unsigned n,int (*cancelled)(void));
+int http_resolve_url(const char *base,const char *reference,char *out,uint32_t cap);
 
 /* URL 拆分：只做语法切分，不联网。host 若为 IP 字面量则原样保留。
  * 成功返回 0。fail closed：任何越界/畸形输入返回 -1。 */

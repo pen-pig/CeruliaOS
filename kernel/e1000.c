@@ -221,7 +221,8 @@ static const pci_device_t *find_device(void) {
     int n = pci_device_count();
     for (int i = 0; i < n; i++) {
         const pci_device_t *d = pci_get_device(i);
-        if (d->vendor_id == E1000_VENDOR && d->device_id == E1000_DEVICE)
+        if (d->vendor_id == E1000_VENDOR &&
+            (d->device_id == E1000_DEVICE || d->device_id == 0x100F)) /* VMware 82545EM */
             return d;
     }
     return 0;
@@ -306,7 +307,7 @@ int e1000_init(void) {
      * BAR 常在 32MB identity 之外，必须显式映射（PCD/PWT 关缓存，
      * 与 ehci.c 同款）；寄存器窗口最远到 0x5400 区，映射 8 页覆盖。 */
     uint32_t bar = d->bar[0];
-    if ((bar & 1u) != 0 || (bar & 0x6u) != 0) {
+    if ((bar & 1u) || ((bar & 6u) && ((bar & 6u) != 4u || d->bar[1] != 0))) {
         dmesg_write("E1000: BAR0 is not 32-bit MMIO, giving up");
         return -1;
     }

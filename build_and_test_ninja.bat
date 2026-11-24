@@ -45,7 +45,12 @@ if errorlevel 1 (
 
 rem ===== ninja resolution: prefer ninja.exe next to this script, fallback to PATH =====
 rem Python's PATH changes do not propagate back to this batch process.
-for /f "delims=" %%L in ('""%PYEXE%" tools\gen_ninja.py --linker-dir"') do set "PATH=%%L;%PATH%"
+for /f "delims=" %%L in ('""%PYEXE%" tools\gen_ninja.py --linker-dir"') do (
+    set "PATH=%%L;%PATH%"
+    for %%V in ("%%L\..\..\..\..\..\..\..\Common7\Tools\VsDevCmd.bat") do set "EZOS_VSDEV=%%~fV"
+)
+rem Host build scripts also link against SDK import libraries (kernel32.lib).
+if not defined VSCMD_VER if defined EZOS_VSDEV if exist "%EZOS_VSDEV%" call "%EZOS_VSDEV%" -arch=x64 -no_logo
 set "NINJA=%~dp0ninja.exe"
 if not exist "%NINJA%" (
     where ninja >nul 2>nul
@@ -59,6 +64,7 @@ if not exist "%NINJA%" (
 
 rem ===== parallel build -j = CPU logical cores =====
 set "NINJA_JOBS=%NUMBER_OF_PROCESSORS%"
+if /i "%~1"=="vmware" goto vmware
 if "%BUILD_ONLY%"=="1" (
     echo [build-only] ninja -j%NINJA_JOBS% building os-image.bin, no QEMU...
     "%NINJA%" -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% os-image.bin
@@ -71,4 +77,10 @@ if "%BUILD_ONLY%"=="1" (
 )
 echo [parallel] ninja -j%NINJA_JOBS% building and launching QEMU...
 "%NINJA%" -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% run
+set "RUN_RC=%ERRORLEVEL%"
 pause
+exit /b %RUN_RC%
+
+:vmware
+"%NINJA%" -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% vmware
+exit /b %ERRORLEVEL%

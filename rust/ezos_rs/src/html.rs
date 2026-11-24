@@ -18,6 +18,10 @@
 //! 长度由调用方担保。
 
 #![allow(dead_code)]
+#[path = "webform.rs"]
+pub mod webform;
+#[path = "samples.rs"]
+mod samples;
 
 // ---------------- 节点种类 ----------------
 pub const NODE_TEXT: u8 = 0; // 一段同样式的正文
@@ -25,6 +29,7 @@ pub const NODE_BLOCK: u8 = 1; // 块级分隔（p/div/li/h1..）
 pub const NODE_BR: u8 = 2; // <br>
 pub const NODE_HR: u8 = 3; // <hr>
 pub const NODE_IMG: u8 = 4; // <img>（只取 alt 文本）
+pub const NODE_ANCHOR: u8 = 5; // invisible scroll destination; text_off points into href arena
 
 // ---------------- 样式位 ----------------
 pub const S_BOLD: u8 = 0x01;
@@ -329,7 +334,7 @@ fn is_void(t: u8) -> bool {
 /// 内容整体跳过（浏览器里有对应渲染，EZOS 上没有）。
 fn is_opaque(t: u8) -> bool {
     t == T_NOSCRIPT
-        || t == T_TEMPLATE
+        || t == T_TEMPLATE || t == T_TEXTAREA
         || t == T_IFRAME
         || t == T_SVG
         || t == T_CANVAS
@@ -387,6 +392,7 @@ struct HP {
     st: *mut u8,
     st_cap: u32,
     list_depth: i32,
+    css: Option<unsafe extern "C" fn(u32,*const u8,u32,*const u8,u32)>,
 }
 
 impl HP {
@@ -417,6 +423,7 @@ impl HP {
         (*p).text_off = off as u16;
         (*p).text_len = len as u16;
         (*p).href_off = href_off;
+        if let Some(css)=self.css { css(0, self.src, self.ncount, self.src, 0); }
         self.ncount += 1;
     }
 
@@ -471,7 +478,7 @@ impl HP {
 
     /// 往 href 竞技场追加一条 NUL 分隔的字符串，返回 offset+1（0 = 失败）
     unsafe fn href_add(&mut self, off: u32, len: u32) -> u16 {
-        if len == 0 || len > 1024 {
+        if len == 0 || len > 2047 || (0..len).any(|i| *self.href.add((off+i) as usize)==0) {
             return 0;
         }
         let end = off + len;
@@ -482,7 +489,7 @@ impl HP {
         *self.href.add(end as usize) = 0;
         self.hlen = end + 1;
         self.links += 1;
-        (end + 1) as u16
+        (off + 1) as u16
     }
 }
 
@@ -736,7 +743,7 @@ fn raw_tag_len(t: u8) -> u32 {
 }
 
 /// 跳到配对结束标签之后（<script>/<style>/<title> 的原始文本区）。
-unsafe fn skip_raw(h: &mut HP, tag: u8) {
+unsafe fn skip_raw(h: &mut HP, tag: u8) -> u32 {
     let name_len = raw_tag_len(tag);
     let mut j = h.i;
     while j + 1 < h.len {
@@ -752,12 +759,13 @@ unsafe fn skip_raw(h: &mut HP, tag: u8) {
                     k += 1;
                 }
                 h.i = if k < h.len { k + 1 } else { h.len };
-                return;
+                return j;
             }
         }
         j += 1;
     }
     h.i = h.len;
+    h.len
 }
 
 /// 跳过 <svg>/<canvas>/... 直到配对的结束标签（带深度计数）。
@@ -850,9 +858,10 @@ unsafe fn read_attr(
                     while v < to && !is_space(*src.add(v as usize)) && *src.add(v as usize) != b'>' {
                         v += 1;
                     }
-                    (v, v)
+                    (k, v)
                 };
                 let mut p = vs;
+                j = if q == b'"' || q == b'\'' { (ve + 1).min(to) } else { ve };
                 while p < ve {
                     if *src.add(p as usize) == b'&' {
                         let n = decode_entity(src, ve, p, out, cap, used);
@@ -973,6 +982,9 @@ pub unsafe extern "C" fn html_parse_rs(
     scratch: *mut u8,
     st_cap: u32,
     stats: *mut u32,
+    form: *mut webform::Form,
+    problem_reader: u32,
+    css: Option<unsafe extern "C" fn(u32,*const u8,u32,*const u8,u32)>,
 ) -> i32 {
     if nodes.is_null() || text.is_null() || href.is_null() || stats.is_null() {
         return -1;
@@ -1001,13 +1013,16 @@ pub unsafe extern "C" fn html_parse_rs(
         st: scratch,
         st_cap,
         list_depth: 0,
+        css,
     };
     let mut title_off: u16 = 0;
     let mut title_len: u32 = 0;
+    let mut context = None;
 
     while h.i < h.len {
         let c = h.at(h.i);
         if c != b'<' {
+            if let Some(css)=css { css(6,h.src,0,h.src,0); }
             scan_text(&mut h);
             continue;
         }
@@ -1029,6 +1044,9 @@ pub unsafe extern "C" fn html_parse_rs(
         let t = tag_id(h.src.add(ns as usize), j - ns);
 
         if is_end {
+            if t == T_FORM {
+                if let Some(f) = form.as_mut() { f.close(); }
+            }
             if t == T_SCRIPT || t == T_STYLE {
                 skip_raw(&mut h, t);
                 continue;
@@ -1040,6 +1058,7 @@ pub unsafe extern "C" fn html_parse_rs(
             // 早先只对块级和空元素 flush，结果 <a>x</a> 的 "x" 跟后面的正文
             // 并成同一段 run，链接点击区横跨两段内容。
             h.flush();
+            if let Some(css)=css { if t!=T_SCRIPT && t!=T_STYLE { css(2,h.src.add(ns as usize),j-ns,h.src,0); } }
             h.pop_to(t);
             let mut k = j;
             while k < h.len && h.at(k) != b'>' {
@@ -1051,7 +1070,12 @@ pub unsafe extern "C" fn html_parse_rs(
 
         // 开标签：属性区是 [j, '>' 之间)
         let mut k = j;
-        while k < h.len && h.at(k) != b'>' {
+        let mut quote = 0;
+        while k < h.len {
+            let c = h.at(k);
+            if quote != 0 { if c == quote { quote = 0; } }
+            else if c == b'>' { break; }
+            else if c == b'\'' || c == b'"' { quote = c; }
             k += 1;
         }
         let attr_from = j;
@@ -1059,8 +1083,36 @@ pub unsafe extern "C" fn html_parse_rs(
         h.i = if k < h.len { k + 1 } else { h.len };
 
         if t == T_SCRIPT || t == T_STYLE {
-            skip_raw(&mut h, t);
+            let start = h.i;
+            let end = skip_raw(&mut h, t);
+            if t==T_STYLE && end<h.len {
+                if let Some(css)=css { css(4,h.src.add(start as usize),end-start,h.src.add(attr_from as usize),attr_to-attr_from); }
+            }
+            if t==T_SCRIPT && end<h.len {
+                if let Some(css)=css { css(7,h.src,0,h.src.add(attr_from as usize),attr_to-attr_from); }
+            }
+            if t == T_SCRIPT && end < h.len {
+                let attrs = core::slice::from_raw_parts(h.src.add(attr_from as usize), (attr_to-attr_from) as usize);
+                if problem_reader != 0 && context.is_none()
+                    && webform::attr(attrs, b"id") == Some(b"lentille-context")
+                    && webform::attr(attrs, b"type").is_some_and(|v| v.eq_ignore_ascii_case(b"application/json"))
+                {
+                    context = Some(core::slice::from_raw_parts(h.src.add(start as usize), (end-start) as usize));
+                }
+                if let Some(f) = form.as_mut() {
+                    f.script(core::slice::from_raw_parts(h.src.add(attr_from as usize), (attr_to-attr_from) as usize),
+                             core::slice::from_raw_parts(h.src.add(start as usize), (end-start) as usize));
+                }
+            }
             continue;
+        }
+        if let Some(f) = form.as_mut() {
+            f.tag(t, core::slice::from_raw_parts(h.src.add(attr_from as usize), (attr_to-attr_from) as usize));
+        }
+        if let Some(css)=css {
+            let void=is_void(t) || matches!(t,T_TITLE|T_META|T_LINK|T_INPUT|T_IMG|T_BR|T_HR) || is_opaque(t);
+            h.flush();
+            css(if void {3} else {1}, h.src.add(ns as usize),j-ns,h.src.add(attr_from as usize),attr_to-attr_from);
         }
         if t == T_HEAD {
             continue; // head 里的东西一律不显示
@@ -1074,7 +1126,7 @@ pub unsafe extern "C" fn html_parse_rs(
                 *h.href.add(used as usize) = 0;
                 h.hlen = used + 1;
                 title_len = n;
-                title_off = (used + 1) as u16;
+                title_off = (used - n + 1) as u16;
             }
             skip_raw(&mut h, t);
             continue;
@@ -1082,6 +1134,24 @@ pub unsafe extern "C" fn html_parse_rs(
         if is_opaque(t) {
             skip_opaque(&mut h, t);
             continue;
+        }
+
+        // Use the same entity decoder as href. Cap individual IDs so a large
+        // unrelated attribute cannot consume the link pool.
+        if attr_from < attr_to {
+            let attrs = core::slice::from_raw_parts(h.src.add(attr_from as usize), (attr_to-attr_from) as usize);
+            let key: &[u8] = if webform::attr(attrs, b"id").is_some() { b"id" }
+                else if t == T_A { b"name" } else { b"" };
+            if !key.is_empty() && webform::attr(attrs,key).is_some_and(|v| !v.is_empty() && v.len()<=255 && !v.contains(&0)) {
+                let mut used = h.hlen;
+                let n = read_attr(h.src,attr_from,attr_to,key.as_ptr(),key.len() as u32,h.href,h.href_cap,&mut used);
+                if n>0 && used<h.href_cap {
+                    h.flush();
+                    h.emit(NODE_ANCHOR, t, 0, h.hlen, n, 0);
+                    *h.href.add(used as usize)=0;
+                    h.hlen=used+1;
+                }
+            }
         }
 
         if t == T_BR {
@@ -1095,13 +1165,23 @@ pub unsafe extern "C" fn html_parse_rs(
             continue;
         }
         if t == T_IMG {
+            h.flush();
+            let mut end=h.hlen;
+            let size=read_attr(h.src,attr_from,attr_to,b"src".as_ptr(),3,h.href,h.href_cap,&mut end);
+            let has_src=size>0 && size<=2047 && end<h.href_cap &&
+                !core::slice::from_raw_parts(h.href.add(h.hlen as usize),size as usize).contains(&0);
+            if has_src {
+                *h.href.add(end as usize)=0;
+                h.emit(6,T_IMG,0,h.hlen,size,h.href_off);
+                h.hlen=end+1;
+            }
             let mut used = h.hlen;
             let alt = b"alt\0";
             let n = read_attr(h.src, attr_from, attr_to, alt.as_ptr(), 3, h.href, h.href_cap, &mut used);
             if n > 0 && used < h.href_cap {
                 *h.href.add(used as usize) = 0;
                 h.hlen = used + 1;
-                h.emit(NODE_IMG, T_IMG, 0, used - n, n, 0);
+                h.emit(NODE_IMG, T_IMG, has_src as u8, used - n, n, h.href_off);
             }
             continue;
         }
@@ -1174,6 +1254,10 @@ pub unsafe extern "C" fn html_parse_rs(
     }
     h.flush();
 
+    if let Some(json) = context {
+        if let Some(css)=css { css(5,h.src,0,h.src,0); }
+        samples::append(&mut h, json);
+    }
     *stats.add(0) = h.ncount;
     *stats.add(1) = h.tlen;
     *stats.add(2) = h.links;

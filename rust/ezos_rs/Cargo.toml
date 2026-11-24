@@ -7,6 +7,7 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [profile.release]
+lto = true
 opt-level = 2
 panic = "abort"
 debug = false

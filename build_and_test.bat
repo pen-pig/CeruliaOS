@@ -39,6 +39,7 @@ rem =========================================================================
 set "ARG=%~1"
 
 if /i "%ARG%"=="clean" goto clean
+if /i "%ARG%"=="vmware" goto vmware
 
 echo ============================================
 echo Building Cerulia...
@@ -50,6 +51,10 @@ if /i "%ARG%"=="no-run" goto build_only
 call "%~dp0build_and_test_ninja.bat"
 if errorlevel 1 goto error
 goto end
+
+:vmware
+call "%~dp0build_and_test_ninja.bat" vmware
+exit /b %ERRORLEVEL%
 
 :build_only
 echo build-only mode: QEMU not launched.
