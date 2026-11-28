@@ -22,6 +22,24 @@ build_and_test_ninja.bat build-only
 build_and_test_ninja.bat
 ```
 
+## Git 提交与推送前检查
+
+新 clone 首次开发时，在确认没有自己的 hooks 需要保留后，执行一次：
+
+```bat
+git config --local core.hooksPath .githooks
+```
+
+需要 Python 3.10+ 在 PATH 上。普通 `git commit` 会检查**暂存区里的文件内容**，
+`git push` 会检查**实际要推送的提交或标签**；工作目录里碰巧存在的新文件不算。
+发现缺失时，按输出把对应的源文件或资源和引用它的改动一起 `git add` 后重试。
+钩子不会替你暂存任何文件，不会上传构建产物，也不会修改已有提交。
+
+也可提前运行 `python tools/check_build_inputs.py --tracked --release`。新增构建依赖应优先声明在
+`build.ninja` 的输入边；检查器还会跟踪项目内常见的 C 引用、汇编引用和 Rust 文件模块。
+它不等于编译，不能检查运行时计算路径或任意宏生成的依赖。GitHub Actions 仍会从提交重新构建并测试；
+仓库如要求所有贡献者都遵守，需对 main 使用 PR 并将 `Build & smoke test` 设为必过检查。
+
 ## 路径解析规则（`ezos_env.py`）
 
 优先级从高到低：
