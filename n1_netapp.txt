@@ -1,9 +1,0 @@
-﻿== phase ping: guest `ping 10.0.2.2` ==
-  [OK] answered ARP + 4 ICMP echo requests
-  [OK] guest printed 4 replies (ICMP round-trip works)
-== phase httpd: guest `httpd` + host GET ==
-   hostfwd 127.0.0.1:18080 -> guest:80
-  [OK] connected (slirp -> guest:80)
-  [OK] HTTP 200 + system page (233 bytes)
-  [OK] guest printed 'served'
-PASS: net app E2E (ping + httpd)

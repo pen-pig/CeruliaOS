@@ -4,6 +4,7 @@
 # 只能靠人工维持 LF（易碎，release/setup_and_run.sh 就已经是 CRLF 了）。
 # 这里显式钉住，跟 .bat 必须纯 ASCII 是同一类约束。
 *.sh text eol=lf
+.githooks/* text eol=lf
 third_party/bearssl/roots.pem text eol=lf
 third_party/bearssl/*.tar.gz binary
 third_party/unifont/*.hex.gz binary

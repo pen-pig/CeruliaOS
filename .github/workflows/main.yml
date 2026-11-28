@@ -34,7 +34,14 @@ jobs:
 
       - name: Source checkout guard
         shell: bash
-        run: python3 tools/check_build_inputs.py --tracked --release 2>&1 | tee ci-inputs.log
+        run: |
+          {
+            if [[ ! -f tools/check_build_inputs.py ]]; then
+              echo "::error file=.github/workflows/main.yml::Missing tools/check_build_inputs.py in the commit. Stage the build guard along with the workflow."
+              exit 1
+            fi
+            python3 tools/check_build_inputs.py --commit "$GITHUB_SHA" --release
+          } 2>&1 | tee ci-inputs.log
 
       - name: Check build preflight
         run: python3 tests/test_build_inputs.py
