@@ -47,7 +47,18 @@ python tools\make_usb_boot.py --write --disk 2     :: 真的写盘（要手打�
 - x64 加载器不会把内核变成 64 位。固定内核工作区与固件保留内存冲突时，加载器会报告并退出。没有 VGA 文本模式时，内核优先用固件已配置的 GOP 帧缓冲显示 shell；不兼容的 GOP 模式仍需 COM1。
 - 现在建议至少 64 MiB RAM。内核放在 28 MiB 以避开 SMM 的低地址保留区；BIOS 引导会在检测到少于 48 MiB 时提示并停止。
 - PS/2 控制器缺失或无响应时，内核会跳过 PS/2 初始化。有识别到的 USB HID 键盘就用 USB；若也没有 USB 键盘，而 COM1 可用，会显示 `Keyboard: COM1 rescue input active`。用 115200、8N1、无流控的串口终端发送 `ver` 回车即可确认已进 shell；只接启用了对应串口且电平匹配的设备。
-- xHCI 已支持在开机时接入的、直连根口的 USB Boot Protocol 键盘和鼠标。经 Hub、热插拔、非 Boot Protocol 键鼠或 xHCI U 盘的内核访问尚不在覆盖范围。QEMU 回归不等同于真机验证。
+- UHCI、OHCI、xHCI 支持最多四颗控制器，EHCI 支持两颗，每颗有独立的调度与 DMA 状态。QEMU 验证了键鼠跨控制器工作、第二颗控制器的键盘登录与重插；xHCI 覆盖传统 BIOS 和 x64 UEFI 的高位 MMIO。EHCI 低速/全速直连设备仍转交给配套 UHCI/OHCI；Hub 的事务转换器路径尚待实机验证。
+- UHCI/OHCI 保留一层 USB 2.0 Hub 键鼠；xHCI 支持级联 Hub，已实测两层 USB 2.0 Hub 下的键鼠和拔插内层 Hub。SuperSpeed Hub 已覆盖合成设备的描述符、深度和端口控制，尚未验证其下游真实键鼠数据。仅处理扩展坞的 USB 输入，不包含其网卡、音频、视频或 Thunderbolt 功能。
+- 多把 USB 键盘、多只 USB 鼠标可以同时输入。USB 键盘共享锁定键和修饰键状态，每把独立处理按下、释放和连发。鼠标按键按设备合并，拔掉一只不会放开另一只仍按住的按钮。Boot 键盘支持 Caps Lock / Num Lock 指示灯。报告模式支持八字节键盘、单键盘用法范围的 NKRO 位图、带 Report ID 的 16 位相对鼠标、滚轮和绝对定位 USB tablet。非 Boot 键盘不猜测 LED 布局，不支持任意厂商私有报文、I²C 触控板。
+- 在真机上，优先用普通有线 USB 键鼠或有标准 Boot HID 的无线接收器。启动排查时优先直插主板 USB 口；如果直插能用而扩展坞不能用，先绕开扩展坞。若键盘在 BIOS 能用但进系统不能用，请保留 COM1 的控制器探测与固件交接日志，不要把 BIOS 的响应当作内核驱动已工作。
+- EHCI Hub 使用默认单转换器配置，只服务键鼠，不登记 Hub 下的存储；每个转换器每帧只安排两个小型中断端点传输。没有配套控制器或转换器时，EHCI 不能直接访问低速/全速设备。OHCI/xHCI U 盘内核访问不在当前范围。QEMU 运行验证不等同于实体机验证。
+- 用 `python tests/test_usb_composite.py` 验证合成的三接口无线接收器（键盘、鼠标、多媒体）和换插；xHCI 与 `--ehci` 使用大配置描述符，`--uhci` 使用紧凑配置，`--ohci` 使用低速设备。用 `python tests/test_usb_input_platforms.py` 验证传统 BIOS / IA32 UEFI，不使用 PS/2 代替 USB 输入。
+- 用 `python tests/test_usb_ohci.py` 验证 x64 UEFI 下 OHCI 键鼠，`--split-controllers` 验证两颗控制器，`--cold` 验证在空控制器上首次热插，`--companion` 验证 EHCI 转交及热插拔。Hub 和键盘灯分别跑 `python tests/test_usb_hub_hid.py --ohci` 与 `python tests/test_usb_keyboard_leds.py --ohci`。
+- 用 `python tests/test_usb_ehci_hid.py` 验证 x64 UEFI 下无配套控制器、无 PS/2 的直连高速 EHCI 键鼠；`--cold` 验证系统启动后首次插入，`--storage` 验证键盘重插前后同控制器上的存储可读，`python tests/test_usb_keyboard_leds.py --ehci` 验证键盘灯。
+- 用 `python tests/test_usb_ehci_hub.py` 验证模拟高速 Hub 的端口供电、复位、失败清理和 Hub 重插；原版 QEMU 的内置 Hub 仅支持全速，此用例不能验证转换器下实际收到键鼠报告。调度与描述符字段检查可用宿主 C 编译器运行 `tests/test_ehci_periodic.c`。
+- 新增回归：`python tests/test_usb_multi_controller.py`（UHCI/EHCI 双控制器），`python tests/test_usb_hub_hid.py --nested`（两级 Hub 与内层换插），`python tests/test_usb_superspeed_hub.py`（SuperSpeed Hub 控制），`python tests/test_usb_nkro.py`（位图键盘和 16 位鼠标）。
+- `python tests/test_usb_xhci_multi.py` 验证两颗 xHCI（可追加 `--bios`），`python tests/test_usb_multi_input.py` 验证两个复合接收器同时工作（可追加 `--split` 改为跨控制器）。两项都不依赖物理 USB 设备。
+- 其他回归：`python tests/test_usb_hotplug.py`（多次重插），`python tests/test_usb_tablet.py`（非 Boot 指点设备）。
 
 ---
 
@@ -398,3 +409,75 @@ python3 tools/make_usb_boot.py --write --disk 2
 
 > 想用脚本写盘，Windows 上请以**管理员**运行（写物理盘需要权限）；
 > Linux/macOS 用 `sudo`。写错盘的后果脚本无法替你承担——它只负责"逼你确认两遍"。
+
+#### Windows 上不要用 `os.open` / `os.write` 写物理盘（实测踩坑）
+
+2026-11-24 实测：在 Windows 上用 Python 的 `os.open(r"\\.\PhysicalDriveN", os.O_WRONLY)`
+写 U 盘，`os.open` **成功**（不报权限错），但第一次 `os.write` 必抛：
+
+```
+OSError: [Errno 9] Bad file descriptor
+```
+
+原因：MSVCRT 的 `_open` 对 `\\.\PhysicalDriveN` 只申请到 `GENERIC_WRITE`，
+句柄没有读权限，内核的 `WriteFile` 返回 `ERROR_INVALID_HANDLE (6)`，被 Python
+映射成 errno 9。**这与管理员权限无关**——提权到管理员后照样报同一个错，
+很容易误判成"权限不够"。
+
+所以 `tools/make_usb_boot.py` 在 Windows 上**绕开 CRT，直接调 Win32 API**：
+
+- `CreateFileW(path, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, ...)`
+  —— 同时要读写（回读校验用同一个句柄），且必须共享，否则盘上有活动卷时
+  独占打开会失败（errno 32 sharing violation）。
+- `SetFilePointerEx` + `WriteFile` / `ReadFile` 按偏移读写，
+  `FILE_FLAG_WRITE_THROUGH` 保证落盘，`FlushFileBuffers` 收尾。
+- 非 Windows 平台走 `os.pwrite` / `os.pread`，语义一致。
+
+#### 更隐蔽的一个坑：卷锁会让"写到卷覆盖区"被拒
+
+改用 Win32 API 后，写入推进到了第 2 块，又失败了：
+
+```
+OSError: [Errno 5] WriteFile(off=1048576,len=1048576) 失败: 拒绝访问。
+```
+
+**第 1 块（偏移 0，1 MiB）成功，第 2 块（偏移 1 MiB）被拒。** 原因是
+NTFS 挂载后持有物理设备的写锁：对 `\\.\PhysicalDriveN` 的原始写入，
+**只要落在卷覆盖的扇区范围内**，内核就拒绝，返回 `ERROR_ACCESS_DENIED`。
+
+本机 NTFS 分区的偏移恰好是 1048576 = 1 MiB，正好和写块边界对齐，
+所以失败点精准落在卷首扇区——看起来极像"写完 1MB 就不让写了"这种
+玄学问题，实际是卷锁。
+
+正确做法（微软文档指定的序列，与 Rufus / dd for Windows 一致）：
+
+1. 找到目标盘上的卷。首选 PowerShell `Get-Partition -DiskNumber N |
+   Get-Volume` 的 `UniqueId`，它直接给出 `\\?\Volume{GUID}\`；
+   退路是 `FindFirstVolumeW` 枚举 + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`
+   查所属物理盘。
+2. 对每个卷：`FSCTL_LOCK_VOLUME`（先加独占锁，dismount 才干净）
+   → `FSCTL_DISMOUNT_VOLUME`（卸载文件系统，让 NTFS 刷完缓存元数据
+   并交出该区域）。
+3. **保持句柄打开直到写盘完成** —— 卷锁随句柄关闭才释放。
+
+工具里的 `_WinVolumeGuard` 就是干这个的。另外两条注意事项：
+
+- **卷设备路径带尾斜杠时，用默认 flag 打开会返回 `ERROR_PATH_NOT_FOUND (3)`**，
+  必须去掉尾斜杠或加 `FILE_FLAG_BACKUP_SEMANTICS`。
+- **本机 Storage 模块没有 `Dismount-Volume` cmdlet**（模块导出列表里只有
+  `Dismount-DiskImage`）。用它做卸载会静默失败。更糟的是早期代码用
+  `; "DONE"` 判断成功，cmdlet 不存在时 PowerShell 报错但 `"DONE"` 照样
+  输出 → **假阳性**，卷从未被卸载，还顺手把真正的错误吞了。所以这里
+  改用 Win32 原生 IOCTL，错误码直接拿得到。
+
+#### 写盘前的准备与禁忌
+
+- 工具在写入前会自动锁卷 + 卸载卷；万一仍被拒（errno 5），会自动
+  兜底执行 `Clear-Disk -Number N -RemoveData`（diskpart `clean` 的
+  PowerShell 等价物）清掉分区表后重写。
+- **不要 `Set-Disk -Offline`**：磁盘离线后 `\\.\PhysicalDrive1` 会变成
+  "设备未就绪"，反而写不进去。锁卷 + 卸载卷就够了。
+- **不要用 PowerShell 的 `text=True`** 捕获输出：中文系统下 PowerShell
+  输出是 GBK，按 UTF-8 解会抛 `UnicodeDecodeError`，把真正的错误
+  冲掉。工具里的 `_run()` 改成收 bytes 再按 `utf-8 → gbk → latin-1`
+  依次尝试解码。

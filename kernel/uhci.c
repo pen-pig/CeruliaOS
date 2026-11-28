@@ -53,6 +53,8 @@
  * （见 uhci_dma_sync）。QEMU 不模拟缓存一致性，故此处不影响现有测试。
  */
 #include "uhci.h"
+#include "irqflags.h"
+#include "task.h"
 #include "pci.h"
 #include "pmm.h"
 #include "dmesg.h"
@@ -148,66 +150,39 @@ static void u_delay_ms(uint32_t ms) {
  * 一次取全需要 >64 的窗口；UHCI 的 TD maxlen 是 11 位字段（0x7FF 表示 0），
  * 255 完全在编码范围内，且 HC 会把多个最大包自动拼进同一个 TD 缓冲，
  * 低速设备（8 字节/包）也无需软件分包。 */
-static volatile uint32_t g_qh[8]       __attribute__((aligned(16))); /* 32B QH */
-static volatile uint32_t g_td[3][8]    __attribute__((aligned(16))); /* 3×32B TD */
-static volatile uint8_t  g_setup[8]    __attribute__((aligned(16)));
-static volatile uint8_t  g_rbuf[256]   __attribute__((aligned(16)));
 #define UHCI_XFER_MAX    256            /* 数据阶段缓冲上界 */
-
-/* H2-2d：中断传输结构（中断 QH + 1 个中断 TD + 报告缓冲）。
- *
- * 调度骨架（关键，改这里前先想清楚）：
- *   帧列表(1024 项) -> 中断 QH --(水平链 Q=1)--> 控制 QH
- *                         |                         |
- *                     中断 TD(Q=0 纵向)          控制 TD 链(Q=0 纵向)
- *   两个 QH 都是常驻的：帧列表初始化后**永不再改**，控制/中断传输只改各自
- *   QH 的 element 指针（挂上/撤下一个 dword）。这样两种传输互不踩帧列表，
- *   也不必每次传输重写 4KB 帧列表（shell 每秒轮询上千次时这点很要紧）。
- *   两个队列都空时 HC 只是每帧走过两个终止项，零开销。 */
-static volatile uint32_t g_iqh[8]      __attribute__((aligned(16)));
-static volatile uint32_t g_itd[8]      __attribute__((aligned(16)));
-static volatile uint8_t  g_ibuf[16]    __attribute__((aligned(16)));
-#define UHCI_INTR_TO_MS  3u             /* 中断轮询超时（毫秒） */
-
-/* H1c：bulk 传输结构（bulk QH 常驻 + TD 池 + 数据缓冲）。
- *
- * 调度骨架更新（改这里前先想清楚）：
- *   帧列表 -> 中断 QH --Q=1--> 控制 QH --Q=1--> bulk QH --水平链--> T
- * 三个 QH 都常驻：帧列表初始化后永不再改；控制/中断/bulk 传输只改各自 QH 的
- * element（挂上/撤下一个 dword）。bulk 挂在水平链最末端——UHCI 带宽模型里
- * bulk 正是"用完中断+控制剩下的带宽"，QEMU 全速 1ms 帧足够单帧跑完一笔。
- *
- * 全速（12Mbps）bulk 端点 mps 上限 64 字节（低速无 bulk）。512B 扇区按
- * mps=64 拆 8 包；TD 池按 16 备（mps>=32 都能单笔 512B），越界 fail closed。
- * 数据缓冲 512B 放 .bss（identity 映射区，虚拟==物理，HC DMA 直接用）。 */
-static volatile uint32_t g_bqh[8]       __attribute__((aligned(16)));
-static volatile uint32_t g_btd[16][8]   __attribute__((aligned(16)));
-static volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(16)));
+#define HID_QUEUES 4u
 #define UHCI_BULK_TD_MAX 16
 #define UHCI_BULK_TO_MS  1000u          /* 一笔 bulk 传输超时（毫秒） */
 #define UHCI_BULK_NAK_MAX 2000          /* 单 TD NAK 重试上界（约 2s） */
+typedef struct {
+    volatile uint32_t qh[4],td[4];
+    volatile uint8_t data[64];
+    uint8_t addr,ep,toggle,pending;
+} __attribute__((aligned(16))) hid_queue;
+typedef struct {
+    volatile uint32_t g_qh[8]       __attribute__((aligned(16)));
+    volatile uint32_t g_td[3][8]    __attribute__((aligned(16)));
+    volatile uint8_t  g_setup[8]    __attribute__((aligned(16)));
+    volatile uint8_t  g_rbuf[256]   __attribute__((aligned(16)));
+    hid_queue hidq[HID_QUEUES];
+    volatile uint32_t g_bqh[8]       __attribute__((aligned(16)));
+    volatile uint32_t g_btd[16][8]   __attribute__((aligned(16)));
+    volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(16)));
+    uint8_t g_btog_in[128];
+    uint8_t g_btog_out[128];
+    volatile uint32_t g_frame[1024] __attribute__((aligned(4096)));
+    uint16_t io;
+    int first_port,first_ls;
+} uhci_t;
+static uhci_t controllers[UHCI_MAX_CTL];
+static unsigned controller_count;
 
-/* bulk 端点 DATA toggle：按 USB 地址索引、IN/OUT 各一份（一设备最多一对
- * bulk 端点）。与中断端点的 g_toggle 相互独立——不同端点的 toggle 序列
- * 本来就是独立的。ClearFeature(HALT)/BOT reset 后必须双清零（规范要求
- * toggle 回到 DATA0）。 */
-static uint8_t g_btog_in[128];
-static uint8_t g_btog_out[128];
-
-/* 中断端点的 DATA toggle（按 USB 地址索引，每设备一个中断端点够用）。
- * UHCI 不做自动 toggle：TD token 的 bit19 必须由软件给，给错设备就丢包。 */
-static uint8_t g_toggle[128];
-
-/* 帧列表：1024 项，4KB 对齐（UHCI 要求）。放在 .bss（与 AHCI 的 DMA 缓冲同区，
- * 已验证对设备 DMA 一致），不依赖 pmm 池——pmm 页在本 QEMU 下经 FLBASEADD
- * 给 HC 做 DMA 读时未被证实一致，故改用 BSS 静态区。 */
-static volatile uint32_t g_frame[1024] __attribute__((aligned(4096)));
-#define UHCI_FRAME_PHYS  ((uint32_t)(unsigned long)(&g_frame[0]))
-
-/* 探针共享句柄：uhci_setup_one 写入，uhci_control_probe 读取 */
-static uint16_t g_ctrl_io    = 0;     /* 控制器 I/O 基址（0=未初始化） */
-static int      g_ctrl_port  = -1;    /* 首个已连接端口（-1=无） */
-static int      g_ctrl_ls    = 0;     /* 该端口是否低速设备 */
+static uhci_t *state(uint16_t io) {
+    for(unsigned i=0;i<controller_count;i++)
+        if(controllers[i].io==io)return &controllers[i];
+    return 0;
+}
 
 /* H2-2c：已连接端口表（静态，无动态分配）。uhci_setup_one 期间填充，
  * 供上层枚举模块 usbenum 逐个消费。g_plist_n 为有效条数。 */
@@ -262,37 +237,39 @@ static void uhci_dma_sync_tick(void) {
     }
 }
 
-int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
+static int control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
                       const uint8_t *setup, int dir_in,
                       uint8_t *buf, int blen, int lowspeed, int *actlen) {
-    (void)io;   /* 控制传输由 HC 走调度（帧列表->QH->TD），不经直接端口 IO */
+    uhci_t *u=state(io);
+    if(!u)return -1;
+   /* 控制传输由 HC 走调度（帧列表->QH->TD），不经直接端口 IO */
     if (actlen) *actlen = 0;
     if (addr > 127 || ep > 15) return -1;          /* 不可信上界 */
     if (blen < 0 || blen > UHCI_XFER_MAX) return -1; /* 缓冲上界（防写越界） */
     if (blen > 0 && !buf) return -1;
 
     /* SETUP 包拷到对齐缓冲；数据缓冲：IN 先清零避免读到陈旧值，OUT 拷入用户数据 */
-    for (int i = 0; i < 8; i++) g_setup[i] = setup[i];
-    for (int i = 0; i < blen; i++) g_rbuf[i] = dir_in ? 0 : buf[i];
+    for (int i = 0; i < 8; i++) u->g_setup[i] = setup[i];
+    for (int i = 0; i < blen; i++) u->g_rbuf[i] = dir_in ? 0 : buf[i];
 
     /* 清零 3 个 TD（含 HW 字段与保留位），避免残留上一次传输的标志 */
     for (int t = 0; t < 3; t++)
-        for (int k = 0; k < 8; k++) g_td[t][k] = 0;
+        for (int k = 0; k < 8; k++) u->g_td[t][k] = 0;
 
     uint32_t ls = lowspeed ? UHCI_TD_LS : 0u;
 
     /* TD0 SETUP：PID=SETUP，toggle=DATA0（token bit19=0，配 QH carry=0） */
-    g_td[0][3] = U32PTR(&g_setup[0]);
-    g_td[0][2] = UHCI_PID_SETUP
+    u->g_td[0][3] = U32PTR(&u->g_setup[0]);
+    u->g_td[0][2] = UHCI_PID_SETUP
                | ((uint32_t)addr << 8)
                | ((uint32_t)ep    << 15)
                | (0u << 19)                   /* DATA0 */
                | ((uint32_t)7u << 21);        /* maxlen 字段 = 8-1（SETUP 恒 8B） */
-    g_td[0][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
+    u->g_td[0][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
     /* 链接用 vertical(Q=0)：TD→TD 必须按纵向链走，Q=1 会被 HC 当成另一个
      * QH 而跳过整个队列（QEMU 帧循环以 Q 位判定 QH/TD）。帧列表项才用 Q=1。
      * 无数据阶段(blen==0，如 SET_ADDRESS)时 SETUP 直接链到 STATUS(TD2)。 */
-    g_td[0][0] = (blen > 0) ? U32PTR(&g_td[1]) : U32PTR(&g_td[2]);
+    u->g_td[0][0] = (blen > 0) ? U32PTR(&u->g_td[1]) : U32PTR(&u->g_td[2]);
 
     /* TD1 DATA：方向依 dir_in；toggle=DATA1。仅在有数据阶段(blen>0)时构建；
      * 无数据阶段(如 SET_ADDRESS)时 TD1 保持全 0（ACTIVE=0），不参与完成判定，
@@ -300,38 +277,38 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     if (blen > 0) {
         uint32_t data_pid = dir_in ? UHCI_PID_IN : UHCI_PID_OUT;
         uint32_t dlen = (uint32_t)(blen - 1);   /* maxlen 字段 = len-1 */
-        g_td[1][3] = U32PTR(&g_rbuf[0]);
-        g_td[1][2] = data_pid
+        u->g_td[1][3] = U32PTR(&u->g_rbuf[0]);
+        u->g_td[1][2] = data_pid
                    | ((uint32_t)addr << 8)
                    | ((uint32_t)ep    << 15)
                    | (1u << 19)                   /* DATA1 */
                    | (dlen << 21);                /* maxlen = len-1 */
-        g_td[1][1] = UHCI_TD_ACTIVE
+        u->g_td[1][1] = UHCI_TD_ACTIVE
                    | (dir_in ? UHCI_TD_SPD : 0u)  /* IN 开短包检测 */
                    | UHCI_TD_ERR3 | ls;
-        g_td[1][0] = U32PTR(&g_td[2]);            /* ->TD2 (vertical) */
+        u->g_td[1][0] = U32PTR(&u->g_td[2]);            /* ->TD2 (vertical) */
     }
 
     /* TD2 STATUS：方向取数据阶段反（IN数据->OUT状态，OUT数据->IN状态）；
      * 无数据阶段时 STATUS 直接接在 SETUP 后。toggle 恒用 DATA1（控制传输规定
      * SETUP=DATA0，其后首包与状态阶段均 DATA1，QH carry 关闭时由 token 位决定）。 */
     uint32_t sts_pid = dir_in ? UHCI_PID_OUT : UHCI_PID_IN;
-    g_td[2][3] = 0;
-    g_td[2][2] = sts_pid
+    u->g_td[2][3] = 0;
+    u->g_td[2][2] = sts_pid
                | ((uint32_t)addr << 8)
                | ((uint32_t)ep    << 15)
                | (1u << 19)                   /* DATA1 */
                | (0x7FFu << 21);               /* maxlen=0 字节的 UHCI 编码 */
-    g_td[2][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
-    g_td[2][0] = 0x1u;                        /* T terminate，链表尾 */
+    u->g_td[2][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
+    u->g_td[2][0] = 0x1u;                        /* T terminate，链表尾 */
 
     /* 挂接控制队列：控制 QH 的 element -> TD0（Q=0 纵向）。
      * H2-2d 起**不再改写帧列表**——帧列表常驻指向中断 QH，中断 QH 水平链到
-     * 控制 QH（见 g_iqh 处的骨架注释），控制传输只动自己 QH 的 element。
+     * 控制 QH（见 u->hidq 处的骨架注释），控制传输只动自己 QH 的 element。
      * H1c 起控制 QH 的水平链后面还挂着常驻 bulk QH，这里**绝不能碰
-     * g_qh[0]**（曾把它清成 terminate，把 bulk QH 从链上摘掉——症状是
+     * u->g_qh[0]**（曾把它清成 terminate，把 bulk QH 从链上摘掉——症状是
      * 控制传输全部正常而 bulk 传输一个包都发不出去）。 */
-    g_qh[1] = U32PTR(&g_td[0]);                  /* 元素指针 -> TD0 (vertical) */
+    u->g_qh[1] = U32PTR(&u->g_td[0]);                  /* 元素指针 -> TD0 (vertical) */
     uhci_dma_sync();                             /* 推给 HC 之前先写回 */
 
     /* 轮询完成（以 g_pit_ticks 1ms 为基准，超时 fail closed 不挂死） */
@@ -339,9 +316,9 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     int done = 0;
     while ((uint32_t)(g_pit_ticks - t0) < UHCI_XFER_TO_MS) {
         uhci_dma_sync_tick();                     /* 重读 TD 状态前先作废缓存 */
-        uint32_t s0 = g_td[0][1];
-        uint32_t s1 = g_td[1][1];
-        uint32_t s2 = g_td[2][1];
+        uint32_t s0 = u->g_td[0][1];
+        uint32_t s1 = u->g_td[1][1];
+        uint32_t s2 = u->g_td[2][1];
         if (((s0 & UHCI_TD_ACTIVE) == 0) &&
             ((s1 & UHCI_TD_ACTIVE) == 0) &&
             ((s2 & UHCI_TD_ACTIVE) == 0)) { done = 1; break; }
@@ -350,7 +327,7 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
             break;
     }
     /* 不论成功失败，把控制 QH 的 element 拉回终止（T），防 HC 反复重跑本链路 */
-    g_qh[1] = 0x1u;
+    u->g_qh[1] = 0x1u;
     uhci_dma_sync();                             /* 摘链同样要写回 */
 
     if (!done) {
@@ -366,7 +343,7 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
     /* 检查致命硬件错误位（fail closed，不打 silent） */
     uhci_dma_sync();
-    uint32_t s0 = g_td[0][1], s1 = g_td[1][1], s2 = g_td[2][1];
+    uint32_t s0 = u->g_td[0][1], s1 = u->g_td[1][1], s2 = u->g_td[2][1];
     if ((s0 & UHCI_TD_FATAL) || (s1 & UHCI_TD_FATAL) || (s2 & UHCI_TD_FATAL)) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         u_app_str(line, &li, lim, "UHCI-CTRL: xfer error TD0=0x");
@@ -394,73 +371,112 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     if (actlen) *actlen = al;
     if (dir_in && buf && al > 0) {
         int n = al; if (n > blen) n = blen;          /* 上界保护 */
-        for (int i = 0; i < n; i++) buf[i] = (uint8_t)g_rbuf[i];
+        for (int i = 0; i < n; i++) buf[i] = (uint8_t)u->g_rbuf[i];
     }
     return 0;
 }
 
-/*
- * 中断 IN 轮询（H2-2d：HID 键盘的报告通道）。语义见 uhci.h。
- *
- * 与设备约定：
- *  - 没有新报告时设备回 NAK —— 这不是错误，返回 0 且 *actlen=0。
- *  - DATA toggle 必须软件维护（UHCI TD token bit19），且**只有真正收到数据
- *    才翻转**：NAK/零长度传输不算完成一次数据包，翻了就会与设备失步，
- *    表现为"第一次能读到报告，之后永远读不到"。
- *  - 轮询窗口 UHCI_INTR_TO_MS（3ms）：低速设备每帧最多一次事务，1ms/帧，
- *    3 帧足够 HC 重试完；超时 fail closed 返回 -1，绝不挂死。
- */
-int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
-                      uint8_t *buf, int blen, int lowspeed, int *actlen) {
-    (void)io;   /* same as control xfer: routed by the schedule, not port IO */
-    if (actlen) *actlen = 0;
-    if (!buf || addr == 0u || addr > 127u) return -1;
-    if ((ep & 0x80u) == 0u || (ep & 0x7Fu) > 15u) return -1;  /* 必须是 IN 端点 */
-    if (blen < 1 || blen > (int)sizeof(g_ibuf)) return -1;    /* 缓冲上界 */
-
-    uint32_t ls = lowspeed ? UHCI_TD_LS : 0u;
-    uint32_t tog = g_toggle[addr] ? (1u << 19) : 0u;   /* DATA0/DATA1 */
-
-    for (int i = 0; i < (int)sizeof(g_ibuf); i++) g_ibuf[i] = 0;
-
-    g_itd[0] = 0x1u;                                    /* T：链表尾 */
-    g_itd[1] = UHCI_TD_ACTIVE | UHCI_TD_SPD | UHCI_TD_ERR3 | ls;
-    g_itd[2] = UHCI_PID_IN
-             | ((uint32_t)addr << 8)
-             | (((uint32_t)(ep & 0x7Fu)) << 15)
-             | tog
-             | (((uint32_t)(blen - 1)) << 21);          /* maxlen = len-1 */
-    g_itd[3] = U32PTR(&g_ibuf[0]);
-
-    /* 挂上：中断 QH 的 element -> 中断 TD（Q=0 纵向） */
-    g_iqh[1] = U32PTR(&g_itd[0]);
-    uhci_dma_sync();                            /* 推给 HC 之前先写回 */
-
-    uint32_t t0 = g_pit_ticks;
-    int done = 0;
-    while ((uint32_t)(g_pit_ticks - t0) < UHCI_INTR_TO_MS) {
-        uhci_dma_sync_tick();                    /* 读 TD 状态前先作废缓存 */
-        uint32_t s = g_itd[1];
-        if ((s & UHCI_TD_ACTIVE) == 0u) { done = 1; break; }
-        if (s & UHCI_TD_FATAL) break;                   /* fail closed，不空等 */
+int uhci_control_xfer(uint16_t io,uint8_t addr,uint8_t ep,const uint8_t *setup,
+                      int dir_in,uint8_t *buf,int len,int ls,int *actual) {
+    static int busy;
+    uint32_t now=g_pit_ticks;
+    if (actual)*actual=0;
+    if (!setup)return -1;
+    for (;;) {
+        uint32_t flags=irq_save_disable();
+        if(!flags)return -1;
+        if(!busy){busy=1;irq_restore(flags);break;}
+        irq_restore(flags);
+        if((uint32_t)(g_pit_ticks-now)>=UHCI_XFER_TO_MS)return -1;
+        task_yield();
     }
-    /* 撤下：防 HC 反复重跑同一个已完成的 TD */
-    g_iqh[1] = 0x1u;
+    int r=control_xfer(io,addr,ep,setup,dir_in,buf,len,ls,actual);
+    uint32_t flags=irq_save_disable();
+    busy=0;
+    irq_restore(flags);
+    return r;
+}
+
+uint16_t uhci_root_io(unsigned ctl) {return ctl<controller_count?controllers[ctl].io:0;}
+
+unsigned uhci_root_status(uint16_t io,unsigned port) {
+    if(!state(io) || port>=2)return 0;
+    unsigned offset=0x10+2*port;
+    unsigned ps=u_inw(io,offset);
+    /* Preserve Enable and Suspend. CSC/PEC are W1C. */
+    if(ps&10u)u_outw(io,offset,(uint16_t)(ps&(0x1004u|10u)));
+    return (ps&3u)|((ps&0x100u)>>6);
+}
+
+void uhci_root_disable(uint16_t io,unsigned port) {
+    if(state(io) && port<2)u_outw(io,0x10+2*port,0);
+}
+
+void uhci_release_hid(uint16_t io,uint8_t addr) {
+    uhci_t *u=state(io);
+    if(!u)return;
+    uint32_t flags=irq_save_disable();
+    unsigned retired=0;
+    for(unsigned i=0;i<HID_QUEUES;i++) {
+        if(u->hidq[i].addr==addr){
+            u->hidq[i].qh[1]=1;
+            retired|=1u<<i;
+        }
+    }
+    if(retired)uhci_dma_sync();
+    irq_restore(flags);
+    if(!retired)return;
+    /* Retire all interfaces of a composite receiver before reusing DMA. */
+    uint32_t start=g_pit_ticks;
+    while((uint32_t)(g_pit_ticks-start)<3u)asm volatile("pause");
+    flags=irq_save_disable();
+    for(unsigned i=0;i<HID_QUEUES;i++)
+        if(retired&(1u<<i))u->hidq[i].pending=u->hidq[i].addr=u->hidq[i].toggle=0;
+    irq_restore(flags);
+}
+
+/* Nonblocking: consume a completed report and arm the next transfer. */
+int uhci_interrupt_in(uint16_t io,int port,uint8_t addr,uint8_t ep,uint8_t *buf,
+                      int len,int lowspeed,int *actual) {
+    uhci_t *u=state(io);
+    if(!u)return -1;
+    if(actual)*actual=0;
+    /* Stop delivering input from an address after its port loses link. */
+    if( (unsigned)port>=2 || (u_inw(io,0x10+2*port)&5u)!=5u || !addr || addr>127 || ep<0x81 || ep>0x8f ||
+       !buf || len<1 || len>(lowspeed?8:64))return -1;
+    uint32_t flags=irq_save_disable();
+    hid_queue *q=NULL;
+    for(unsigned i=0;i<HID_QUEUES;i++){
+        if(u->hidq[i].addr==addr && u->hidq[i].ep==ep){q=&u->hidq[i];break;}
+        if(!q && !u->hidq[i].addr)q=&u->hidq[i];
+    }
+    if(!q){irq_restore(flags);return -1;}
+    q->addr=addr;q->ep=ep;
+    if(q->pending){
+        uhci_dma_sync_tick();
+        uint32_t st=q->td[1];
+        if(st & UHCI_TD_ACTIVE){irq_restore(flags);return 0;}
+        if(st & UHCI_TD_FATAL){irq_restore(flags);return -1;}
+        /* Wait for the HC to retire this TD before publishing another. */
+        if(!(q->qh[1]&1u)){irq_restore(flags);return 0;}
+        if(!(st & UHCI_TD_NAK)){
+            unsigned n=((st & 2047u)+1u)&2047u;
+            q->toggle^=1;
+            if(n>(unsigned)len)n=(unsigned)len;
+            for(unsigned j=0;j<n;j++)buf[j]=q->data[j];
+            if(actual)*actual=(int)n;
+        }
+    }
+    q->td[0]=1;
+    q->td[1]=UHCI_TD_ACTIVE|UHCI_TD_ERR3|(lowspeed?UHCI_TD_LS:0);
+    q->td[2]=UHCI_PID_IN|((uint32_t)addr<<8)|((uint32_t)(ep&15)<<15)|
+             ((uint32_t)q->toggle<<19)|((uint32_t)(len-1)<<21);
+    q->td[3]=U32PTR(q->data);
+    __asm__ volatile("":::"memory");
+    q->qh[1]=U32PTR(q->td);
+    q->pending=1;
     uhci_dma_sync();
-
-    uint32_t st = g_itd[1];
-    if (!done) return -1;
-    if (st & UHCI_TD_FATAL) return -1;
-
-    uint32_t al_field = st & 0x7FFu;
-    int al = (al_field == 0x7FFu) ? 0 : (int)al_field + 1;
-    if (al <= 0) return 0;                              /* NAK / 零长度：无数据 */
-
-    g_toggle[addr] = (uint8_t)(g_toggle[addr] ^ 1u);    /* 收到数据才翻 toggle */
-    int n = al;
-    if (n > blen) n = blen;
-    for (int i = 0; i < n; i++) buf[i] = (uint8_t)g_ibuf[i];
-    if (actlen) *actlen = n;
+    irq_restore(flags);
     return 0;
 }
 
@@ -483,16 +499,17 @@ int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
 int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
                    uint8_t *buf, int blen, int mps,
                    int lowspeed, int *actlen) {
-    (void)io;   /* 与控制传输相同：走常驻调度，不经直接端口 IO */
+    uhci_t *u=state(io);
+    if(!u)return -1;
     if (actlen) *actlen = 0;
     if (addr == 0u || addr > 127u) return -1;
-    if (blen < 0 || blen > (int)sizeof(g_bulkbuf)) return -1;   /* 缓冲上界 */
+    if (blen < 0 || blen > (int)sizeof(u->g_bulkbuf)) return -1;   /* 缓冲上界 */
     if (blen > 0 && !buf) return -1;
     if (mps != 8 && mps != 16 && mps != 32 && mps != 64) return -1;
     if ((ep & 0x7Fu) == 0u || (ep & 0x7Fu) > 15u) return -1;   /* 非端点0 */
 
     int dir_in = (ep & 0x80u) ? 1 : 0;
-    uint8_t *togp = dir_in ? &g_btog_in[addr] : &g_btog_out[addr];
+    uint8_t *togp = dir_in ? &u->g_btog_in[addr] : &u->g_btog_out[addr];
     uint32_t tog = *togp ? (1u << 19) : 0u;
 
     /* 拆包：n = ceil(blen/mps)。TD 池上界校验（mps=8 且 512B 时 n=64>16，
@@ -505,7 +522,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     if (blen == 0) return 0;                     /* 零数据阶段：无事可做 */
 
     /* 数据搬进 DMA 缓冲（IN 清零防陈旧值，OUT 拷入待发数据） */
-    for (int i = 0; i < blen; i++) g_bulkbuf[i] = dir_in ? 0 : buf[i];
+    for (int i = 0; i < blen; i++) u->g_bulkbuf[i] = dir_in ? 0 : buf[i];
 
     uint32_t ls = lowspeed ? UHCI_TD_LS : 0u;    /* 低速无 bulk，保守保留 */
     uint32_t pid = dir_in ? UHCI_PID_IN : UHCI_PID_OUT;
@@ -514,21 +531,21 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     for (int i = 0; i < n; i++) {
         int want = (remain > mps) ? mps : remain;
         remain -= want;
-        for (int k = 0; k < 8; k++) g_btd[i][k] = 0;
-        g_btd[i][3] = U32PTR(&g_bulkbuf[i * mps]);
-        g_btd[i][2] = pid
+        for (int k = 0; k < 8; k++) u->g_btd[i][k] = 0;
+        u->g_btd[i][3] = U32PTR(&u->g_bulkbuf[i * mps]);
+        u->g_btd[i][2] = pid
                    | ((uint32_t)addr << 8)
                    | (((uint32_t)(ep & 0x7Fu)) << 15)
                    | tog
                    | (((uint32_t)(want - 1)) << 21);      /* maxlen = len-1 */
-        g_btd[i][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
+        u->g_btd[i][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
                    | (dir_in ? UHCI_TD_SPD : 0u);
-        g_btd[i][0] = (i + 1 < n) ? U32PTR(&g_btd[i + 1]) : 0x1u;
+        u->g_btd[i][0] = (i + 1 < n) ? U32PTR(&u->g_btd[i + 1]) : 0x1u;
         tog ^= (1u << 19);                                 /* 后续包翻转 */
     }
 
     /* 挂上 bulk QH（element -> TD0，Q=0 纵向），逐包串行等待 */
-    g_bqh[1] = U32PTR(&g_btd[0]);
+    u->g_bqh[1] = U32PTR(&u->g_btd[0]);
     uhci_dma_sync();
 
     int total = 0;
@@ -539,14 +556,14 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
         int done = 0;
         while ((uint32_t)(g_pit_ticks - t0) < UHCI_BULK_TO_MS) {
             uhci_dma_sync_tick();
-            uint32_t st = g_btd[i][1];
+            uint32_t st = u->g_btd[i][1];
             if (st & UHCI_TD_ACTIVE) continue;             /* HC 还在跑 */
             if (st & UHCI_TD_NAK) {
                 /* 设备忙：规范里 NAK 的 TD 置完成+NAK 位，HC 不再重试——
                  * 软件重激活同一个 TD（toggle/token 不变，设备期待的
                  * toggle 序列也没变），上界防设备永久忙。 */
                 if (++naks > UHCI_BULK_NAK_MAX) { fail = 1; break; }
-                g_btd[i][1] = (st & ~(uint32_t)UHCI_TD_NAK & ~0x7FFu)
+                u->g_btd[i][1] = (st & ~(uint32_t)UHCI_TD_NAK & ~0x7FFu)
                             | UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
                             | (dir_in ? UHCI_TD_SPD : 0u);
                 uhci_dma_sync();       /* 重新激活的那个字必须先写回 */
@@ -558,7 +575,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
         }
         if (!done) { fail = 1; break; }
 
-        uint32_t st = g_btd[i][1];
+        uint32_t st = u->g_btd[i][1];
         uint32_t al = st & 0x7FFu;
         int got = (al == 0x7FFu) ? 0 : (int)al + 1;
         total += got;
@@ -569,7 +586,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     }
 
     /* 撤下：防 HC 反复重跑已完成的 TD 链 */
-    g_bqh[1] = 0x1u;
+    u->g_bqh[1] = 0x1u;
     uhci_dma_sync();
 
     if (fail) {
@@ -590,7 +607,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     if (dir_in && total > 0) {
         int cpy = total;
         if (cpy > blen) cpy = blen;
-        for (int i = 0; i < cpy; i++) buf[i] = (uint8_t)g_bulkbuf[i];
+        for (int i = 0; i < cpy; i++) buf[i] = (uint8_t)u->g_bulkbuf[i];
     }
     if (actlen) *actlen = total;
     return 0;
@@ -598,16 +615,20 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
 /* BOT reset / ClearFeature(HALT) 之后调用：bulk 两个方向的 toggle 清回
  * DATA0（USB 规范要求端点复位时 toggle 重置）。 */
-void uhci_bulk_tog_reset(uint8_t addr) {
+void uhci_bulk_tog_reset(uint16_t io,uint8_t addr) {
+    uhci_t *u=state(io);
+    if(!u)return;
     if (addr > 127u) return;
-    g_btog_in[addr]  = 0;
-    g_btog_out[addr] = 0;
+    u->g_btog_in[addr]  = 0;
+    u->g_btog_out[addr] = 0;
 }
 
 /* 确保 HC 处于运行态（见 uhci.h 注释）：GRESET/端口复位之后、发起传输之前
  * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */
 int uhci_hc_start(uint16_t io) {
-    u_outl(io, 0x08, UHCI_FRAME_PHYS);   /* 重锁存帧列表物理地址 */
+    uhci_t *u=state(io);
+    if(!u)return -1;
+    u_outl(io, 0x08, U32PTR(u->g_frame));   /* 重锁存帧列表物理地址 */
     uint16_t cmd = u_inw(io, 0x00);
     u_outw(io, 0x00, (uint16_t)(cmd | 0x0001u | 0x0100u));  /* RS=1, CF=1 */
     u_delay_ms(2);
@@ -663,10 +684,10 @@ int uhci_port_reset(uint16_t io, int p) {
  *   GET_DESCRIPTOR(Device) @addr0 -> SET_ADDRESS(1) -> GET_DESCRIPTOR @addr1
  * 仅读设备描述符前几个字段作证据（不解析 HID 报告、不做完整枚举全链路）。
  * 不插设备时干净跳过（fail closed，绝不误报成功）。 */
-static void uhci_control_probe(void) {
-    if (g_ctrl_io == 0 || g_ctrl_port < 0) return;
-    uint16_t io = g_ctrl_io;
-    int port = g_ctrl_port;
+static void uhci_control_probe(uhci_t *u) {
+    if (u->first_port<0) return;
+    uint16_t io=u->io;
+    int port=u->first_port;
 
     /* 仅对已连接端口做复位（空口复位无意义，跳过） */
     int conn = uhci_port_reset(io, port);
@@ -683,7 +704,7 @@ static void uhci_control_probe(void) {
     /* 确保 HC 锁存 BSS 帧列表并处于运行状态（GRESET 已清 CF/RS，必须重设；
      * 每帧链表挂接由 uhci_control_xfer 在每次传输时设置）。 */
     {
-        u_outl(io, 0x08, UHCI_FRAME_PHYS);          /* 重锁存帧列表物理地址 */
+        u_outl(io, 0x08, U32PTR(u->g_frame));          /* 重锁存帧列表物理地址 */
         uint16_t cmd = u_inw(io, 0x00);
         u_outw(io, 0x00, (uint16_t)(cmd | 0x0001u | 0x0100u));   /* RS=1, CF=1 */
         u_delay_ms(2);
@@ -691,7 +712,7 @@ static void uhci_control_probe(void) {
         uint16_t fr   = u_inw(io, 0x06);
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         u_app_str(line, &li, lim, "UHCI-CTRL: hc flba=0x");
-        u_app_hex(line, &li, lim, UHCI_FRAME_PHYS, 8);
+        u_app_hex(line, &li, lim, U32PTR(u->g_frame), 8);
         u_app_str(line, &li, lim, " STS=0x");
         u_app_hex(line, &li, lim, (uint32_t)sts, 4);
         u_app_str(line, &li, lim, " FRNUM=0x");
@@ -700,7 +721,7 @@ static void uhci_control_probe(void) {
         dmesg_write(line);
     }
 
-    int ls = g_ctrl_ls;
+    int ls = u->first_ls;
 
     /* 1) GET_DESCRIPTOR(Device, idx0, len18) @addr0 */
     uint8_t req[8]  = {0x80,0x06,0x00,0x01,0x00,0x00,0x12,0x00};
@@ -774,7 +795,7 @@ static void uhci_control_probe(void) {
 }
 
 /* ---------- 单个 UHCI 控制器初始化（返回 0=成功, -1=放弃） ---------- */
-static int uhci_setup_one(const pci_device_t *d) {
+static int uhci_setup_one(const pci_device_t *d,uhci_t *u) {
     /* 不可信字段上界：bus/dev/func 来自配置空间，先夹紧避免越界访问 */
     uint8_t bus  = d->bus;
     uint8_t dev  = d->dev;
@@ -854,6 +875,7 @@ static int uhci_setup_one(const pci_device_t *d) {
         }
 
         /* 建议基址 0xC000，向上对齐到 size 边界（保证 I/O 解码不跨边界） */
+        if(controller_count)return -1;
         uint32_t base = 0xC000u;
         uint32_t align = size - 1u;
         base = (base + align) & ~align;
@@ -895,7 +917,11 @@ static int uhci_setup_one(const pci_device_t *d) {
     } else {
         /* I/O BAR 已编程：直接用，并补开 IO/BM 位（防御性） */
         io = (uint16_t)(bar0 & 0xFFFCu);
-        uint32_t cmd = pci_read_dword(bus, dev, func, PCI_REG_COMMAND);
+        if(!io || state(io)){
+            dmesg_write("UHCI: invalid or duplicate I/O base");
+            return -1;
+        }
+        uint16_t cmd = pci_read_word(bus, dev, func, PCI_REG_COMMAND);
         if ((cmd & (PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER)) !=
             (PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER)) {
             cmd |= (uint32_t)(PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER);
@@ -915,7 +941,7 @@ static int uhci_setup_one(const pci_device_t *d) {
         }
     }
 
-    if (!bar_ok) return -1;
+    if (!bar_ok || !io || state(io)) return -1;
 
     /* ---------- 全局复位（GRESET, bit2） ---------- */
     uint16_t cmd = u_inw(io, 0x00);
@@ -940,19 +966,22 @@ static int uhci_setup_one(const pci_device_t *d) {
 
     /* ---------- 建立帧列表（BSS，4KB 对齐，与 AHCI DMA 缓冲同区，已验证对
      * 设备 DMA 一致；不依赖 pmm 池，免去资源失败回滚的额外复杂度） ---------- */
-    /* 建立帧列表 + 常驻调度骨架（见 g_iqh 处的骨架注释）：
+    /* 建立帧列表 + 常驻调度骨架（见 u->hidq 处的骨架注释）：
      *   帧列表全部 1024 项 -> 中断 QH(Q=1) -> 水平链 -> 控制 QH(Q=1)
      * 两个 QH 的 element 初始都是 T（空队列），后续各传各的、只改自己那一个
      * dword。帧列表建好之后**永不改写**，也不必每次传输重刷 4KB。 */
-    g_iqh[0] = U32PTR(&g_qh[0]) | 0x2u;          /* 水平链 -> 控制 QH (Q=1) */
-    g_iqh[1] = 0x1u;                             /* element = T（暂无中断 TD） */
-    g_qh[0]  = U32PTR(&g_bqh[0]) | 0x2u;         /* 控制 QH 水平链 -> bulk QH */
-    g_qh[1]  = 0x1u;                             /* element = T（暂无控制 TD） */
-    g_bqh[0] = 0x1u;                             /* bulk QH 水平链终止 */
-    g_bqh[1] = 0x1u;                             /* element = T（暂无 bulk TD） */
+    for(unsigned i=0;i<HID_QUEUES;i++){
+        u->hidq[i].qh[0]=(i+1<HID_QUEUES?U32PTR(u->hidq[i+1].qh):U32PTR(u->g_qh))|2u;
+        u->hidq[i].qh[1]=1;
+        u->hidq[i].addr=u->hidq[i].pending=u->hidq[i].toggle=0;
+    }
+    u->g_qh[0]  = U32PTR(&u->g_bqh[0]) | 0x2u;         /* 控制 QH 水平链 -> bulk QH */
+    u->g_qh[1]  = 0x1u;                             /* element = T（暂无控制 TD） */
+    u->g_bqh[0] = 0x1u;                             /* bulk QH 水平链终止 */
+    u->g_bqh[1] = 0x1u;                             /* element = T（暂无 bulk TD） */
     for (int k = 0; k < 1024; k++)
-        g_frame[k] = U32PTR(&g_iqh[0]) | 0x2u;   /* frame -> 中断 QH (Q=1) */
-    u_outl(io, 0x08, UHCI_FRAME_PHYS);          /* FLBASEADD = 帧列表物理地址 */
+        u->g_frame[k] = U32PTR(u->hidq[0].qh) | 0x2u;   /* frame -> 中断 QH (Q=1) */
+    u_outl(io, 0x08, U32PTR(u->g_frame));          /* FLBASEADD = 帧列表物理地址 */
     u_outw(io, 0x06, 0x0000);                   /* FRNUM = 0 */
 
     /* ---------- 启动调度（RS=1, CF=1, MAXP=0→64 字节包） ----------
@@ -1001,7 +1030,7 @@ static int uhci_setup_one(const pci_device_t *d) {
         if (conn && first_conn < 0) { first_conn = p; first_ls = (int)ls; }
         /* H2-2c：登记进端口表供枚举模块消费（表满则丢弃多余条目，
          * 不扩表、不动态分配——UHCI 根口本来只有 2 个）。 */
-        if (conn && g_plist_n < UHCI_MAX_PORTS) {
+        if (conn && (unsigned)g_plist_n < UHCI_MAX_PORTS) {
             g_plist[g_plist_n].io   = io;
             g_plist[g_plist_n].port = p;
             g_plist[g_plist_n].ls   = (int)ls;
@@ -1024,9 +1053,9 @@ static int uhci_setup_one(const pci_device_t *d) {
     }
 
     /* 把首个已连接端口的句柄交给 H2-2b 控制传输探针 */
-    g_ctrl_io    = io;
-    g_ctrl_port  = first_conn;
-    g_ctrl_ls    = first_ls;
+    u->io=io;
+    u->first_port=first_conn;
+    u->first_ls=first_ls;
 
     /* ---------- 汇总行 ---------- */
     uint16_t sts_f = u_inw(io, 0x02);
@@ -1041,7 +1070,7 @@ static int uhci_setup_one(const pci_device_t *d) {
         if (irq_valid) u_app_dec(line, &li, lim, (uint32_t)irq);
         else           u_app_str(line, &li, lim, "N/A");
         u_app_str(line, &li, lim, " frame=0x");
-        u_app_hex(line, &li, lim, UHCI_FRAME_PHYS, 8);
+        u_app_hex(line, &li, lim, U32PTR(u->g_frame), 8);
         u_app_str(line, &li, lim, " sts=0x");
         u_app_hex(line, &li, lim, (uint32_t)sts_f, 4);
         if (li < lim) line[li] = 0; else line[lim] = 0;
@@ -1055,7 +1084,6 @@ static int uhci_setup_one(const pci_device_t *d) {
 void uhci_init(void) {
     int n = pci_device_count();
     int found = 0;
-    int handled = 0;
 
     for (int i = 0; i < n; i++) {
         const pci_device_t *d = pci_get_device(i);
@@ -1066,13 +1094,9 @@ void uhci_init(void) {
             continue;
 
         found++;
-        if (handled) {
-            /* 本步只初始化第一个 UHCI，其余记一笔跳过，避免重复帧列表/端口日志 */
-            dmesg_write("UHCI: additional UHCI controller skipped this step");
-            continue;
-        }
-        handled = 1;
-        uhci_setup_one(d);
+        if (controller_count>=UHCI_MAX_CTL)continue;
+        if(uhci_setup_one(d,&controllers[controller_count])==0)
+            controller_count++;
     }
 
     if (found == 0) return;    /* usb_scan_log 已报 "no USB controller"，不重复 */
@@ -1082,11 +1106,12 @@ void uhci_init(void) {
         int li = 0; int lim = (int)sizeof(line) - 1;
         u_app_str(line, &li, lim, "UHCI: ");
         u_app_dec(line, &li, lim, (uint32_t)found);
-        u_app_str(line, &li, lim, " UHCI controller(s) found, initialized first");
+        u_app_str(line, &li, lim, " UHCI controller(s) found, initialized ");
+        u_app_dec(line, &li, lim, controller_count);
         if (li < lim) line[li] = 0; else line[lim] = 0;
         dmesg_write(line);
     }
 
     /* H2-2b：对已连接端口做最小控制传输探针（GET_DESCRIPTOR/SET_ADDRESS） */
-    uhci_control_probe();
+    for(unsigned i=0;i<controller_count;i++)uhci_control_probe(&controllers[i]);
 }

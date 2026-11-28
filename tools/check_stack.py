@@ -49,6 +49,9 @@ WARN_LIMIT = 4 * 1024
 CFLAGS = ["-m32", "-ffreestanding", "-Os", "-Wall", "-Wextra",
           "-fno-pie", "-fno-pic", "-fno-stack-protector", "-Ikernel", "-MMD"]
 
+# Match the build's per-file include path for the bundled freestanding headers.
+EXTRA_CFLAGS = {"webimage": ["-Ithird_party/wuffs/include"]}
+
 
 def main():
     cc = ezos_env.tool("cc")
@@ -64,10 +67,10 @@ def main():
         # gcc 自己覆盖。删它没有意义，却会在带删除钩子的环境里被拦下，
         # os.remove 抛错后虽然被except 吞掉，但某些钩子是直接终止进程的，
         # 整项测试就被砍成 rc=1、stdout 半截 —— 曾因此误判成"栈预算超标"。
-        cmd = [cc] + CFLAGS + ["-fstack-usage", "-c", s, "-o", obj]
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [cc] + CFLAGS + EXTRA_CFLAGS.get(base, []) + ["-fstack-usage", "-c", s, "-o", obj]
+        p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if p.returncode != 0:
-            errors.append("%s: %s" % (s, (p.stderr or "").strip().splitlines()[:1]))
+            errors.append("%s:\n    %s" % (s, "\n    ".join(p.stderr.strip().splitlines()[:6])))
             continue
         if not os.path.exists(su):
             continue

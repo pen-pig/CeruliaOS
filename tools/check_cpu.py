@@ -114,6 +114,7 @@ def scan(path, label):
 
 def main():
     quiet = "--quiet" in sys.argv
+    require_all = "--require-all" in sys.argv
     if OBJDUMP is None:
         print("check_cpu: 找不到能反汇编 i386 的 objdump"
               "（装 i686-elf-tools，或让 CI 装 gcc-multilib）")
@@ -147,10 +148,12 @@ def main():
             print("  OK   %-5s %s：无 SSE/SSE2" % (label, rel))
 
     for s in skipped:
-        print("  SKIP %s" % s)
+        print("  %s %s" % ("FAIL" if require_all else "SKIP", s))
 
     if bad:
         print("check_cpu: FAIL（内核不开 CR4.OSFXSR、不保存 XMM，这些指令必然 #UD）")
+        return 1
+    if require_all and skipped:
         return 1
     print("check_cpu: OK")
     return 0

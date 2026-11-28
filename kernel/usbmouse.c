@@ -13,14 +13,15 @@
  *
  * 红线落实：
  *  - 不可信输入上界：报告不足 3 字节直接丢弃；缓冲固定 8 字节，mps 夹紧。
- *  - 轮询绝不挂死：uhci 层有超时，这里额外做 5ms 节流 + **IF=0 直接返回**
- *    （IF=0 时 g_pit_ticks 不前进，uhci 的超时等待会变成永久挂死）。
+ *  - 轮询使用非阻塞 USB IN；5ms 节流，避免反复读取同一端点。
  *  - 与 PS/2 共用状态：注入走 mouse_inject_report()，由 mouse.c 负责关中断
  *    保护，本模块不直接碰指针坐标。
  *  - 静默原则：NAK（没有新报告）是常态，绝不打印；诊断行只在真的收到报告
  *    或真的有位移/按键时打，并对"移动事件"再做 250ms 节流防刷屏。
  */
 #include "usbmouse.h"
+#include "types.h"
+#include "usbwheel.h"
 #include "usbenum.h"
 #include "usbhc.h"
 #include "mouse.h"
@@ -34,13 +35,23 @@
 #define USBMOU_REPORT_LEN  8u      /* 缓冲上界 */
 #define USBMOU_EMIT_MS     250u    /* 移动诊断行节流 */
 
-static const usb_dev_t *g_mou = NULL;   /* 认领到的鼠标（指向 usbenum 的静态表） */
-static uint32_t g_last_poll = 0;        /* 上次真正轮询的 tick */
-static uint32_t g_last_emit = 0;        /* 上次打移动行的 tick */
-static int      g_last_btn = 0;         /* 上次按键状态（变化才算事件） */
-static int      g_got_report = 0;       /* 至少收到过一个合法报告 */
+typedef struct {
+    const usb_dev_t *dev;
+    const usb_hid_if_t *pointer;
+    uint32_t last_emit;
+    uint16_t abs_x,abs_y;
+    uint8_t mode, buttons, got_report, abs_valid;
+} pointer_t;
+static pointer_t pointers[USBENUM_MAX_DEV];
+static uint32_t last_poll;
 
-/* ---------- 手写格式化（内核无 sprintf） ---------- */
+static int usb_buttons(void) {
+    int merged=0;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+        if(pointers[i].dev)merged|=pointers[i].buttons;
+    return merged;
+}
+
 static void m_str(char *b, int *n, int lim, const char *s) {
     while (*s && *n < lim) b[(*n)++] = *s++;
 }
@@ -66,90 +77,116 @@ static void m_emit(char *b, int n, int lim) {
 }
 
 /* ---------- 入口：认领鼠标并切 boot 协议 ---------- */
-void usbmouse_init(void) {
-    int n = usbenum_device_count();
-
-    g_mou = NULL;
-    g_got_report = 0;
-    g_last_btn = 0;
-
-    for (int i = 0; i < n; i++) {
-        const usb_dev_t *d = usbenum_get(i);
-        if (!d) continue;
-        /* boot 鼠标的判据：HID 接口 + subclass=1(boot) + protocol=2(鼠标)，
-         * 且枚举阶段已 SET_CONFIGURATION 成功、找到了中断 IN 端点。
-         * 注意 hid_ep_mps 可能小于 8，真正的报告长度以实际 actlen 为准。 */
-        if (d->hid_if >= 0 && d->hid_sub == 1u && d->hid_proto == 2u &&
-            d->hid_ep != 0u && d->configured) {
-            /* 同 usbkbd：EHCI 侧还没有中断 IN，认领了也读不到报告 */
-            if (!usbhc_supports_interrupt(&d->bus)) {
-                dmesg_write("USB-MOU: HID on EHCI skipped (no interrupt IN yet)");
-                continue;
+static const usb_hid_if_t *select_pointer(const usb_dev_t *d,int *is_boot,unsigned *report_mode) {
+    if(!usbhc_supports_interrupt(&d->bus))return 0;
+        for(unsigned j=0;j<d->hid_count;j++){
+            const usb_hid_if_t *candidate=&d->hid[j];
+            if(!candidate->ready || !usb_hid_pointer(candidate))continue;
+            int boot=candidate->sub==1 && candidate->proto==2;
+            unsigned mode=candidate->pointer_layout;
+            if(boot){
+                uint8_t sp[]={0x21,0x0b,(uint8_t)!!mode,0,candidate->number,0,0,0};
+                int result=usbhc_control_xfer(&d->bus,d->addr,0,sp,0,0,0,0);
+                if(result && mode) {
+                    sp[2]=0;
+                    result=usbhc_control_xfer(&d->bus,d->addr,0,sp,0,0,0,0);
+                }
+                if(result) {
+                    /* Some receivers decline SET_PROTOCOL when already in the
+                     * requested mode. Don't guess: ask before interpreting. */
+                    uint8_t get[]={0xa1,3,0,0,candidate->number,0,1,0},proto=255;
+                    int got=0;
+                    if(usbhc_control_xfer(&d->bus,d->addr,0,get,1,&proto,1,&got)!=0 ||
+                       got!=1 || proto>1 || (proto && !mode))continue;
+                    sp[2]=proto;
+                }
+                if(!sp[2])mode=0;
             }
-            g_mou = d;
-            break;
+            *is_boot=boot;
+            *report_mode=mode;
+            return candidate;
         }
-    }
+    return 0;
+}
 
-    mouse_usb_set_present(g_mou ? 1 : 0);
-
-    if (!g_mou) {
-        dmesg_write("USB-MOU: no HID boot mouse");
-        return;
-    }
-
-    /*
-     * SET_PROTOCOL(boot=0)：让设备用固定的 boot 报告格式（buttons/dx/dy）。
-     * 失败不致命（多数鼠标默认就是 boot 格式），但要如实打印。
-     *
-     * **本驱动故意不发 SET_IDLE**：boot 协议下设备的默认 idle 就是"无限"
-     *（变化即报告），与 SET_IDLE(0) 等价，而实测 QEMU 的 usb-mouse 在收到
-     * 显式 SET_IDLE 之后就不再在中断端点上报（中断 IN 恒 NAK，控制端点的
-     * GET_REPORT 也拿不到数据）——不发 SET_IDLE 反而稳定收到报告。真机上
-     * 不发同样安全：默认 idle=无限是所有 boot 鼠标的出厂行为。
-     */
-    uint8_t ifnum = (uint8_t)(g_mou->hid_if & 0xFFu);
-    uint8_t sp[8] = {0x21, 0x0B, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
-    int rp = usbhc_control_xfer(&g_mou->bus, g_mou->addr, 0, sp, 0, NULL, 0,
-                                NULL);
-
+static void bind_pointer(pointer_t *m,const usb_dev_t *picked,const usb_hid_if_t *h,
+                         int boot,unsigned report_mode) {
     {
         char line[128];
         int n2 = 0;
         int lim = (int)sizeof(line) - 1;
-        m_str(line, &n2, lim, "USB-MOU: boot mouse addr=");
-        m_dec(line, &n2, lim, (uint32_t)g_mou->addr);
+        m_str(line, &n2, lim, boot ? "USB-MOU: boot mouse addr=" : "USB-MOU: report pointer addr=");
+        m_dec(line, &n2, lim, (uint32_t)picked->addr);
         m_str(line, &n2, lim, " ep=");
-        m_dec(line, &n2, lim, (uint32_t)g_mou->hid_ep);
+        m_dec(line, &n2, lim, (uint32_t)h->ep);
         m_str(line, &n2, lim, " mps=");
-        m_dec(line, &n2, lim, (uint32_t)g_mou->hid_ep_mps);
+        m_dec(line, &n2, lim, (uint32_t)h->mps);
         m_str(line, &n2, lim, " int=");
-        m_dec(line, &n2, lim, (uint32_t)g_mou->hid_ep_interval);
-        m_str(line, &n2, lim, (rp == 0) ? " proto=ok" : " proto=fail");
+        m_dec(line, &n2, lim, (uint32_t)h->interval);
+        m_str(line, &n2, lim, report_mode==HID_ABS_WHEEL ? " proto=ok mode=absolute" :
+              report_mode ? " proto=ok mode=wheel" : " proto=ok mode=boot");
         m_emit(line, n2, lim);
     }
+    uint32_t flags=irq_save_disable();
+    *m=(pointer_t){.dev=picked,.pointer=h,.mode=(uint8_t)report_mode};
+    mouse_usb_set_present(1);
+    irq_restore(flags);
 }
 
-/*
- * 轮询主体：读一份报告并注入。所有提前返回都在这里，外层统一清重入标志。
- */
-static void poll_once(const usb_dev_t *d) {
-    uint8_t rep[USBMOU_REPORT_LEN];
+void usbmouse_init(void) {
+    int n=usbenum_device_count();
+    for(int i=0;i<n && i<USBENUM_MAX_DEV;i++){
+        const usb_dev_t *d=usbenum_get(i);
+        if(!d || !d->configured || pointers[i].dev)continue;
+        int boot=0;
+        unsigned mode=0;
+        const usb_hid_if_t *h=select_pointer(d,&boot,&mode);
+        if(h)bind_pointer(&pointers[i],d,h,boot,mode);
+    }
+    if(!usbmouse_present())dmesg_write("USB-MOU: no HID boot mouse (or usable report-mode pointer)");
+}
+
+void usbmouse_detach(const usb_dev_t *device) {
+    uint32_t flags=irq_save_disable();
+    int old=usb_buttons();
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+        if(pointers[i].dev==device)pointers[i]=(pointer_t){0};
+    int new=usb_buttons();
+    if(old!=new)mouse_inject_report(0,0,new,0);
+    mouse_usb_set_present(usbmouse_present());
+    irq_restore(flags);
+}
+
+/* Read a report and publish any button, motion or wheel change. */
+static void poll_once(pointer_t *m) {
+    const usb_dev_t *d=m->dev;
+    uint8_t data[USBMOU_REPORT_LEN];
+    uint8_t *rep=data;
     int act = 0;
-    int mps = (int)d->hid_ep_mps;
+    int mps = (int)m->pointer->mps;
     if (mps < (int)USBMOU_REPORT_MIN) mps = (int)USBMOU_REPORT_MIN;
-    if (mps > (int)sizeof(rep)) mps = (int)sizeof(rep);
+    if (mps > (int)sizeof(data)) mps = (int)sizeof(data);
 
-    for (int i = 0; i < (int)sizeof(rep); i++) rep[i] = 0;
-    int r = usbhc_interrupt_in(&d->bus, d->addr, d->hid_ep, rep, mps, &act);
-    if (r != 0) return;                          /* 超时/致命错误：静默 */
+    for (int i = 0; i < (int)sizeof(data); i++) rep[i] = 0;
+    int r = usbhc_interrupt_in(&d->bus, d->addr, m->pointer->ep, rep, mps, &act);
+    if (r != 0) {
+        /* Losing a device mid-drag must not leave the desktop captured. */
+        if (m->buttons) {m->buttons=0;mouse_inject_report(0,0,usb_buttons(),0);}
+        m->abs_valid=0;
+        return;
+    }
     if (act < (int)USBMOU_REPORT_MIN) return;    /* NAK 或报告不完整：静默 */
+    if(m->mode && m->pointer->pointer_id){
+        if(rep[0]!=m->pointer->pointer_id)return;
+        rep++;act--;
+    }
+    if(m->mode && (unsigned)act!=hid_pointer_bytes(m->mode))return;
 
-    if (!g_got_report) {
+    if (!m->got_report) {
         char line[96];
         int n = 0;
         int lim = (int)sizeof(line) - 1;
-        g_got_report = 1;
+        m->got_report = 1;
         m_str(line, &n, lim, "USB-MOU: report ok len=");
         m_dec(line, &n, lim, (uint32_t)act);   /* 实测长度，不写死 */
         m_emit(line, n, lim);
@@ -162,7 +199,29 @@ static void poll_once(const usb_dev_t *d) {
      */
     mouse_ev_t ev;
     ev.dx = ev.dy = ev.buttons = ev.dz = 0;
-    if (mouse_decode_usb(rep, (uint32_t)act, &ev) != 0) return;
+    if(m->mode==HID_ABS_WHEEL) {
+        if(act!=6)return;
+        unsigned x=rep[1]|((unsigned)rep[2]<<8),y=rep[3]|((unsigned)rep[4]<<8);
+        if(x>32767 || y>32767)return;
+        int buttons=rep[0]&7,delta=(int8_t)rep[5],changed=m->buttons!=buttons;
+        m->buttons=(uint8_t)buttons;
+        if(!m->abs_valid || x!=m->abs_x || y!=m->abs_y){
+            m->abs_valid=1;
+            m->abs_x=(uint16_t)x;
+            m->abs_y=(uint16_t)y;
+            mouse_inject_absolute(x,y,usb_buttons(),delta);
+        }else if(changed || delta){
+            /* Don't move the shared cursor back to a stationary tablet. */
+            mouse_inject_report(0,0,usb_buttons(),delta);
+        }
+        return;
+    }
+    if(m->mode==HID_REL16 || m->mode==HID_REL16_WHEEL){
+        ev.buttons=rep[0]&7;
+        ev.dx=(int16_t)(rep[1]|((unsigned)rep[2]<<8));
+        ev.dy=(int16_t)(rep[3]|((unsigned)rep[4]<<8));
+        if(m->mode==HID_REL16_WHEEL)ev.dz=(int8_t)rep[5];
+    }else if (mouse_decode_usb(rep, m->mode ? (uint32_t)act : 3u, &ev) != 0) return;
 
     int btn = ev.buttons;
     int dx  = ev.dx;
@@ -170,8 +229,8 @@ static void poll_once(const usb_dev_t *d) {
     int dz  = ev.dz;
 
     /* 静止且按键没变：不是事件，直接返回（避免把 0 位移当事件刷屏） */
-    if (dx == 0 && dy == 0 && dz == 0 && btn == g_last_btn) return;
-    g_last_btn = btn;
+    if (dx == 0 && dy == 0 && dz == 0 && btn == m->buttons) return;
+    m->buttons = btn;
 
     /*
      * 注入：统一成屏幕坐标交给 mouse 层。
@@ -179,10 +238,10 @@ static void poll_once(const usb_dev_t *d) {
      *   Y：USB 正 = 下，屏幕 Y 正 = 下 -> 原样（mouse 层内部已按屏幕坐标累加）
      * 滚轮：USB 报告正 = 上滚，mouse 层的 wheel 语义是 >0 向上滚 -> 原样
      */
-    mouse_inject_report(dx, dy, btn, dz);
+    mouse_inject_report(dx,dy,usb_buttons(),dz);
 
-    if ((uint32_t)(g_pit_ticks - g_last_emit) < USBMOU_EMIT_MS) return;
-    g_last_emit = g_pit_ticks;
+    if (m->last_emit && (uint32_t)(g_pit_ticks - m->last_emit) < USBMOU_EMIT_MS) return;
+    m->last_emit = g_pit_ticks;
 
     {
         char line[128];
@@ -193,7 +252,7 @@ static void poll_once(const usb_dev_t *d) {
         m_str(line, &n, lim, " dy=");
         m_sdec(line, &n, lim, dy);
         m_str(line, &n, lim, " btn=");
-        m_dec(line, &n, lim, (uint32_t)btn);
+        m_dec(line, &n, lim, (uint32_t)mouse_get_buttons());
         m_str(line, &n, lim, " x=");
         m_dec(line, &n, lim, (uint32_t)mouse_get_x());
         m_str(line, &n, lim, " y=");
@@ -202,37 +261,25 @@ static void poll_once(const usb_dev_t *d) {
     }
 }
 
-/* ---------- 轮询入口：节流 + 死锁/重入防线，再跑一次主体 ---------- */
+/* Nonblocking per-device polls; merged button state survives a detach. */
 void usbmouse_poll(void) {
-    const usb_dev_t *d = g_mou;
-    if (!d) return;
-
-    /*
-     * 与键盘同一条死锁防线：**中断关着就绝不能轮询**。
-     * uhci_interrupt_in() 靠 g_pit_ticks 推进做超时等待（IRQ0 驱动），在
-     * IF=0 的上下文里 g_pit_ticks 永不前进 —— 那不是"等 3ms"，而是永久挂死。
-     */
-    uint32_t flags = irq_save_disable();
-    int irq_was_on = (flags != 0u);
+    uint32_t flags=irq_save_disable();
+    if(!flags)return;
+    uint32_t now=g_pit_ticks;
+    if((uint32_t)(now-last_poll)>=USBMOU_THROTTLE_MS){
+        last_poll=now;
+        for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+            if(pointers[i].dev)poll_once(&pointers[i]);
+    }
     irq_restore(flags);
-    if (!irq_was_on) return;
-
-    if ((uint32_t)(g_pit_ticks - g_last_poll) < USBMOU_THROTTLE_MS) return;
-    g_last_poll = g_pit_ticks;
-
-    /* 重入保护：诊断行会读 mouse_get_x/y()，而那也是本函数的轮询点。
-     * 标志必须在**所有**出口清零，所以主体拆成 poll_once 由这里统一收尾。 */
-    static int in_poll = 0;
-    if (in_poll) return;
-    in_poll = 1;
-    poll_once(d);
-    in_poll = 0;
 }
 
 int usbmouse_present(void) {
-    return g_mou ? 1 : 0;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)if(pointers[i].dev)return 1;
+    return 0;
 }
 
 int usbmouse_got_report(void) {
-    return g_got_report;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)if(pointers[i].got_report)return 1;
+    return 0;
 }

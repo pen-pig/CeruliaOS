@@ -8,14 +8,13 @@
  * UHCI 与 EHCI 两边已经各自探测好的已连接端口；之后只读，无动态分配、
  * 无失败回滚问题。
  *
- * 能力差异（fail closed）：EHCI 目前没有周期调度，usbhc_interrupt_in
- * 对它直接返回 -1，类驱动靠 usbhc_supports_interrupt() 在认领阶段就
- * 跳过（而不是等到运行时每条轮询都失败刷屏）。
+ * Controller dispatch for control, HID interrupt IN and supported bulk I/O.
  */
 #include "usbhc.h"
 #include "uhci.h"
 #include "ehci.h"
 #include "xhci.h"
+#include "ohci.h"
 #include "dmesg.h"
 #include "types.h"
 
@@ -24,6 +23,7 @@ static int     g_ports_n = 0;
 
 const char *usbhc_name(uint8_t hc) {
     if (hc == USBHC_XHCI) return "xHCI";
+    if (hc == USBHC_OHCI) return "OHCI";
     return (hc == USBHC_EHCI) ? "EHCI" : "UHCI";
 }
 
@@ -57,13 +57,27 @@ void usbhc_scan(void) {
         g_ports_n++;
     }
 
-    int nx = xhci_port_count();
-    for (int i = 0; i < nx && g_ports_n < USBHC_MAX_PORTS; i++) {
-        int port = xhci_port_get(i);
-        if (port < 0) continue;
-        g_ports[g_ports_n++] = (usbhc_t){.hc = USBHC_XHCI, .port = (uint8_t)port};
+    int nx=0;
+    for(unsigned ctl=0;ctl<XHCI_MAX_CTL;ctl++){
+        int found=xhci_port_count(ctl);
+        nx+=found;
+        for(int i=0;i<found && g_ports_n<USBHC_MAX_PORTS;i++){
+            int port=xhci_port_get(ctl,i);
+            if(port<0)continue;
+            g_ports[g_ports_n++]=(usbhc_t){.hc=USBHC_XHCI,.ctl=(uint8_t)ctl,.port=(uint8_t)port};
+        }
     }
 
+    int no=0;
+    for(unsigned i=0;i<OHCI_MAX_CTL;i++)
+        for(unsigned p=0;p<ohci_root_count(i);p++){
+            unsigned st=ohci_root_status(i,p,0);
+            if(!(st&1u))continue;
+            no++;
+            if(g_ports_n>=USBHC_MAX_PORTS)continue;
+            g_ports[g_ports_n++]=(usbhc_t){.hc=USBHC_OHCI,.ctl=(uint8_t)i,
+                                      .port=(uint8_t)p,.ls=!!(st&4u)};
+        }
     int ne = ehci_port_count();
     for (int i = 0; i < ne && g_ports_n < USBHC_MAX_PORTS; i++) {
         int ctl = 0;
@@ -81,7 +95,7 @@ void usbhc_scan(void) {
     /* 登记数与控制器实际口数应当一致。不一致说明表被截断了（容量不足或
      * port_get 失败被跳过），必须打出来 —— 否则表现只是"某个设备不认"，
      * 事后无从判断是设备没插还是我们丢了。 */
-    if (g_ports_n < nu + ne + nx) {
+    if (g_ports_n < nu + ne + nx + no) {
         char w[128];
         int m = 0;
         int wl = (int)sizeof(w) - 1;
@@ -90,7 +104,7 @@ void usbhc_scan(void) {
         m = usbhc_put_dec(w, m, wl, (uint32_t)g_ports_n);
         t = " of ";
         while (*t && m < wl) w[m++] = *t++;
-        m = usbhc_put_dec(w, m, wl, (uint32_t)(nu + ne + nx));
+        m = usbhc_put_dec(w, m, wl, (uint32_t)(nu + ne + nx + no));
         t = " dropped)";
         while (*t && m < wl) w[m++] = *t++;
         w[m] = 0;
@@ -110,6 +124,11 @@ void usbhc_scan(void) {
         s = " / EHCI ";
         while (*s && n < lim) line[n++] = *s++;
         n = usbhc_put_dec(line, n, lim, (uint32_t)ne);
+        if(no){
+            s=" / OHCI ";
+            while(*s && n<lim)line[n++]=*s++;
+            n=usbhc_put_dec(line,n,lim,(uint32_t)no);
+        }
         if (nx) {
             s = " / xHCI ";
             while (*s && n < lim) line[n++] = *s++;
@@ -134,14 +153,15 @@ int usbhc_port_get(int i, usbhc_t *out) {
 
 int usbhc_port_reset(const usbhc_t *h) {
     if (!h) return 0;
-    if (h->hc == USBHC_XHCI) return xhci_port_start(h->port);
-    if (h->hc == USBHC_EHCI) return ehci_port_reset((int)h->ctl, (int)h->port);
-    return uhci_port_reset(h->io, (int)h->port);
+    if (h->hc == USBHC_XHCI) return xhci_port_start(h->ctl,h->port);
+    if (h->hc == USBHC_OHCI) return ohci_reset(h->ctl&127u,h->port,h->ctl&USBHC_DOWNSTREAM);
+    if (h->hc == USBHC_EHCI) return h->hub_port ? 1 : ehci_port_reset(h->ctl,h->port);
+    return h->ctl ? 1 : uhci_port_reset(h->io, (int)h->port);
 }
 
 int usbhc_hc_start(const usbhc_t *h) {
     if (!h) return -1;
-    if (h->hc == USBHC_EHCI || h->hc == USBHC_XHCI) return 0;
+    if (h->hc == USBHC_EHCI || h->hc == USBHC_XHCI || h->hc==USBHC_OHCI) return 0;
     return uhci_hc_start(h->io);
 }
 
@@ -150,10 +170,13 @@ int usbhc_control_xfer(const usbhc_t *h, uint8_t addr, uint8_t ep,
                        uint8_t *buf, int blen, int *actlen) {
     if (!h) return -1;
     if (h->hc == USBHC_XHCI)
-        return ep == 0 ? xhci_control(h->port, setup, dir_in, buf, blen, actlen) : -1;
+        return ep == 0 ? xhci_control(h->ctl,h->port, setup, dir_in, buf, blen, actlen) : -1;
+    if(h->hc==USBHC_OHCI)
+        return !ep ? ohci_control(h->ctl&127u,addr,h->ls,setup,dir_in,buf,blen,actlen) : -1;
     if (h->hc == USBHC_EHCI)
-        return ehci_control_xfer((int)h->ctl, addr, ep, setup, dir_in,
-                                 buf, blen, actlen);
+        return h->tt_hub ? ehci_control_split(h->ctl,addr,ep,h->tt_hub,h->hub_port,
+                                             h->ls,setup,dir_in,buf,blen,actlen)
+                         : ehci_control_xfer(h->ctl,addr,ep,setup,dir_in,buf,blen,actlen);
     return uhci_control_xfer(h->io, addr, ep, setup, dir_in,
                              buf, blen, h->ls ? 1 : 0, actlen);
 }
@@ -161,15 +184,20 @@ int usbhc_control_xfer(const usbhc_t *h, uint8_t addr, uint8_t ep,
 int usbhc_interrupt_in(const usbhc_t *h, uint8_t addr, uint8_t ep,
                        uint8_t *buf, int blen, int *actlen) {
     if (!h) return -1;
-    if (h->hc == USBHC_XHCI) return xhci_interrupt_in(h->port, ep, buf, blen, actlen);
-    if (h->hc == USBHC_EHCI) return -1;     /* 周期调度尚未实现 */
-    return uhci_interrupt_in(h->io, addr, ep, buf, blen,
+    if (h->hc == USBHC_XHCI) return xhci_interrupt_in(h->ctl,h->port, ep, buf, blen, actlen);
+    if(h->hc==USBHC_OHCI)return ohci_interrupt_in(h->ctl&127u,h->port,addr,ep,buf,blen,actlen);
+    if (h->hc == USBHC_EHCI)
+        return ehci_interrupt_in(h->ctl,h->port,addr,ep,buf,blen,actlen);
+    return uhci_interrupt_in(h->io, h->port, addr, ep, buf, blen,
                              h->ls ? 1 : 0, actlen);
 }
 
-int usbhc_configure_hid(const usbhc_t *h, uint8_t ep, uint16_t mps, uint8_t interval) {
+int usbhc_configure_hid(const usbhc_t *h, uint8_t addr, uint8_t ep, uint16_t mps, uint8_t interval) {
     if (!h) return -1;
-    return h->hc == USBHC_XHCI ? xhci_configure_hid(h->port, ep, mps, interval) : 0;
+    if(h->hc==USBHC_OHCI)return ohci_configure_hid(h->ctl&127u,addr,ep,mps,interval,h->ls);
+    if(h->hc==USBHC_EHCI)
+        return ehci_configure_hid(h->ctl,h->port,addr,ep,mps,interval,h->tt_hub,h->hub_port,h->ls);
+    return h->hc == USBHC_XHCI ? xhci_configure_hid(h->ctl,h->port, ep, mps, interval) : 0;
 }
 
 int usbhc_bulk_xfer(const usbhc_t *h, uint8_t addr, uint8_t ep,
@@ -187,13 +215,14 @@ void usbhc_bulk_tog_reset(const usbhc_t *h, uint8_t addr) {
         ehci_bulk_tog_reset((int)h->ctl, addr);
         return;
     }
-    uhci_bulk_tog_reset(addr);
+    uhci_bulk_tog_reset(h->io,addr);
 }
 
 int usbhc_supports_interrupt(const usbhc_t *h) {
-    return h && (h->hc == USBHC_UHCI || h->hc == USBHC_XHCI);
+    return h && (h->hc == USBHC_UHCI || h->hc == USBHC_XHCI ||
+                 h->hc == USBHC_OHCI || h->hc == USBHC_EHCI);
 }
 
 int usbhc_supports_bulk(const usbhc_t *h) {
-    return h && (h->hc == USBHC_UHCI || h->hc == USBHC_EHCI);
+    return h && (h->hc == USBHC_UHCI || (h->hc == USBHC_EHCI && !h->hub_port));
 }

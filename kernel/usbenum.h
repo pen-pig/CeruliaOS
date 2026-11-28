@@ -31,8 +31,28 @@
 
 #define USBENUM_MAX_DEV 8
 
-/* 枚举结果（一个 USB 设备一份） */
+#define USB_INPUT_INTERFACES 8
 typedef struct {
+    uint16_t key_bit, mod_bit; /* Bit offsets without the optional Report ID. */
+    uint8_t first, last, id, bytes; /* mod_bit=0xffff when not separate. */
+} hid_key_bitmap_t;
+typedef struct {
+    uint8_t number, sub, proto, ep, interval, pointer_layout, ready;
+    uint8_t pointer_id;
+    uint16_t mps, report_length, key_layout;
+    hid_key_bitmap_t bitmap;
+} usb_hid_if_t;
+
+static inline int usb_hid_keyboard(const usb_hid_if_t *h) {
+    return h->ep && (h->bitmap.bytes ||
+           (h->mps>=8 && (h->key_layout || (h->sub==1 && h->proto==1))));
+}
+static inline int usb_hid_pointer(const usb_hid_if_t *h) {
+    return h->ep && h->mps>=3 && (h->pointer_layout || (h->sub==1 && h->proto==2));
+}
+
+/* 枚举结果（一个 USB 设备一份） */
+typedef struct usb_device {
     usbhc_t  bus;           /* 所属主机控制器 + 根口（UHCI/EHCI 统一句柄） */
     uint8_t  port;          /* 根口编号（与 bus.port 同值，日志用） */
     uint8_t  addr;          /* 分配到的 USB 地址（1..127） */
@@ -49,14 +69,8 @@ typedef struct {
     uint16_t cfg_total;         /* wTotalLength */
     uint8_t  nif;               /* 接口数 */
 
-    /* HID（bInterfaceClass == 0x03） */
-    int      hid_if;            /* HID 接口号；-1 = 没有 HID 接口 */
-    uint8_t  hid_sub, hid_proto;/* subclass(1=boot) / protocol(1=键盘,2=鼠标) */
-    uint8_t  hid_ep;            /* 中断 IN 端点地址（bit7=1）；0 = 没找到 */
-    uint16_t hid_ep_mps;        /* 该端点最大包长 */
-    uint8_t  hid_ep_interval;   /* 轮询间隔（ms） */
-    uint16_t hid_rep_len;       /* HID 报告描述符长度（字节） */
-    uint8_t  configured;        /* SET_CONFIGURATION 已成功 */
+    usb_hid_if_t hid[USB_INPUT_INTERFACES];
+    uint8_t hid_count, configured;
 
     /* Mass Storage（bInterfaceClass == 0x08，BOT 需 proto==0x50）
      * H1c：U 盘认领用的接口/端点记录。只记第一个 MSC 接口的第一对 bulk
@@ -72,6 +86,7 @@ typedef struct {
 /* 入口：在 kernel_main 的 uhci_init() 之后调用一次。
  * 没有任何已连接端口时打印 "USB-ENUM: 0 device(s) enumerated" 并返回。 */
 void usbenum_init(void);
+void usbenum_start_input_service(void);
 
 /* 枚举到的设备数 */
 int usbenum_device_count(void);

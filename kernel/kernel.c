@@ -37,6 +37,7 @@
 #include "uhci.h"
 #include "ehci.h"
 #include "xhci.h"
+#include "ohci.h"
 #include "usbhc.h"
 #include "usbenum.h"
 #include "usbkbd.h"
@@ -523,6 +524,7 @@ void kernel_main(void) {
      * 枚举才有端口可走（曾放在枚举之后，结果高速设备一个都没被枚举）。 */
     ehci_init();
     xhci_init();
+    ohci_init();
 
     /* A1 第二阶段：合并 UHCI/EHCI 两边的已连接端口，向上层（枚举、HID、
      * U 盘）提供统一的 usbhc_t 句柄。 */
@@ -712,6 +714,7 @@ void kernel_main(void) {
      * 'desktop' 命令（cmd_desktop -> gw_start）。下面的循环只是兜底：
      * 万一 shell_run 返回，重新拉起 shell，绝不自动跳进桌面。 */
     keyboard_discard_boot_input();
+    usbenum_start_input_service();
     for (;;) {
         shell_run();
         terminal_writestring("\nShell session ended, restarting shell.\n");

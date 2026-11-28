@@ -18,7 +18,8 @@
 /* 一个控制器最多登记这么多个已连接端口（PIIX3 UHCI 只有 2 个根口）。
  * 端口表是静态的：枚举前由 uhci_init 填好，之后只读，无动态分配、
  * 无失败回滚问题。 */
-#define UHCI_MAX_PORTS 8
+#define UHCI_MAX_CTL 4u
+#define UHCI_MAX_PORTS (UHCI_MAX_CTL * 2u)
 
 /* 入口：在 kernel_main 的 usb_scan_log() 之后调用一次。
  * 找不到 UHCI 控制器时打印 "UHCI: no UHCI controller found" 并静默返回。
@@ -55,11 +56,10 @@ int uhci_port_reset(uint16_t io, int port);
  *      <0 = 失败（超时 / STALL / CRC 等致命位）。
  * 语义要点：
  *   - NAK 不算错误：没有新报告时设备恒 NAK，调用方必须容忍 actlen==0。
- *   - DATA toggle 由本模块按地址维护，**只在真的收到数据时翻转**（NAK/零长度
- *     不翻），否则设备会因 toggle 不匹配拒绝后续报告。
+ *   - 每个中断端点有独立的队列和 DATA toggle。收到 ACK 后翻转，NAK 不翻。
  *   - blen 上界 16（HID boot 报告 8 字节，留余量）。
  */
-int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
+int uhci_interrupt_in(uint16_t io,int port, uint8_t addr, uint8_t ep,
                       uint8_t *buf, int blen, int lowspeed, int *actlen);
 
 /*
@@ -76,7 +76,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
 /* bulk 端点 toggle 清零（回到 DATA0）。BOT reset / ClearFeature(HALT) 之后
  * 必须调用，否则后续传输会因 toggle 失配被设备丢弃。 */
-void uhci_bulk_tog_reset(uint8_t addr);
+void uhci_bulk_tog_reset(uint16_t io,uint8_t addr);
 
 /*
  * 确保控制器处于运行态：重新锁存帧列表物理地址并置 RS=1/CF=1。
@@ -88,6 +88,10 @@ int uhci_hc_start(uint16_t io);
 
 /* 已连接端口表条数（uhci_init 之后有效；0 = 没有任何设备接入）。 */
 int uhci_port_count(void);
+uint16_t uhci_root_io(unsigned controller);
+unsigned uhci_root_status(uint16_t io,unsigned port);
+void uhci_root_disable(uint16_t io,unsigned port);
+void uhci_release_hid(uint16_t io,uint8_t addr);
 
 /*
  * 取第 i 个已连接端口的句柄。io_out/port_out/ls_out 均可为 NULL。

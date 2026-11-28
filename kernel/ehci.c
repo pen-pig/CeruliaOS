@@ -41,10 +41,13 @@
  *   - 中途失败回滚：映射失败/复位失败立即放弃本控制器，不留下半初始化状态。
  */
 #include "ehci.h"
+#include "ehci_periodic.h"
 #include "pci.h"
 #include "paging.h"
 #include "dmesg.h"
 #include "isr.h"
+#include "irqflags.h"
+#include "task.h"
 #include "types.h"
 
 /* ---------- 能力寄存器偏移（相对 BAR 基址） ---------- */
@@ -83,6 +86,8 @@
 #define PS_PE         0x00000004u   /* bit2  Port Enabled */
 #define PS_PEDC       0x00000008u   /* bit3  Port Enable/Disable Change (W1C) */
 #define PS_OCC        0x00000020u   /* bit5  Over-current Change (W1C) */
+#define PS_FPR        0x00000040u   /* bit6  Force Port Resume */
+#define PS_SUSP       0x00000080u   /* bit7  Suspend */
 #define PS_PR         0x00000100u   /* bit8  Port Reset */
 #define PS_LS         0x00000C00u   /* bit11:10 Line Status */
 #define PS_PP         0x00001000u   /* bit12 Port Power */
@@ -118,8 +123,8 @@
 #define LINK_QH(p)    (((uint32_t)(unsigned long)(p)) | 0x2u)
 #define LINK_T        0x1u
 
-/* 控制传输缓冲上界（与 UHCI 侧一致，配置描述符需要 >64） */
-#define EHCI_XFER_MAX 256
+/* Long configuration descriptors of composite receivers need more than 255 bytes. */
+#define EHCI_XFER_MAX 1024
 /* 各阶段超时（毫秒，g_pit_ticks 基准） */
 #define EHCI_TO_RESET   200u
 #define EHCI_TO_SCHED   100u
@@ -150,6 +155,8 @@ typedef struct {
     uint32_t cap;      /* 能力寄存器虚拟基址（MMIO，已映射） */
     uint32_t op;       /* 操作寄存器虚拟基址 = cap + CAPLENGTH */
     int      nports;   /* 根口数（HCSPARAMS[3:0]，已夹紧） */
+    int      async_busy,async_broken;
+    wait_queue_t async_wq;
     int      valid;    /* 该条目已成功初始化 */
 } ehci_ctl_t;
 
@@ -161,7 +168,7 @@ typedef struct {
     int ctl;     /* 控制器索引 */
     int port;    /* 根口编号 */
 } ehci_port_t;
-static ehci_port_t g_plist[EHCI_MAX_PORTS];
+static ehci_port_t g_plist[EHCI_MAX_CTL*EHCI_MAX_PORTS];
 static int         g_plist_n = 0;
 
 /* ---------- MMIO 访问 ---------- */
@@ -182,6 +189,12 @@ static inline void e_port_wr(int ctl, int port, uint32_t v) {
     e_mmio_wr(ctl, EH_PORTSC + (uint32_t)port * 4u, v & ~PS_RWC);
 }
 
+static void schedule_bits(int c,uint32_t clear,uint32_t set) {
+    uint32_t f=irq_save_disable();
+    e_mmio_wr(c,EH_USBCMD,(e_mmio_rd(c,EH_USBCMD)&~clear)|set);
+    irq_restore(f);
+}
+
 static void e_delay_ms(uint32_t ms) {
     uint32_t t0 = g_pit_ticks;
     while ((uint32_t)(g_pit_ticks - t0) < ms) { }
@@ -192,27 +205,31 @@ static void e_delay_ms(uint32_t ms) {
  * 类型/T 标志，故必须 32 字节对齐；identity 映射下虚拟地址即物理地址，
  * HC 作为总线主控可直接 DMA 读这块内存。）
  * ========================================================================= */
-static volatile uint32_t g_head[12]  __attribute__((aligned(32)));  /* 常驻 head QH */
-static volatile uint32_t g_xqh[12]   __attribute__((aligned(32)));  /* 传输 QH */
-static volatile uint32_t g_qtd[3][8] __attribute__((aligned(32)));  /* SETUP/DATA/STATUS */
-static volatile uint8_t  g_setup[8]  __attribute__((aligned(32)));
-static volatile uint8_t  g_rbuf[256] __attribute__((aligned(32)));
-
-/* 周期帧列表（本步为空，全部 T；PSE 开着也不产生流量，为后续中断
- * 传输预留）。1024 项 × 4B = 4KB，必须 4KB 对齐。 */
-static volatile uint32_t g_flist[1024] __attribute__((aligned(4096)));
-
-/* bulk（U 盘 BOT 通道）：QH + 1 个 qTD + 512 字节数据缓冲。
- * 512 = 一个扇区；HS bulk 端点 mps 就是 512，一笔扇区读写正好一包。 */
-static volatile uint32_t g_bqh[12]  __attribute__((aligned(32)));
-static volatile uint32_t g_btd[8]   __attribute__((aligned(32)));
-static volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(32)));
-
-/* bulk 端点 DATA toggle（按 USB 地址索引，IN/OUT 各一份）。
- * EHCI 侧用 DTC=1（toggle 由 qTD 的 DT 位给），所以必须软件维护：
- * **只在事务真正完成时翻转**，BOT Reset / ClearFeature(HALT) 后清零。 */
-static uint8_t g_btog_in[128];
-static uint8_t g_btog_out[128];
+#define EHCI_HID_QUEUES 8u
+typedef struct {
+    volatile uint32_t qh[16] __attribute__((aligned(32)));
+    volatile uint32_t td[2][16];
+    volatile uint8_t buf[64] __attribute__((aligned(64)));
+    ehci_period_t period;
+    uint8_t addr, ep, mps, port, tail, pending, failed;
+} ehci_hid_t;
+typedef struct {
+    volatile uint32_t g_head[16]  __attribute__((aligned(32)));
+    volatile uint32_t g_xqh[16]   __attribute__((aligned(32)));
+    volatile uint32_t g_qtd[3][16] __attribute__((aligned(32)));
+    volatile uint8_t  g_setup[8]  __attribute__((aligned(32)));
+    volatile uint8_t  g_rbuf[EHCI_XFER_MAX] __attribute__((aligned(64)));
+    volatile uint32_t g_flist[1024] __attribute__((aligned(4096)));
+    ehci_hid_t hidq[EHCI_HID_QUEUES];
+    int periodic_broken;
+    volatile uint32_t g_bqh[16]  __attribute__((aligned(32)));
+    volatile uint32_t g_btd[16]   __attribute__((aligned(32)));
+    volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(32)));
+    uint8_t g_btog_in[128];
+    uint8_t g_btog_out[128];
+    uint8_t tt_ep0[128];
+} ehci_dma_t;
+static ehci_dma_t dma[EHCI_MAX_CTL];
 
 #define EH_PHYS(p)  ((uint32_t)(unsigned long)(p))
 
@@ -234,29 +251,189 @@ static void qtd_set_buf(volatile uint32_t *td, uint32_t phys, int len) {
         td[3 + i] = page + (uint32_t)i * 0x1000u;
 }
 
+/* EHCI §3.6/§4.10: turn the inactive tail qTD into the next transfer.
+ * The HC's overlay retains DATA toggle. Both links reach the new tail,
+ * including after a short IN. */
+static void hid_arm(ehci_hid_t *h) {
+    volatile uint32_t *td=h->td[h->tail], *next=h->td[h->tail^1u];
+    next[2]=0;
+    td[0]=td[1]=EH_PHYS(next);
+    qtd_set_buf(td,EH_PHYS(h->buf),h->mps);
+    asm volatile("":::"memory");
+    td[2]=QTD_PID_IN|QTD_CERR3|QTD_ACTIVE|((uint32_t)h->mps<<16);
+    h->tail^=1u;
+    h->pending=1;
+}
+
+static int periodic_wait(int c,int enabled) {
+    uint32_t start=g_pit_ticks;
+    while(!!(e_mmio_rd(c,EH_USBSTS)&STS_PSS)!=enabled) {
+        if((uint32_t)(g_pit_ticks-start)>=EHCI_TO_SCHED){
+            dma[c].periodic_broken=1; /* Never recycle DMA that may still be running. */
+            dmesg_write("EHCI: periodic schedule transition timed out");
+            return 0;
+        }
+        asm volatile("pause");
+    }
+    return 1;
+}
+
+static int periodic_stop(int c) {
+    /* §2.3.1: don't change PSE while PSE and PSS disagree. */
+    if(dma[c].periodic_broken || !periodic_wait(c,!!(e_mmio_rd(c,EH_USBCMD)&CMD_PSE)))return 0;
+    schedule_bits(c,CMD_PSE,0);
+    return periodic_wait(c,0);
+}
+
+static void periodic_publish(int c) {
+    ehci_hid_t *sorted[EHCI_HID_QUEUES];
+    unsigned count=0;
+    for(unsigned i=0;i<EHCI_HID_QUEUES;i++)if(dma[c].hidq[i].addr){
+        unsigned j=count++;
+        while(j && sorted[j-1]->period.frames<dma[c].hidq[i].period.frames){sorted[j]=sorted[j-1];j--;}
+        sorted[j]=&dma[c].hidq[i];
+    }
+    /* Once this queue matches, a shorter (or equal) period with a
+     * compatible phase is guaranteed to match the same frame. */
+    for(unsigned j=0;j<count;j++){
+        unsigned next=j+1;
+        while(next<count && !ehci_period_overlap(sorted[j]->period,sorted[next]->period))next++;
+        sorted[j]->qh[0]=next<count?LINK_QH(sorted[next]->qh):LINK_T;
+    }
+    for(unsigned i=0;i<1024;i++){
+        unsigned j=0;
+        while(j<count && !ehci_period_matches(sorted[j]->period,i))j++;
+        dma[c].g_flist[i]=j<count?LINK_QH(sorted[j]->qh):LINK_T;
+    }
+    asm volatile("":::"memory");
+    if(count)schedule_bits(c,0,CMD_PSE);
+}
+
+int ehci_configure_hid(int c,int port,uint8_t addr,uint8_t ep,uint16_t mps,uint8_t interval,
+                       unsigned hub,unsigned down,unsigned low) {
+    if(c<0 || c>=EHCI_MAX_CTL || port<0 || port>=g_ctl[c].nports || !g_ctl[c].valid ||
+       !addr || addr>127 || ep<0x81 || ep>0x8f || !mps || mps>(low?8u:64u) ||
+       (hub && (hub>127 || !down || down>15)) || (low && !hub))return -1;
+    ehci_hid_t *h=0;
+    ehci_period_t used[EHCI_HID_QUEUES], period;
+    unsigned count=0;
+    for(unsigned i=0;i<EHCI_HID_QUEUES;i++){
+        if(dma[c].hidq[i].addr==addr && dma[c].hidq[i].ep==ep)return -1;
+        if(!dma[c].hidq[i].addr && !h)h=&dma[c].hidq[i];
+        if(dma[c].hidq[i].addr)used[count++]=dma[c].hidq[i].period;
+    }
+    unsigned mask=ehci_period_plan(interval,hub,used,count,&period);
+    if(!h || !mask || !periodic_stop(c))return -1;
+    uint32_t flags=irq_save_disable();
+    for(unsigned i=0;i<16;i++)h->qh[i]=h->td[0][i]=h->td[1][i]=0;
+    h->period=period;
+    h->port=(uint8_t)port;h->ep=ep;h->mps=(uint8_t)mps;
+    h->tail=h->pending=h->failed=0;
+    h->qh[1]=addr|((uint32_t)(ep&15u)<<8)|ehci_eps(hub,low)|QH_MPL(mps);
+    h->qh[2]=QH_MULT1|ehci_tt_bits(hub,down)|mask;
+    h->qh[4]=EH_PHYS(h->td[0]);
+    h->qh[5]=LINK_T;
+    h->addr=addr;
+    periodic_publish(c);
+    irq_restore(flags);
+    return 0;
+}
+
+int ehci_interrupt_in(int c,int port,uint8_t addr,uint8_t ep,uint8_t *buf,int len,int *actual) {
+    if(actual)*actual=0;
+    if(c<0 || c>=EHCI_MAX_CTL || port<0 || port>=g_ctl[c].nports || !g_ctl[c].valid || dma[c].periodic_broken ||
+       !buf || len<1 || !addr || (e_mmio_rd(c,EH_USBSTS)&(STS_HCH|STS_HSE)))return -1;
+    uint32_t ps=e_port_rd(c,port);
+    if((ps&(PS_PO|PS_PE|PS_CCS|PS_CSC))!=(PS_PE|PS_CCS))return -1;
+    uint32_t flags=irq_save_disable();
+    int result=-1;
+    for(unsigned i=0;i<EHCI_HID_QUEUES;i++){
+        ehci_hid_t *h=&dma[c].hidq[i];
+        if(h->addr!=addr || h->ep!=ep || h->port!=port || h->failed)continue;
+        if(h->pending){
+            uint32_t token=h->td[h->tail^1u][2];
+            if(token&QTD_FATAL){h->failed=1;break;}
+            if(token&QTD_ACTIVE){result=0;break;}
+            /* The overlay must have retired the old qTD. */
+            if((h->qh[6]&QTD_ACTIVE) || h->qh[4]!=EH_PHYS(h->td[h->tail])){
+                result=0;
+                break;
+            }
+            unsigned rem=(token>>16)&0x7fffu;
+            if(rem>h->mps){h->failed=1;break;}
+            int n=h->mps-rem;
+            if(n>len)n=len;
+            for(int k=0;k<n;k++)buf[k]=h->buf[k];
+            if(actual)*actual=n;
+        }
+        hid_arm(h);
+        result=0;
+        break;
+    }
+    irq_restore(flags);
+    return result;
+}
+
+void ehci_release_hid(int c,uint8_t addr) {
+    if(c<0 || c>=EHCI_MAX_CTL || !addr || !g_ctl[c].valid)return;
+    unsigned matches=0;
+    for(unsigned i=0;i<EHCI_HID_QUEUES;i++)if(dma[c].hidq[i].addr==addr)matches|=1u<<i;
+    if(!matches || !periodic_stop(c))return;
+    uint32_t flags=irq_save_disable();
+    for(unsigned i=0;i<EHCI_HID_QUEUES;i++)if(matches&(1u<<i))dma[c].hidq[i].addr=0;
+    periodic_publish(c);
+    irq_restore(flags);
+}
+
 /* ---------- 异步调度停/起（确定性优先，见文件头） ---------- */
 static int async_stop(int ctl) {
-    e_mmio_wr(ctl, EH_USBCMD, e_mmio_rd(ctl, EH_USBCMD) & ~CMD_ASE);
+    schedule_bits(ctl,CMD_ASE,0);
     uint32_t t0 = g_pit_ticks;
     while ((uint32_t)(g_pit_ticks - t0) < EHCI_TO_SCHED) {
         if ((e_mmio_rd(ctl, EH_USBSTS) & STS_ASS) == 0u) return 0;
     }
     dmesg_write("EHCI: async schedule did not stop (timeout)");
+    g_ctl[ctl].async_broken=1;
     return -1;
 }
 
 static int async_start(int ctl) {
-    e_mmio_wr(ctl, EH_USBCMD, e_mmio_rd(ctl, EH_USBCMD) | CMD_ASE | CMD_RS);
+    schedule_bits(ctl,0,CMD_ASE|CMD_RS);
     uint32_t t0 = g_pit_ticks;
     while ((uint32_t)(g_pit_ticks - t0) < EHCI_TO_SCHED) {
         if ((e_mmio_rd(ctl, EH_USBSTS) & STS_ASS) != 0u) return 0;
     }
     dmesg_write("EHCI: async schedule did not start (timeout)");
+    g_ctl[ctl].async_broken=1;
     return -1;
 }
 
+/* Bulk and EP0 share an async ring. HID hotplug and LED traffic can run
+ * in a separate task from block I/O, so serialize before touching DMA. */
+static int async_acquire(int ctl) {
+    if(ctl<0 || ctl>=EHCI_MAX_CTL || !g_ctl[ctl].valid)return 0;
+    uint32_t f=irq_save_disable();
+    if(!f)return 0;
+    uint32_t start=g_pit_ticks;
+    while(g_ctl[ctl].async_busy && !g_ctl[ctl].async_broken &&
+          (uint32_t)(g_pit_ticks-start)<EHCI_TO_XFER+2u*EHCI_TO_SCHED)
+        task_sleep(&g_ctl[ctl].async_wq,20);
+    int ok=!g_ctl[ctl].async_busy && !g_ctl[ctl].async_broken;
+    if(ok)g_ctl[ctl].async_busy=1;
+    irq_restore(f);
+    return ok;
+}
+
+static void async_release(int ctl) {
+    uint32_t f=irq_save_disable();
+    g_ctl[ctl].async_busy=0;
+    task_wake_all(&g_ctl[ctl].async_wq);
+    irq_restore(f);
+}
+
 /* ---------- 通用控制传输 ---------- */
-int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
+static int control_owned(int ctl, uint8_t addr, uint8_t ep,
+                      unsigned hub,unsigned down,unsigned low,unsigned mps,
                       const uint8_t *setup, int dir_in,
                       uint8_t *buf, int blen, int *actlen) {
     if (actlen) *actlen = 0;
@@ -267,73 +444,69 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
     if (ctl < 0 || ctl >= EHCI_MAX_CTL || !g_ctl[ctl].valid) return -1;
     if (addr > 127 || ep > 15) return -1;                  /* 不可信上界 */
     if (blen < 0 || blen > EHCI_XFER_MAX) return -1;       /* 缓冲上界 */
-    if (blen > 0 && !buf) return -1;
+    if (!setup || (blen > 0 && !buf) || blen!=(setup[6]|(setup[7]<<8))) return -1;
+    if (async_stop(ctl) != 0) return -1;
 
     /* SETUP 包与数据缓冲：IN 先清零避免读到陈旧值，OUT 拷入待发数据 */
-    for (int i = 0; i < 8; i++) g_setup[i] = setup[i];
-    for (int i = 0; i < blen; i++) g_rbuf[i] = dir_in ? 0 : buf[i];
+    for (int i = 0; i < 8; i++) dma[ctl].g_setup[i] = setup[i];
+    for (int i = 0; i < blen; i++) dma[ctl].g_rbuf[i] = dir_in ? 0 : buf[i];
 
-    uint32_t qtd0 = EH_PHYS(&g_qtd[0]);
-    uint32_t qtd1 = EH_PHYS(&g_qtd[1]);
-    uint32_t qtd2 = EH_PHYS(&g_qtd[2]);
+    uint32_t qtd0 = EH_PHYS(&dma[ctl].g_qtd[0]);
+    uint32_t qtd1 = EH_PHYS(&dma[ctl].g_qtd[1]);
+    uint32_t qtd2 = EH_PHYS(&dma[ctl].g_qtd[2]);
 
     /* 清零三个 qTD（含 HC 回写区），避免上一次传输的残留标志 */
     for (int t = 0; t < 3; t++)
-        for (int k = 0; k < 8; k++) g_qtd[t][k] = 0;
+        for (int k = 0; k < 16; k++) dma[ctl].g_qtd[t][k] = 0;
 
     /* qTD0 SETUP：PID=SETUP，DATA0（bit31=0），8 字节 */
-    g_qtd[0][0] = (blen > 0) ? qtd1 : qtd2;                /* next */
-    g_qtd[0][1] = LINK_T;                                  /* alt next */
-    g_qtd[0][2] = QTD_PID_SETUP | (8u << 16) | QTD_CERR3 | QTD_ACTIVE;
-    qtd_set_buf(g_qtd[0], EH_PHYS(&g_setup[0]), 8);
+    dma[ctl].g_qtd[0][0] = (blen > 0) ? qtd1 : qtd2;                /* next */
+    dma[ctl].g_qtd[0][1] = LINK_T;                                  /* alt next */
+    dma[ctl].g_qtd[0][2] = QTD_PID_SETUP | (8u << 16) | QTD_CERR3 | QTD_ACTIVE;
+    qtd_set_buf(dma[ctl].g_qtd[0], EH_PHYS(&dma[ctl].g_setup[0]), 8);
 
     /* qTD1 DATA（仅 blen>0 时构建）：DATA1 */
     if (blen > 0) {
-        g_qtd[1][0] = qtd2;
-        g_qtd[1][1] = LINK_T;
-        g_qtd[1][2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
+        dma[ctl].g_qtd[1][0] = qtd2;
+        dma[ctl].g_qtd[1][1] = dir_in ? qtd2 : LINK_T;
+        dma[ctl].g_qtd[1][2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
                     | ((uint32_t)blen << 16)
                     | QTD_DT | QTD_CERR3 | QTD_ACTIVE;
-        qtd_set_buf(g_qtd[1], EH_PHYS(&g_rbuf[0]), blen);
+        qtd_set_buf(dma[ctl].g_qtd[1], EH_PHYS(&dma[ctl].g_rbuf[0]), blen);
     }
 
     /* qTD2 STATUS：方向取数据阶段反，零长度，DATA1，完成时中断 */
-    g_qtd[2][0] = LINK_T;
-    g_qtd[2][1] = LINK_T;
-    g_qtd[2][2] = (dir_in ? QTD_PID_OUT : QTD_PID_IN)
+    dma[ctl].g_qtd[2][0] = LINK_T;
+    dma[ctl].g_qtd[2][1] = LINK_T;
+    dma[ctl].g_qtd[2][2] = ((blen && dir_in) ? QTD_PID_OUT : QTD_PID_IN)
                 | (0u << 16)
                 | QTD_DT | QTD_CERR3 | QTD_ACTIVE | QTD_IOC;
-    for (int i = 0; i < 5; i++) g_qtd[2][3 + i] = 0;       /* 零长度：无缓冲 */
+    for (int i = 0; i < 5; i++) dma[ctl].g_qtd[2][3 + i] = 0;       /* 零长度：无缓冲 */
 
-    /* 传输 QH：控制端点、高速、mps=64（USB2 规范对高速端点 0 的规定）。
-     * 不置 QH_DTC：控制端点的 DATA toggle 由 HC 自己按 USB 规则推进
-     *（SETUP=DATA0，其后 DATA1）——软件插手反而容易与设备失步。 */
-    for (int k = 0; k < 12; k++) g_xqh[k] = 0;
-    g_xqh[0] = LINK_QH(&g_head[0]);                        /* 水平链回 head */
-    g_xqh[1] = (uint32_t)addr
+    /* Each qTD specifies its stage's toggle. Low/full speed control
+     * requires C=1, EPS plus the physical downstream port and TT hub. */
+    for (int k = 0; k < 16; k++) dma[ctl].g_xqh[k] = 0;
+    dma[ctl].g_xqh[0] = LINK_QH(&dma[ctl].g_head[0]);                        /* 水平链回 head */
+    dma[ctl].g_xqh[1] = (uint32_t)addr
              | ((uint32_t)ep << 8)
-             | QH_EPS_HIGH
-             | QH_MPL(64)
-             | QH_C;
-    g_xqh[2] = QH_MULT1;                                   /* 异步：S/C-mask=0 */
-    g_xqh[3] = 0;                                          /* current qTD */
-    g_xqh[4] = qtd0;                                       /* next qTD */
-    g_xqh[5] = LINK_T;                                     /* alt next */
-    g_xqh[6] = 0;                                          /* token（覆盖区） */
+             | ehci_eps(hub,low)
+             | QH_MPL(mps)
+             | QH_DTC | (hub?QH_C:0);
+    dma[ctl].g_xqh[2] = QH_MULT1|ehci_tt_bits(hub,down);             /* async: masks zero */
+    dma[ctl].g_xqh[3] = 0;                                          /* current qTD */
+    dma[ctl].g_xqh[4] = qtd0;                                       /* next qTD */
+    dma[ctl].g_xqh[5] = LINK_T;                                     /* alt next */
+    dma[ctl].g_xqh[6] = 0;                                          /* token（覆盖区） */
 
     /* 停 -> 挂 QH -> 跑 */
-    if (async_stop(ctl) != 0) return -1;
-    g_head[0] = LINK_QH(&g_xqh[0]);
-    if (async_start(ctl) != 0) {
-        g_head[0] = LINK_QH(&g_head[0]);
-        return -1;
-    }
+    dma[ctl].g_head[0] = LINK_QH(&dma[ctl].g_xqh[0]);
+    if (async_start(ctl) != 0) return -1;
 
     /* 轮询完成：任一 qTD 报致命位即提前收手（fail closed） */
     uint32_t t0 = g_pit_ticks;
     int done = 0;
     while ((uint32_t)(g_pit_ticks - t0) < EHCI_TO_XFER) {
-        uint32_t s0 = g_qtd[0][2], s1 = g_qtd[1][2], s2 = g_qtd[2][2];
+        uint32_t s0 = dma[ctl].g_qtd[0][2], s1 = dma[ctl].g_qtd[1][2], s2 = dma[ctl].g_qtd[2][2];
         if (((s0 & QTD_ACTIVE) == 0u) &&
             ((s1 & QTD_ACTIVE) == 0u) &&
             ((s2 & QTD_ACTIVE) == 0u)) { done = 1; break; }
@@ -342,9 +515,8 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
     }
 
     /* 摘下 QH（同样在 ASE=0 时做），恢复 head 自环 */
-    async_stop(ctl);
-    g_head[0] = LINK_QH(&g_head[0]);
-    async_start(ctl);
+    if(async_stop(ctl)!=0)return -1;
+    dma[ctl].g_head[0] = LINK_QH(&dma[ctl].g_head[0]);
 
     if (!done) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
@@ -357,7 +529,7 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
         return -1;
     }
 
-    uint32_t s0 = g_qtd[0][2], s1 = g_qtd[1][2], s2 = g_qtd[2][2];
+    uint32_t s0 = dma[ctl].g_qtd[0][2], s1 = dma[ctl].g_qtd[1][2], s2 = dma[ctl].g_qtd[2][2];
     if ((s0 & QTD_FATAL) || (s1 & QTD_FATAL) || (s2 & QTD_FATAL)) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         e_str(line, &li, lim, "EHCI-CTRL: xfer error TD0=0x");
@@ -379,76 +551,115 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
         if (al < 0) al = 0;
         if (al > blen) al = blen;
         if (dir_in && buf) {
-            for (int i = 0; i < al; i++) buf[i] = (uint8_t)g_rbuf[i];
+            for (int i = 0; i < al; i++) buf[i] = (uint8_t)dma[ctl].g_rbuf[i];
         }
     }
     if (actlen) *actlen = al;
     return 0;
 }
 
+int ehci_control_xfer(int ctl,uint8_t addr,uint8_t ep,const uint8_t *setup,int in,
+                      uint8_t *buf,int len,int *actual) {
+    if(actual)*actual=0;
+    if(!async_acquire(ctl))return -1;
+    int result=control_owned(ctl,addr,ep,0,0,0,64,setup,in,buf,len,actual);
+    async_release(ctl);
+    return result;
+}
+
+/* Only the single-TT setting (the default alternate setting) is used.
+ * Addresses are allocated globally by usbenum; addr0 is relearned
+ * on the first eight-byte descriptor of each new device. */
+
+int ehci_control_split(int ctl,uint8_t addr,uint8_t ep,unsigned hub,unsigned down,int low,
+                       const uint8_t *setup,int in,uint8_t *buf,int len,int *actual) {
+    if(actual)*actual=0;
+    if(!hub || hub>127 || !down || down>15 || addr>127 || ep || !setup ||
+       len<0 || len>EHCI_XFER_MAX || (len && !buf) || len!=(setup[6]|(setup[7]<<8)) ||
+       !async_acquire(ctl))return -1;
+    int device_desc=in && setup[0]==0x80 && setup[1]==6 && setup[2]==0 && setup[3]==1;
+    if(!addr && device_desc && len==8)dma[ctl].tt_ep0[0]=8;
+    unsigned mps=low || !dma[ctl].tt_ep0[addr] ? 8u : dma[ctl].tt_ep0[addr];
+    int n=0,result=control_owned(ctl,addr,ep,hub,down,low,mps,setup,in,buf,len,&n);
+    if(!result && device_desc && n>=8){
+        uint8_t m=buf[7];
+        if(m==8 || (!low && (m==16 || m==32 || m==64)))dma[ctl].tt_ep0[addr]=m;
+        else result=-1;
+    }
+    if(!result && !addr && !len && !setup[0] && setup[1]==5 &&
+       setup[2] && setup[2]<128 && !setup[3])dma[ctl].tt_ep0[setup[2]]=dma[ctl].tt_ep0[0];
+    if(result && !g_ctl[ctl].async_broken){
+        /* A failed async split can leave translator state. CLEAR_TT_BUFFER
+         * for both control directions, at single-TT index 1. */
+        uint8_t clear[8]={0x23,8,(uint8_t)(addr<<4),(uint8_t)(addr>>4),1,0,0,0};
+        (void)control_owned(ctl,(uint8_t)hub,0,0,0,0,64,clear,0,0,0,0);
+        clear[3]|=0x80u;
+        if(!g_ctl[ctl].async_broken)(void)control_owned(ctl,(uint8_t)hub,0,0,0,0,64,clear,0,0,0,0);
+    }
+    if(!result && actual)*actual=n;
+    async_release(ctl);
+    return result;
+}
+
 /* ---------- bulk 传输（U 盘的 BOT 通道） ----------
  * 与 UHCI 侧的语义完全一致（NAK 由 HC 逐微帧重试、toggle 软件维护、
  * STALL 交上层走 BOT Reset + ClearFeature），只是载体换成异步环 + qTD。
  * 返回 0 成功（*actlen=实际字节数），<0 失败。 */
-int ehci_bulk_xfer(int ctl, uint8_t addr, uint8_t ep,
+static int bulk_owned(int ctl, uint8_t addr, uint8_t ep,
                    uint8_t *buf, int blen, int mps, int *actlen) {
     if (actlen) *actlen = 0;
     if (ctl < 0 || ctl >= EHCI_MAX_CTL || !g_ctl[ctl].valid) return -1;
     if (addr == 0u || addr > 127u) return -1;
-    if (blen < 0 || blen > (int)sizeof(g_bulkbuf)) return -1;   /* 缓冲上界 */
+    if (blen < 0 || blen > (int)sizeof(dma[ctl].g_bulkbuf)) return -1;   /* 缓冲上界 */
     if (blen > 0 && !buf) return -1;
     if ((ep & 0x7Fu) == 0u || (ep & 0x7Fu) > 15u) return -1;    /* 非端点 0 */
     /* full-speed bulk mps 只到 64；高速 bulk 端点 mps 恒为 512（一个扇区） */
     if (mps != 8 && mps != 16 && mps != 32 && mps != 64 && mps != 512) return -1;
     if (blen == 0) return 0;
+    if (async_stop(ctl) != 0) return -1;
 
     int dir_in = (ep & 0x80u) ? 1 : 0;
-    uint8_t *togp = dir_in ? &g_btog_in[addr] : &g_btog_out[addr];
+    uint8_t *togp = dir_in ? &dma[ctl].g_btog_in[addr] : &dma[ctl].g_btog_out[addr];
 
-    for (int i = 0; i < blen; i++) g_bulkbuf[i] = dir_in ? 0 : buf[i];
+    for (int i = 0; i < blen; i++) dma[ctl].g_bulkbuf[i] = dir_in ? 0 : buf[i];
 
-    for (int k = 0; k < 8; k++) g_btd[k] = 0;
-    g_btd[0] = LINK_T;                                  /* next = T */
-    g_btd[1] = LINK_T;                                  /* alt next = T */
-    g_btd[2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
+    for (int k = 0; k < 16; k++) dma[ctl].g_btd[k] = 0;
+    dma[ctl].g_btd[0] = LINK_T;                                  /* next = T */
+    dma[ctl].g_btd[1] = LINK_T;                                  /* alt next = T */
+    dma[ctl].g_btd[2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
              | ((uint32_t)blen << 16)
              | (*togp ? QTD_DT : 0u)
              | QTD_CERR3 | QTD_ACTIVE;
-    qtd_set_buf(g_btd, EH_PHYS(&g_bulkbuf[0]), blen);
+    qtd_set_buf(dma[ctl].g_btd, EH_PHYS(&dma[ctl].g_bulkbuf[0]), blen);
 
-    for (int k = 0; k < 12; k++) g_bqh[k] = 0;
-    g_bqh[0] = LINK_QH(&g_head[0]);                     /* 水平链回 head */
-    g_bqh[1] = (uint32_t)addr
+    for (int k = 0; k < 16; k++) dma[ctl].g_bqh[k] = 0;
+    dma[ctl].g_bqh[0] = LINK_QH(&dma[ctl].g_head[0]);                     /* 水平链回 head */
+    dma[ctl].g_bqh[1] = (uint32_t)addr
              | ((uint32_t)(ep & 0x7Fu) << 8)
              | QH_EPS_HIGH
              | QH_MPL(mps)
              | QH_DTC;            /* DTC=1：toggle 取 qTD 的 DT 位（软件维护） */
-    g_bqh[2] = QH_MULT1;
-    g_bqh[4] = EH_PHYS(&g_btd[0]);                      /* next qTD */
-    g_bqh[5] = LINK_T;
-    g_bqh[6] = 0;
+    dma[ctl].g_bqh[2] = QH_MULT1;
+    dma[ctl].g_bqh[4] = EH_PHYS(&dma[ctl].g_btd[0]);                      /* next qTD */
+    dma[ctl].g_bqh[5] = LINK_T;
+    dma[ctl].g_bqh[6] = 0;
 
-    if (async_stop(ctl) != 0) return -1;
-    g_head[0] = LINK_QH(&g_bqh[0]);
-    if (async_start(ctl) != 0) {
-        g_head[0] = LINK_QH(&g_head[0]);
-        return -1;
-    }
+    dma[ctl].g_head[0] = LINK_QH(&dma[ctl].g_bqh[0]);
+    if (async_start(ctl) != 0) return -1;
 
     uint32_t t0 = g_pit_ticks;
     int done = 0;
     while ((uint32_t)(g_pit_ticks - t0) < EHCI_TO_XFER) {
-        uint32_t st = g_btd[2];
+        uint32_t st = dma[ctl].g_btd[2];
         if ((st & QTD_ACTIVE) == 0u) { done = 1; break; }
         if (st & QTD_FATAL) break;
         if (e_mmio_rd(ctl, EH_USBSTS) & (STS_HCH | STS_HSE)) break;
     }
 
-    async_stop(ctl);
-    g_head[0] = LINK_QH(&g_head[0]);
-    async_start(ctl);
+    if(async_stop(ctl)!=0)return -1;
+    dma[ctl].g_head[0] = LINK_QH(&dma[ctl].g_head[0]);
 
-    uint32_t st = g_btd[2];
+    uint32_t st = dma[ctl].g_btd[2];
     if (!done || (st & QTD_FATAL)) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         e_str(line, &li, lim, "EHCI-BULK: xfer fail addr=");
@@ -477,17 +688,24 @@ int ehci_bulk_xfer(int ctl, uint8_t addr, uint8_t ep,
     }
 
     if (dir_in && actual > 0) {
-        for (int i = 0; i < actual; i++) buf[i] = (uint8_t)g_bulkbuf[i];
+        for (int i = 0; i < actual; i++) buf[i] = (uint8_t)dma[ctl].g_bulkbuf[i];
     }
     if (actlen) *actlen = actual;
     return 0;
 }
 
+int ehci_bulk_xfer(int ctl,uint8_t addr,uint8_t ep,uint8_t *buf,int len,int mps,int *actual) {
+    if(actual)*actual=0;
+    if(!async_acquire(ctl))return -1;
+    int result=bulk_owned(ctl,addr,ep,buf,len,mps,actual);
+    async_release(ctl);
+    return result;
+}
+
 void ehci_bulk_tog_reset(int ctl, uint8_t addr) {
-    (void)ctl;
-    if (addr > 127u) return;
-    g_btog_in[addr]  = 0;
-    g_btog_out[addr] = 0;
+    if (ctl<0 || ctl>=EHCI_MAX_CTL || addr>127) return;
+    dma[ctl].g_btog_in[addr]  = 0;
+    dma[ctl].g_btog_out[addr] = 0;
 }
 
 /* ---------- 端口复位 + 高速判定 ---------- */
@@ -496,7 +714,7 @@ int ehci_port_reset(int ctl, int port) {
     if (port < 0 || port >= g_ctl[ctl].nports) return 0;
 
     uint32_t sc = e_port_rd(ctl, port);
-    if ((sc & PS_CCS) == 0u) return 0;                  /* 空口：什么都不做 */
+    if ((sc & (PS_PO|PS_CCS)) != PS_CCS) return 0;
 
     /* 置 PR（bit8）并保持 >=50ms（USB2 规范要求根口复位 >=50ms）。
      * 保留 PP（供电）等其它位；写回时剔除 W1C 位由 e_port_wr 统一处理。 */
@@ -539,6 +757,7 @@ int ehci_port_reset(int ctl, int port) {
         /* 复位后端口没被使能 —— 按 EHCI 规范这意味着挂的是全速/低速设备，
          * 必须交还 companion（写 PO=1）。真机上 companion UHCI 随后会枚举它，
          * 键盘鼠标因此不受影响；本控制器不再看这个口。 */
+        if(!(e_cap_rd(ctl,EH_HCSPARAMS)&(15u<<12)))return 0;
         e_port_wr(ctl, port, (sc & ~PS_RWC) | PS_PO | PS_PP);
         {
             char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
@@ -552,92 +771,72 @@ int ehci_port_reset(int ctl, int port) {
         }
         return 0;
     }
+    e_mmio_wr(ctl,EH_PORTSC+4u*(unsigned)port,(sc&~PS_RWC)|(sc&PS_CSC));
     return 1;   /* 高速设备，本控制器拥有 */
 }
 
-/* ---------- BIOS/OS handoff（真机必需） ---------- *
- * EHCI 的扩展能力链表起点在 HCCPARAMS[15:8]（EECP）。偏移处若为
- * capability id 1（USBLEGSUP），其 bit16 = BIOS Owned Semaphore：
- * 固件/SMM 占着控制器时该位为 1，此时 EHCI 的寄存器被 BIOS 接管，
- * 端口永远不工作。做法：写 bit24（OS Owned Semaphore）=1，等 BIOS 清
- * bit16（规范给固件 1ms，耐心给 200ms），再关掉 SMI 使能位。 */
-static void ehci_bios_handoff(const pci_device_t *d, int ctl) {
-    uint32_t hcc = e_cap_rd(ctl, EH_HCCPARAMS);
-    uint32_t eecp = (hcc >> 8) & 0xFFu;
-    if (eecp < 0x40u) return;          /* 0 = 没有扩展能力；<0x40 不是合法 PCI 配置空间偏移 */
-
-    /* USBLEGSUP/EECP 是 PCI 配置空间偏移（EHCI 规范 §2.1.7），
-     * 必须走 PCI 配置读写——以前拿 cap 基址+eecp 当 MMIO 读写，
-     * QEMU 未实现区读 0 所以 CI 绿，真机上所有权永远拿不到。 */
-    uint32_t sem = pci_read_dword(d->bus, d->dev, d->func, eecp);
-    uint32_t capid = sem & 0xFFu;
-    if (capid != 0x01u) return;        /* 不是 USBLEGSUP */
-
-    if ((sem & (1u << 16)) == 0u) {    /* BIOS 没占着，无需交接 */
-        /* 顺手关掉 SMI（bit31:16 里的 SMI 使能位），避免真机 SMM 打断。
-         * `~0xFFFFu` 是多余的：0xFFFF0000u 已经把低 16 位清零了。 */
-        pci_write_dword(d->bus, d->dev, d->func, eecp, sem & 0xFFFF0000u);
-        return;
-    }
-
-    /* 请求 OS 所有权 */
-    pci_write_dword(d->bus, d->dev, d->func, eecp, sem | (1u << 24));
-    uint32_t t0 = g_pit_ticks;
-    while ((uint32_t)(g_pit_ticks - t0) < 200u) {
-        uint32_t v = pci_read_dword(d->bus, d->dev, d->func, eecp);
-        if ((v & (1u << 16)) == 0u) break;
-        e_delay_ms(5);
-    }
-    uint32_t after = pci_read_dword(d->bus, d->dev, d->func, eecp);
-    /* 走到这里说明 BIOS 200ms 内没交出所有权。仍然清掉 BIOS Owned Semaphore
-     * —— 这**不是规范推荐的握手兜底，而是强夺**：规范做法是超时后放弃该
-     * 控制器并报错，由固件/用户决定。之所以在这里强夺，是因为 Cerulia 是唯一
-     * 会用到 EHCI 的软件，等下去只会让启动卡死；风险是若 BIOS 的 SMM 代码
-     * 仍在访问控制器，可能与我们的访问撞车。真机上如遇枚举异常，这里是第一
-     * 个要怀疑的地方。
-     * 关掉全部 SMI 使能（低 16 位），保留高 16 位的信号量状态。 */
-    pci_write_dword(d->bus, d->dev, d->func, eecp, after & 0xFFFF0000u);
-    {
-        char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
-        e_str(line, &li, lim, "EHCI: bios handoff eecp=0x");
-        e_hex(line, &li, lim, eecp, 2);
-        e_str(line, &li, lim, " bios-owned-now=");
-        e_dec(line, &li, lim, (after & (1u << 16)) ? 1u : 0u);
-        e_str(line, &li, lim, " os-owned=");
-        e_dec(line, &li, lim, (after & (1u << 24)) ? 1u : 0u);
-        if (li < lim) line[li] = 0; else line[lim] = 0;
-        dmesg_write(line);
-    }
+unsigned ehci_root_count(int ctl) {
+    return ctl>=0 && ctl<g_ctl_n ? (unsigned)g_ctl[ctl].nports : 0;
 }
 
-/* ---------- 单控制器初始化 ---------- */
-static int ehci_setup_one(const pci_device_t *d, int idx) {
-    /* 找 32 位 MMIO BAR（bit0=0 表示内存；bit2:1=00b 表示 32 位）。
-     * 64 位 BAR（bit2:1=10b）在 32 位无 PAE 下够不到 4GB 以上，
-     * fail closed 并明确打日志，绝不静默跳过。 */
-    uint32_t bar = 0;
-    int bar_idx = -1;
-    for (int b = 0; b < 6; b++) {
-        uint32_t v = d->bar[b];
-        if (v == 0u) continue;
-        if ((v & 0x1u) != 0u) continue;               /* I/O 空间，不是 EHCI 的 */
-        if ((v & 0x6u) != 0x0u) {
-            dmesg_write("EHCI: 64-bit MMIO BAR unsupported (32-bit paging)");
+unsigned ehci_root_status(int ctl,int port) {
+    if(port<0 || (unsigned)port>=ehci_root_count(ctl) ||
+       (e_mmio_rd(ctl,EH_USBSTS)&(STS_HCH|STS_HSE)))return 0;
+    uint32_t sc=e_port_rd(ctl,port);
+    if(sc & PS_PO)return 0;
+    if(sc&PS_CSC)e_mmio_wr(ctl,EH_PORTSC+4u*(unsigned)port,(sc&~PS_RWC)|PS_CSC);
+    return (sc&PS_CCS) | ((sc&PS_CSC)?2u:0u) |
+           ((sc&(PS_PR|PS_FPR|PS_SUSP))?4u:0u);
+}
+
+void ehci_root_disable(int ctl,int port) {
+    if(ctl<0 || ctl>=EHCI_MAX_CTL || !g_ctl[ctl].valid ||
+       port<0 || port>=g_ctl[ctl].nports)return;
+    uint32_t sc=e_port_rd(ctl,port);
+    if(!(sc&PS_PO))e_port_wr(ctl,port,sc&~PS_PE);
+}
+
+/* EHCI §5.1: find USBLEGSUP in PCI config space (not MMIO). Do not
+ * touch a live firmware schedule or its DMA on an ownership timeout. */
+static int ehci_bios_handoff(const pci_device_t *d,int ctl) {
+    unsigned off=(e_cap_rd(ctl,EH_HCCPARAMS)>>8)&255u;
+    for(unsigned n=0;off && n<48u;n++){
+        if(off<0x40u || off>0xfcu || (off&3u))return -1;
+        uint32_t sem=pci_read_dword(d->bus,d->dev,d->func,off);
+        if((sem&255u)==1u){
+            if(off>=0xfcu)return -1;
+            const uint32_t bios=1u<<16,os=1u<<24;
+            pci_write_dword(d->bus,d->dev,d->func,off,sem|os);
+            uint32_t start=g_pit_ticks;
+            do{
+                sem=pci_read_dword(d->bus,d->dev,d->func,off);
+                if(!(sem&bios) && (sem&os)){
+                    /* USBLEGCTLSTS is the next dword, not USBLEGSUP. */
+                    pci_write_dword(d->bus,d->dev,d->func,off+4u,0u);
+                    dmesg_write("EHCI: firmware ownership released");
+                    return 0;
+                }
+                e_delay_ms(5);
+            }while((uint32_t)(g_pit_ticks-start)<500u);
+            dmesg_write("EHCI: firmware retained ownership; controller skipped");
             return -1;
         }
-        bar = v & 0xFFFFFFF0u;
-        bar_idx = b;
-        break;
+        off=(sem>>8)&255u;
     }
-    if (bar_idx < 0) {
-        dmesg_write("EHCI: no memory BAR found, skip");
+    return off?-1:0;
+}
+/* ---------- 单控制器初始化 ---------- */
+static int ehci_setup_one(const pci_device_t *d, int idx) {
+    /* A 64-bit BAR is also usable when firmware placed it below 4 GiB. */
+    uint32_t v=d->bar[0],bar=v&~15u;
+    if((v&7u)==4u && d->bar[1]){
+        dmesg_write("EHCI: BAR above 4 GiB, controller skipped");
         return -1;
     }
-
-    /* 开 MEM 解码 + 总线主控（EHCI 的寄存器与 DMA 都靠这两个位） */
-    uint32_t cmd = pci_read_dword(d->bus, d->dev, d->func, PCI_REG_COMMAND);
-    cmd |= (uint32_t)(PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
-    pci_write_dword(d->bus, d->dev, d->func, PCI_REG_COMMAND, cmd);
+    if(((v&7u)!=0u && (v&7u)!=4u) || bar<PAGING_IDENTITY_END || bar>0xfffffe00u){
+        dmesg_write("EHCI: missing or invalid MMIO BAR0");
+        return -1;
+    }
 
     /* 映射 MMIO：BAR 常在 32MB identity 之外，必须显式映射。
      * 按 PAGING_MMIO_FLAGS（PCD/PWT）关缓存——MMIO 寄存器不能用 WB 回写，
@@ -654,24 +853,26 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
         }
     }
 
+    uint16_t cmd=pci_read_word(d->bus,d->dev,d->func,PCI_REG_COMMAND)|PCI_CMD_MEM_SPACE;
+    pci_write_dword(d->bus,d->dev,d->func,PCI_REG_COMMAND,cmd);
     g_ctl[idx].cap = bar;
     uint32_t caplen = *(volatile uint8_t *)(unsigned long)(bar + EH_CAPLENGTH);
-    if (caplen < 0x10u || caplen > 0x40u) caplen = 0x10u;   /* 不可信上界 */
+    if(caplen<0x10u || caplen>0x40u || (caplen&3u))return -1;
     g_ctl[idx].op = bar + caplen;
 
     uint32_t hcs = e_cap_rd(idx, EH_HCSPARAMS);
     uint32_t hcc = e_cap_rd(idx, EH_HCCPARAMS);
     int nports = (int)(hcs & 0x0Fu);
+    if(!nports)return -1;
     if (nports > EHCI_MAX_PORTS) nports = EHCI_MAX_PORTS;
     g_ctl[idx].nports = nports;
+    g_ctl[idx].async_wq.head=-1;
 
     {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         e_str(line, &li, lim, "EHCI: bar=0x");
         e_hex(line, &li, lim, bar, 8);
-        e_str(line, &li, lim, " (BAR");
-        e_dec(line, &li, lim, (uint32_t)bar_idx);
-        e_str(line, &li, lim, ") irq=");
+        e_str(line, &li, lim, " (BAR0) irq=");
         if (d->intr_line != 0xFFu && d->intr_line < 16u)
             e_dec(line, &li, lim, (uint32_t)d->intr_line);
         else
@@ -686,7 +887,15 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
         dmesg_write(line);
     }
 
-    ehci_bios_handoff(d, idx);
+    if(ehci_bios_handoff(d,idx)!=0)return -1;
+    e_mmio_wr(idx,EH_USBINTR,0);
+    e_mmio_wr(idx,EH_USBCMD,0);
+    uint32_t stop_at=g_pit_ticks;
+    while(!(e_mmio_rd(idx,EH_USBSTS)&STS_HCH)){
+        if((uint32_t)(g_pit_ticks-stop_at)>=EHCI_TO_RESET)return -1;
+        e_delay_ms(1);
+    }
+    pci_write_dword(d->bus,d->dev,d->func,PCI_REG_COMMAND,cmd&~PCI_CMD_BUS_MASTER);
 
     /* ---------- 控制器复位（HCRESET） ----------
      * 复位会把 USBCMD/USBSTS/端口状态全部带回上电值；后续必须重新
@@ -697,6 +906,7 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
         if ((e_mmio_rd(idx, EH_USBCMD) & CMD_HCRESET) == 0u) break;
         e_delay_ms(2);
     }
+    if(e_mmio_rd(idx,EH_USBCMD)&CMD_HCRESET)return -1;
     {
         uint32_t sts = e_mmio_rd(idx, EH_USBSTS);
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
@@ -712,26 +922,27 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
     e_mmio_wr(idx, EH_USBINTR, 0u);                    /* 不用中断，纯轮询 */
     e_mmio_wr(idx, EH_CTRLDSSEG, 0u);                  /* 32 位地址，无高段 */
 
-    /* 周期帧列表：全 T（本步无周期流量），为第二阶段中断传输预留 */
-    for (int k = 0; k < 1024; k++) g_flist[k] = LINK_T;
-    e_mmio_wr(idx, EH_PERIODIC, EH_PHYS(&g_flist[0]));
+    /* Start with an empty periodic list until a HID class endpoint is found. */
+    for (int k = 0; k < 1024; k++) dma[idx].g_flist[k] = LINK_T;
+    e_mmio_wr(idx, EH_PERIODIC, EH_PHYS(&dma[idx].g_flist[0]));
 
     /* 异步环头：H=1（回收链表头），自环，token 置 HALT 防 HC 执行陈旧 qTD */
-    for (int k = 0; k < 12; k++) g_head[k] = 0;
-    g_head[0] = LINK_QH(&g_head[0]);                   /* 水平链指向自己 */
-    g_head[1] = QH_H;
-    g_head[2] = QH_MULT1;
-    g_head[4] = LINK_T;                                /* next qTD = T */
-    g_head[5] = LINK_T;                                /* alt next = T */
-    g_head[6] = QTD_HALT;                              /* 覆盖区：halted */
-    e_mmio_wr(idx, EH_ASYNC, EH_PHYS(&g_head[0]));
+    for (int k = 0; k < 16; k++) dma[idx].g_head[k] = 0;
+    dma[idx].g_head[0] = LINK_QH(&dma[idx].g_head[0]);                   /* 水平链指向自己 */
+    dma[idx].g_head[1] = QH_H;
+    dma[idx].g_head[2] = QH_MULT1;
+    dma[idx].g_head[4] = LINK_T;                                /* next qTD = T */
+    dma[idx].g_head[5] = LINK_T;                                /* alt next = T */
+    dma[idx].g_head[6] = QTD_HALT;                              /* 覆盖区：halted */
+    e_mmio_wr(idx, EH_ASYNC, EH_PHYS(&dma[idx].g_head[0]));
 
     /* CONFIGFLAG=1：把根口路由到 EHCI 自己（为 0 时端口归 companion，
      * 表现就是"PORTSC 永远读不到连接"）。必须在 RS=1 之前写。 */
     e_mmio_wr(idx, EH_CONFIGFLAG, 0x1u);
 
-    /* 起调度：RS=1 + PSE=1（周期列表空，跑着无害）+ ASE=1 */
-    e_mmio_wr(idx, EH_USBCMD, CMD_RS | CMD_PSE | CMD_ASE);
+    /* Enable periodic processing only after publishing a HID queue. */
+    pci_write_dword(d->bus,d->dev,d->func,PCI_REG_COMMAND,cmd|PCI_CMD_BUS_MASTER);
+    e_mmio_wr(idx, EH_USBCMD, CMD_RS | CMD_ASE);
     e_delay_ms(5);
     {
         uint32_t sts = e_mmio_rd(idx, EH_USBSTS);
@@ -743,7 +954,7 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
         e_str(line, &li, lim, " PSS=");
         e_dec(line, &li, lim, (sts & STS_PSS) ? 1u : 0u);
         e_str(line, &li, lim, " async=0x");
-        e_hex(line, &li, lim, EH_PHYS(&g_head[0]), 8);
+        e_hex(line, &li, lim, EH_PHYS(&dma[idx].g_head[0]), 8);
         if (li < lim) line[li] = 0; else line[lim] = 0;
         dmesg_write(line);
     }
@@ -778,7 +989,9 @@ static int ehci_setup_one(const pci_device_t *d, int idx) {
         if ((sc & PS_CCS) == 0u) continue;              /* 空口，跳过 */
         if (sc & PS_PO) continue;                       /* 已归 companion */
         int hs = ehci_port_reset(idx, p);
-        if (hs && g_plist_n < EHCI_MAX_PORTS) {
+        /* Keep every unaddressed device off the bus at address zero. */
+        if(hs)ehci_root_disable(idx,p);
+        if (hs && g_plist_n < EHCI_MAX_CTL*EHCI_MAX_PORTS) {
             g_plist[g_plist_n].ctl = idx;
             g_plist[g_plist_n].port = p;
             g_plist_n++;
@@ -877,7 +1090,6 @@ static void ehci_control_probe(void) {
 void ehci_init(void) {
     int n = pci_device_count();
     int found = 0;
-    int handled = 0;
 
     for (int i = 0; i < n; i++) {
         const pci_device_t *d = pci_get_device(i);
@@ -886,12 +1098,10 @@ void ehci_init(void) {
         if (d->class_code != 0x0Cu || d->subclass != 0x03u || d->prog_if != 0x20u)
             continue;
         found++;
-        if (handled) {
-            dmesg_write("EHCI: additional EHCI controller skipped this step");
+        if (g_ctl_n>=EHCI_MAX_CTL) {
+            dmesg_write("EHCI: more EHCI controllers than supported slots");
             continue;
         }
-        if (g_ctl_n >= EHCI_MAX_CTL) continue;
-        handled = 1;
         if (ehci_setup_one(d, g_ctl_n) == 0) g_ctl_n++;
     }
 
@@ -900,13 +1110,17 @@ void ehci_init(void) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         e_str(line, &li, lim, "EHCI: ");
         e_dec(line, &li, lim, (uint32_t)found);
-        e_str(line, &li, lim, " EHCI controller(s) found, initialized first");
+        e_str(line, &li, lim, " EHCI controller(s) found, initialized ");
+        e_dec(line, &li, lim, (uint32_t)g_ctl_n);
         if (li < lim) line[li] = 0; else line[lim] = 0;
         dmesg_write(line);
     }
 
     e_delay_ms(100);      /* 端口复位后设备稳定期（枚举前必须等） */
-    ehci_control_probe();
+    if(g_plist_n && ehci_port_reset(g_plist[0].ctl,g_plist[0].port)) {
+        ehci_control_probe();
+        ehci_root_disable(g_plist[0].ctl,g_plist[0].port);
+    } else if(!g_plist_n)ehci_control_probe();
 }
 
 int ehci_port_count(void) {

@@ -286,10 +286,9 @@ def run_case(name, extra_args, mode):
                 print("  FAIL %s: a 480Mb/s device was handed to companion"
                       % name)
                 ok = False
-            # 键盘是高速 HID：EHCI 还没周期调度，必须如实说"认领不了"，
-            # 而不是假装能用（真机上键鼠是 FS/LS，走 companion UHCI）
-            if not any("HID on EHCI skipped" in l for l in lines):
-                print("  FAIL %s: expected explicit 'HID on EHCI skipped'" % name)
+            # End-to-end key delivery is independently checked by test_usb_ehci_hid.py.
+            if not any("USB-KBD: boot kbd" in l for l in lines):
+                print("  FAIL %s: high-speed boot keyboard was not bound" % name)
                 ok = False
             if not any("USB-MSC: no mass storage device" in l for l in lines):
                 print("  FAIL %s: keyboard-only case must not claim a drive"

@@ -242,6 +242,7 @@ void keyboard_discard_boot_input(void) {
         buffer_start = (buffer_start + 1) % KEYBOARD_BUFFER_SIZE;
     }
     left_shift = right_shift = alt_down = 0;
+    usbkbd_cancel_repeat();
     irq_restore(flags);
 }
 

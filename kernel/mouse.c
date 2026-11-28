@@ -26,6 +26,7 @@ static int usb_present = 0;     /* H2-2e：USB boot 鼠标已认领（mouse_pres
 static int mouse_x = 0;
 static int mouse_y = 0;
 static int mouse_buttons = 0;   // bit0=左, bit1=右, bit2=中
+static int ps2_buttons, usb_buttons;
 
 static uint8_t packet[4];
 static int packet_index = 0;
@@ -485,7 +486,8 @@ void mouse_handler(void) {
             pkt_cnt++;                    /* 只计真正生效的包 */
 
             mouse_accumulate(ev.dx, ev.dy);
-            mouse_set_buttons(ev.buttons);   /* 位移先入账：事件坐标取变迁后位置 */
+            ps2_buttons=ev.buttons;
+            mouse_set_buttons(ps2_buttons|usb_buttons); /* edges use the new cursor position */
             if (ev.dz != 0) wheel_push(ev.dz);
         }
     }
@@ -521,9 +523,23 @@ int mouse_get_x(void) {
 void mouse_inject_report(int dx, int dy, int buttons, int dz) {
     uint32_t flags = irq_save_disable();
     mouse_accumulate(dx, dy);
-    mouse_set_buttons(buttons);   /* 位移先入账：事件坐标取变迁后位置 */
+    usb_buttons=buttons;
+    mouse_set_buttons(usb_buttons|ps2_buttons);
     pkt_cnt++;
     if (dz != 0) wheel_push(dz);
+    irq_restore(flags);
+}
+
+/* Absolute HID reports use a 0..32767 range, independent of sensitivity. */
+void mouse_inject_absolute(unsigned x,unsigned y,int buttons,int dz) {
+    if (x>32767 || y>32767 || GFX_W<1 || GFX_H<1)return;
+    uint32_t flags=irq_save_disable();
+    mouse_x=(int)((x*(GFX_W-1)+16383)/32767);
+    mouse_y=(int)((y*(GFX_H-1)+16383)/32767);
+    usb_buttons=buttons;
+    mouse_set_buttons(usb_buttons|ps2_buttons);
+    pkt_cnt++;
+    if(dz)wheel_push(dz);
     irq_restore(flags);
 }
 

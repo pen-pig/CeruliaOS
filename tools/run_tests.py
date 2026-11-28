@@ -60,7 +60,11 @@ LAYERS = {
              "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
              "fsck", "save_exfat", "redirect_save"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
-             "usbmsc", "usbboot", "ehci"],
+             "usbmsc", "usbboot", "ehci", "usb_browser_input", "usb_keyboard_hold",
+             "usb_hotplug", "usb_hub_hid", "usb_tablet", "usb_keyboard_leds",
+             "usb_composite", "usb_input_platforms", "usb_ohci", "usb_ehci_hid", "usb_ehci_hub",
+             "usb_nkro", "usb_superspeed_hub", "usb_multi_controller",
+             "usb_xhci_multi", "usb_multi_input"],
     "net":  ["netapp", "dhcp", "dns", "fetch", "browser_network", "browser_images", "browser_css", "browser_boxes", "browser_js"],
     "gui":  ["vi", "vi_big", "vi_color", "notepad_save", "cjk", "uefi3", "exitmode", "html"],
     # gprobe：GUI 交互探针（tests/probe_*.py）。与 gui 层不同——gui 层是
@@ -112,7 +116,7 @@ WATCH = [
     ("sysvol", "core fs"), ("ref_exfat", "core fs"),
     ("mouse", "core usb gprobe"), ("usbmouse", "core usb"),
     ("usbkbd", "usb"),
-    ("keyboard", "usb"), ("uhci", "usb"), ("ehci", "usb"), ("usbc", "usb"),
+    ("keyboard", "usb"), ("uhci", "usb"), ("ohci", "usb"), ("ehci", "usb"), ("usbc", "usb"),
     ("usb.", "usb"), ("usbenum", "usb"), ("usbhc", "usb"),
     ("net.c", "net"), ("rtl8139", "net"), ("dhcp", "net"), ("dns", "net"),
     # 静态检查不跑 QEMU，10~30s 就完事，所以 kernel/ 下任何 .c 改动都带上

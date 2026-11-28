@@ -71,6 +71,7 @@ int paging_lfb_ready(void);
 /* Single dedicated 2 MiB high-physical MMIO window. Access only through
  * paging_mmio64_*; ordinary pointers do not map this window. */
 #define PAGING_MMIO64_VA 0xc0000000u
+/* Returns a byte offset into the temporary PAE aperture, or -1. */
 int paging_mmio64_init(uint64_t phys_2m);
 uint32_t paging_mmio64_read(uint32_t offset);
 void paging_mmio64_write(uint32_t offset, uint32_t value);

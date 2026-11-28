@@ -26,29 +26,27 @@
 #define USBHC_UHCI  0u
 #define USBHC_EHCI  1u
 #define USBHC_XHCI  2u
+#define USBHC_OHCI  3u
+#define USBHC_DOWNSTREAM 0x80u
 
-/* 统一端口表容量：UHCI 根口 + EHCI 根口。
- *
- * **必须是两者上限之和**，不是拍脑袋的数：UHCI 规范最多 8 根口，
- * EHCI 最多 16 根口，两者是独立控制器，总共可达 24。取 16 的话，
- * 多控制器真机上超出的端口会被 `g_ports_n < USBHC_MAX_PORTS` 那个
- * 循环条件静默丢弃 —— 枚举层看不到任何异常，只表现为"某个设备死活
- * 不认出来"，而汇总日志还照打nu/ne，看不出丢了东西。 */
-#define USBHC_MAX_PORTS (8 + 16 + 8)
+/* 统一根口表：四颗 UHCI、两颗 EHCI、四颗 xHCI、四颗 OHCI。 */
+#define USBHC_MAX_PORTS (8 + 2*16 + 4*32 + 4*15)
 
 /*
  * 一个"已连接端口"的句柄。枚举层（usbenum）拿它去做标准请求，
  * 类驱动（usbkbd/usbmouse/usbmsc）拿它去发中断/bulk 传输。
  * 字段按控制器类型解释：
- *   hc == USBHC_UHCI：io 有效，ctl 无意义
- *   hc == USBHC_EHCI：ctl（控制器索引）有效，io 无意义，ls 恒 0（高速）
+ *   hc == USBHC_UHCI：io 有效，ctl=1 表示已由外置 Hub 完成端口复位
+ *   hc == USBHC_EHCI：ctl 是控制器；hub_port 非零表示已由外置 Hub 复位。
+ *     tt_hub 是低速/全速设备的事务转换器地址；高速子设备不走分割事务。
  */
 typedef struct {
     uint8_t  hc;      /* USBHC_UHCI / USBHC_EHCI */
-    uint8_t  ctl;     /* EHCI 控制器索引 */
+    uint8_t  ctl;     /* EHCI 控制器索引 / UHCI downstream 标志 */
     uint8_t  port;    /* 根口编号 */
     uint8_t  ls;      /* 低速设备（仅 UHCI 有意义） */
     uint16_t io;      /* UHCI I/O 基址 */
+    uint8_t tt_hub, hub_port;  /* EHCI only; hub ports are 1-based. */
 } usbhc_t;
 
 /*
@@ -83,7 +81,7 @@ int usbhc_control_xfer(const usbhc_t *h, uint8_t addr, uint8_t ep,
  */
 int usbhc_interrupt_in(const usbhc_t *h, uint8_t addr, uint8_t ep,
                        uint8_t *buf, int blen, int *actlen);
-int usbhc_configure_hid(const usbhc_t *h, uint8_t ep, uint16_t mps, uint8_t interval);
+int usbhc_configure_hid(const usbhc_t *h, uint8_t addr, uint8_t ep, uint16_t mps, uint8_t interval);
 
 /* 一笔 bulk 传输。返回 0 成功（*actlen=实际字节数），<0 失败 */
 int usbhc_bulk_xfer(const usbhc_t *h, uint8_t addr, uint8_t ep,

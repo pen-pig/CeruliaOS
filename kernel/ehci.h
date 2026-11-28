@@ -16,8 +16,8 @@
  *     全速/低速交还 companion）+ 控制传输（SETUP/DATA/STATUS）。
  *   - 诊断全部走 dmesg_write（COM1），前缀 "EHCI:" / "EHCI-CTRL:"。
  *
- * 本步**不做**：周期调度（中断 IN，HID 键盘/鼠标走 EHCI 是下一步 A1 第二阶段）、
- * bulk 传输（U 盘走 EHCI 也是第二阶段）、设备枚举接线（usbenum 目前只认 UHCI）。
+ * 异步调度负责 EP0 和高速存储；独立的周期调度负责直连高速 HID。
+ * 一层高速 Hub 的 USB 1.x 键鼠使用 split EP0 / interrupt IN。
  *
  * 关键差异备忘（别照抄 UHCI）：
  *   - UHCI 传输靠"帧列表 -> QH/TD"，EHCI 靠"异步环 + qTD"。
@@ -30,7 +30,7 @@
 
 #include "types.h"
 
-/* 控制器表容量（真机常见 1-2 个 EHCI；本步只初始化第一个，其余记一笔跳过） */
+/* 独立调度和 DMA，每颗控制器一个实例。 */
 #define EHCI_MAX_CTL   2
 /* 单控制器根口上界（HCSPARAMS N_PORTS 是 4 位，最多 15） */
 #define EHCI_MAX_PORTS 16
@@ -65,13 +65,15 @@ int ehci_port_get(int i, int *ctl_out, int *port_out);
  *   ep        端点号（0-15）
  *   setup     8 字节 SETUP 包
  *   dir_in    数据阶段方向（1=IN 设备到主机，0=OUT）
- *   buf/blen  数据缓冲与长度；blen 上界 256
+ *   buf/blen  数据缓冲与长度；blen 上界 1024
  *   actlen    实际传输字节数（可为 NULL）
  * 端点 0 的 mps 按 USB2 规范对高速设备恒为 64，故不设参数。
  */
 int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
                       const uint8_t *setup, int dir_in,
                       uint8_t *buf, int blen, int *actlen);
+int ehci_control_split(int ctl,uint8_t addr,uint8_t ep,unsigned hub,unsigned down,int low,
+                       const uint8_t *setup,int in,uint8_t *buf,int len,int *actual);
 
 /*
  * 一笔 bulk 传输（U 盘的 BOT 通道，A1 第二阶段）。
@@ -92,5 +94,15 @@ void ehci_bulk_tog_reset(int ctl, uint8_t addr);
  *      0 = 不是高速（已交还 companion）或根本没有设备。
  */
 int ehci_port_reset(int ctl, int port);
+
+/* Native high-speed HID and root hotplug. Root status bits 0: connected,
+ * 1: connection changed (acknowledged on read), 2: resetting/resuming. */
+unsigned ehci_root_count(int ctl);
+unsigned ehci_root_status(int ctl,int port);
+void ehci_root_disable(int ctl,int port);
+int ehci_configure_hid(int ctl,int port,uint8_t addr,uint8_t ep,uint16_t mps,uint8_t interval,
+                       unsigned hub,unsigned down,unsigned low);
+int ehci_interrupt_in(int ctl,int port,uint8_t addr,uint8_t ep,uint8_t *buf,int len,int *actual);
+void ehci_release_hid(int ctl,uint8_t addr);
 
 #endif

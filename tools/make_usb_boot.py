@@ -52,12 +52,33 @@ def list_disks():
 
 
 def _run(cmd, shell=False):
+    """跑一条命令并返回 (stdout, rc)。
+
+    Windows 上 PowerShell 的输出是控制台代码页（中文系统 = GBK/CP936），
+    用 text=True 会默认按 UTF-8 解码，遇到非 ASCII 字节直接抛
+    UnicodeDecodeError（在 subprocess 的 reader 线程里炸，掩盖真实错误）。
+    这里改成按 bytes 收，再用 utf-8→gbk→latin1 依次尝试解码，
+    最后 fallback 到 replace，保证不因编码问题丢输出。
+    """
     try:
-        out = subprocess.run(cmd, shell=shell, capture_output=True, text=True,
+        out = subprocess.run(cmd, shell=shell, capture_output=True,
                              timeout=30, creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-        return out.stdout, out.returncode
+        return _decode(out.stdout), out.returncode
     except Exception as e:  # noqa
         return "", 1
+
+
+def _decode(raw):
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _list_windows():
@@ -164,14 +185,33 @@ def _list_darwin():
 # --------------------------------------------------------------------------
 # 镜像校验
 # --------------------------------------------------------------------------
-# 写入目标：pad 到 1024 扇区（512KB 整）。
+# 写入目标：镜像本身 512 对齐即可；写盘时把总长度补到 1024 扇区（512KB）的
+# **整数倍**（不足 1024 扇区时补到 1024）。
 # 实测（QEMU SeaBIOS 1.16.3）：993 扇区（奇数）的镜像 U 盘引导失败
 # （BIOS 认出设备但读盘报错），pad 到 1024 立即成功；真机 BIOS 实现各有
-# 怪癖，对齐整 KB 是零成本保险。多写的 15KB 全是零，不影响引导。
+# 怪癖，对齐整 KB 是零成本保险。多写的零不影响引导。
 # kernel.bin / UEFI 契约不受影响：UEFI 加载器（uefi/main.c）读的是文件真实
 # 大小，不是这个 pad；BIOS 路径的扇区数由 tools/make_image.py 写进引导扇区
-# 0x1FC，与这里的 1024 扇区无关。
+# 0x1FC，与这里的 pad 无关。
+#
+# 注意：曾经这里还有一条「镜像不得超过 1024 扇区（512KB）」的预算检查。
+# 那条检查是照着**裸镜像**（os-image.bin，只有引导扇区+stage2+内核）写的，
+# 但本工具的默认镜像已经换成 usb-image.bin —— 它额外带一个 34MB 的 FAT32
+# ESP（ESP_LBA=16384、69632 扇区，见 tools/make_usb_image.py），整镜像
+# 42MB / 86016 扇区。于是文档推荐的命令
+#     python tools/make_usb_boot.py --write --disk N
+# 必然被自己的校验拒掉（"内核超预算了"），而内核窗口的真实上限是
+# boot/layout.inc 的 KERNEL_MAX_SECTORS（3MB），跟整个镜像的大小无关。
+# 真正的容量约束只有一个：镜像不能比目标盘大（main() 里已判）。
 PAD_SECTORS = 1024
+
+
+def pad_target_bytes(img_size):
+    """写盘时的补零目标长度：1024 扇区的整数倍，且不少于镜像本身。"""
+    unit = PAD_SECTORS * 512
+    if img_size <= unit:
+        return unit
+    return ((img_size + unit - 1) // unit) * unit
 
 
 def validate_image(image_path):
@@ -180,9 +220,6 @@ def validate_image(image_path):
     size = os.path.getsize(image_path)
     if size % 512 != 0:
         return None, "镜像大小 %d 不是 512 的倍数（引导扇区必须 512 对齐）" % size
-    if size > PAD_SECTORS * 512:
-        return None, ("镜像 %d 字节超过 %d 扇区预算（%d 字节）——内核超预算了，"
-                      "先回链接脚本查" % (size, PAD_SECTORS, PAD_SECTORS * 512))
     with open(image_path, "rb") as f:
         first = f.read(512)
     if len(first) < 512 or first[510] != 0x55 or first[511] != 0xAA:
@@ -191,50 +228,462 @@ def validate_image(image_path):
 
 
 # --------------------------------------------------------------------------
+# 原始块设备 I/O（write_at / read_at 抽象）
+# --------------------------------------------------------------------------
+# Windows 特有坑（2026-11-24 实测，**管理员权限下同样复现**）：
+#   Python 的 os.open() 底层是 MSVCRT _open()。以 O_WRONLY 打开
+#   \\.\PhysicalDriveN 时，CreateFile 只申请到 GENERIC_WRITE，句柄没有读
+#   权限；随后的 os.write() 被内核拒为 ERROR_INVALID_HANDLE (6)，Python
+#   把它映射成 OSError errno 9 "Bad file descriptor"。
+#   症状很有迷惑性：os.open 本身成功（不报权限错），错误只在第一次
+#   write 时才炸出来，看起来像"打开了却写不了"；提权无效。
+#   → 修法：Windows 上直接用 Win32 CreateFileW，申请
+#     GENERIC_READ|GENERIC_WRITE，并显式给
+#     FILE_SHARE_READ|FILE_SHARE_WRITE（否则盘上有活动卷时独占打开
+#     会失败，errno 32 sharing violation）。同一个句柄还能回读校验，
+#     省掉第二次打开。
+#   非 Windows：os.pwrite/os.pread，语义与原实现一致。
+class _WinRawDevice(object):
+    """Windows 原始块设备句柄（CreateFileW + WriteFile/ReadFile）。"""
+
+    def __init__(self, path):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x00000080
+        FILE_FLAG_WRITE_THROUGH = 0x80000000
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.WriteFile.restype = wintypes.BOOL
+        k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.ReadFile.restype = wintypes.BOOL
+        k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong,
+                                         ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+        k32.SetFilePointerEx.restype = wintypes.BOOL
+        k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        k32.FlushFileBuffers.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        self._k32 = k32
+
+        h = k32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+                             OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, None)
+        if h is None or h == INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            raise OSError(err, "Win32 CreateFileW(%s) 失败，错误码 %d: %s"
+                          % (path, err, ctypes.FormatError(err)))
+        self._h = h
+
+    def _seek(self, offset):
+        if not self._k32.SetFilePointerEx(self._h, self._ctypes.c_longlong(offset),
+                                          None, 0):
+            err = self._ctypes.get_last_error()
+            raise OSError(err, "SetFilePointerEx 失败: %s" % self._ctypes.FormatError(err))
+
+    def write_at(self, offset, data):
+        ctypes = self._ctypes
+        n = ctypes.c_ulong(0)
+        buf = ctypes.create_string_buffer(data, len(data))
+        self._seek(offset)
+        if not self._k32.WriteFile(self._h, buf, len(data), ctypes.byref(n), None):
+            err = ctypes.get_last_error()
+            raise OSError(err, "WriteFile(off=%d,len=%d) 失败: %s"
+                          % (offset, len(data), ctypes.FormatError(err)))
+        if n.value != len(data):
+            raise OSError(5, "WriteFile 短写：%d/%d 字节" % (n.value, len(data)))
+
+    def read_at(self, offset, size):
+        ctypes = self._ctypes
+        n = ctypes.c_ulong(0)
+        buf = ctypes.create_string_buffer(size)
+        self._seek(offset)
+        if not self._k32.ReadFile(self._h, buf, size, ctypes.byref(n), None):
+            err = ctypes.get_last_error()
+            raise OSError(err, "ReadFile(off=%d,len=%d) 失败: %s"
+                          % (offset, size, ctypes.FormatError(err)))
+        return buf.raw[:n.value]
+
+    def flush(self):
+        if not self._k32.FlushFileBuffers(self._h):
+            err = self._ctypes.get_last_error()
+            raise OSError(err, "FlushFileBuffers 失败: %s" % self._ctypes.FormatError(err))
+
+    def close(self):
+        if getattr(self, "_h", None):
+            self._k32.CloseHandle(self._h)
+            self._h = None
+
+
+class _RawDevice(object):
+    """跨平台原始块设备：Windows 走 Win32 API，其他走 os.pwrite/os.pread。"""
+
+    def __init__(self, path):
+        self.path = path
+        self._win = None
+        self._fd = None
+        if IS_WIN:
+            self._win = _WinRawDevice(path)
+        else:
+            self._fd = os.open(path, os.O_RDWR)
+
+    def write_at(self, offset, data):
+        if self._win:
+            return self._win.write_at(offset, data)
+        return os.pwrite(self._fd, data, offset)
+
+    def read_at(self, offset, size):
+        if self._win:
+            return self._win.read_at(offset, size)
+        return os.pread(self._fd, size, offset)
+
+    def flush(self):
+        if self._win:
+            self._win.flush()
+        else:
+            os.fsync(self._fd)
+
+    def close(self):
+        if self._win:
+            self._win.close()
+        elif self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
+class _WinVolumeGuard(object):
+    """Windows：锁定并卸载目标磁盘上的卷。
+
+    为什么必须做（2026-11-24 实测踩坑）：
+      NTFS 挂载后会持有物理设备的写锁。对 `\\\\.\\PhysicalDriveN` 的原始写入，
+      **只要落在卷覆盖的扇区范围内**，就会被内核拒绝，返回
+      ERROR_ACCESS_DENIED（Python errno 5）。
+      实测症状极具迷惑性：写 LBA0（不在任何卷内）成功，紧接着写
+      卷首扇区就被拒 —— 看起来像"写完 1MB 就不让写了"。
+      （本机 NTFS 分区偏移恰好是 1048576 = 1 MiB，与 1 MiB 写块对齐，
+        所以失败点正好落在卷边界上，非常容易误判成块大小问题。）
+
+      做法（微软文档指定的序列，与 Rufus / dd for Windows 一致）：
+        1. 找到目标盘上的卷（优先用 PowerShell Get-Volume 的 UniqueId，
+           它直接给 `\\\\?\\Volume{GUID}\\`；退路是 FindFirstVolumeW 枚举
+           + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS 查所属物理盘）；
+        2. 对每个卷：FSCTL_LOCK_VOLUME（先加独占锁，这样 dismount 才干净）
+           → FSCTL_DISMOUNT_VOLUME（卸载文件系统，让 NTFS 刷完缓存
+           元数据并交出该区域）；
+        3. **保持句柄打开直到写盘完成** —— 卷锁随句柄关闭才释放。
+
+      为什么不用 PowerShell 的 Dismount-Volume：
+      本机 Storage 模块**根本没有这个 cmdlet**（2026-11-24 核实：模块导出
+      列表里只有 Dismount-DiskImage）。而旧代码用 `; "DONE"` 判成功，
+      cmdlet 不存在时 PowerShell 报错但 "DONE" 照样输出 → **假阳性**，
+      卷从未被卸载，还顺手把真正的错误吞掉了。
+    """
+
+    FSCTL_LOCK_VOLUME = 0x00090018
+    FSCTL_DISMOUNT_VOLUME = 0x00090020
+    FSCTL_UNLOCK_VOLUME = 0x00090028
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x56000000
+
+    def __init__(self, disk_number):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self.disk_number = int(disk_number)
+        self._handles = []      # 保持打开 = 保持卷锁
+        self.report = []        # 给用户看的诊断行
+        self.locked = False
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+        k32.FindFirstVolumeW.restype = wintypes.HANDLE
+        k32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+        k32.FindNextVolumeW.restype = wintypes.BOOL
+        k32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+        k32.FindVolumeClose.restype = wintypes.BOOL
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.DeviceIoControl.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        self._k32 = k32
+        self._INVALID = ctypes.c_void_p(-1).value
+
+    def _ioctl(self, handle, code, out_buf=None, out_len=0):
+        ctypes = self._ctypes
+        n = ctypes.c_ulong(0)
+        ok = self._k32.DeviceIoControl(handle, code, None, 0, out_buf, out_len,
+                                       ctypes.byref(n), None)
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return n.value
+
+    def _volumes(self):
+        """枚举所有卷的设备路径（\\\\?\\Volume{...}\\）。"""
+        ctypes = self._ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        h = self._k32.FindFirstVolumeW(buf, 1024)
+        if h == self._INVALID or h is None:
+            return []
+        out = []
+        try:
+            while True:
+                out.append(buf.value)
+                if not self._k32.FindNextVolumeW(h, buf, 1024):
+                    break
+        finally:
+            self._k32.FindVolumeClose(h)
+        return out
+
+    def _disk_of_volume(self, path):
+        """问内核这个卷挂在哪个物理盘上；查不到返回 None。
+
+        注意：卷设备路径 `\\\\?\\Volume{GUID}\\` 带尾斜杠时，用默认 flag
+        打开会返回 ERROR_PATH_NOT_FOUND(3) —— 必须去掉尾斜杠，或加
+        FILE_FLAG_BACKUP_SEMANTICS（当目录打开）。
+        """
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+
+        class DISK_EXTENT(ctypes.Structure):
+            _fields_ = [("DiskNumber", wintypes.DWORD),
+                        ("StartingOffset", ctypes.c_longlong),
+                        ("ExtentLength", ctypes.c_longlong)]
+
+        class VOLUME_DISK_EXTENTS(ctypes.Structure):
+            _fields_ = [("NumberOfDiskExtents", wintypes.DWORD),
+                        ("DiskExtents", DISK_EXTENT * 32)]
+
+        h = self._open_volume(path)
+        if h is None:
+            return None
+        try:
+            ext = VOLUME_DISK_EXTENTS()
+            self._ioctl(h, self.IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                        ctypes.byref(ext), ctypes.sizeof(ext))
+            if ext.NumberOfDiskExtents == 0:
+                return None
+            return int(ext.DiskExtents[0].DiskNumber)
+        except OSError:
+            return None
+        finally:
+            self._k32.CloseHandle(h)
+
+    def _open_volume(self, path):
+        """打开一个卷设备句柄。依次尝试若干路径/flag 组合，返回第一个
+        成功的句柄（失败返回 None）。调用方负责 CloseHandle。
+
+        组合顺序（实测 2026-11-24）：
+          `\\\\?\\Volume{GUID}\\` + BACKUP_SEMANTICS —— 规范形式
+          `\\\\?\\Volume{GUID}`（去尾斜杠）—— 无需特殊 flag
+          `\\\\.\\X:` —— 有盘符时的经典形式
+        """
+        ctypes = self._ctypes
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+        base = path.rstrip("\\")
+        attempts = [
+            (path, FILE_FLAG_BACKUP_SEMANTICS),
+            (base, 0),
+        ]
+        for p, flags in attempts:
+            if not p:
+                continue
+            h = self._k32.CreateFileW(p, GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      None, OPEN_EXISTING, flags, None)
+            if h != self._INVALID and h is not None:
+                return h
+        return None
+
+    def _volumes_on_disk(self):
+        """列出目标盘上的所有卷。
+
+        主路径：PowerShell `Get-Partition -DiskNumber N | Get-Volume` 的
+        UniqueId 直接就是 `\\\\?\\Volume{GUID}\\`，不用猜。
+        退路：枚举所有卷 + 查各自所属物理盘。
+        """
+        ps = ('Get-Partition -DiskNumber %d -ErrorAction SilentlyContinue '
+              '| Get-Volume -ErrorAction SilentlyContinue '
+              '| ForEach-Object { $_.UniqueId }' % int(self.disk_number))
+        stdout, _rc = _run(["powershell", "-NoProfile", "-Command", ps])
+        found = []
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("\\\\?\\Volume{") and line not in found:
+                found.append(line)
+        if found:
+            return found, "PowerShell Get-Volume"
+        # 退路
+        mine = []
+        for vol in self._volumes():
+            if self._disk_of_volume(vol) == self.disk_number:
+                mine.append(vol)
+        return mine, "FindFirstVolumeW + IOCTL extents"
+
+    def engage(self):
+        """锁定并卸载目标盘上的全部卷。返回 (是否至少锁住一个, 诊断报告)。"""
+        ctypes = self._ctypes
+        mine, how = self._volumes_on_disk()
+        self.report.append("  目标盘上的卷：%d 个（来源：%s）" % (len(mine), how))
+
+        for vol in mine:
+            h = self._open_volume(vol)
+            if h is None:
+                err = ctypes.get_last_error()
+                self.report.append("  %s 打开失败（错误 %d）" % (vol, err))
+                continue
+            try:
+                # 先锁后卸载：微软文档的顺序，锁住后 dismount 才干净
+                self._ioctl(h, self.FSCTL_LOCK_VOLUME)
+                self.report.append("  %s 已加卷锁 (FSCTL_LOCK_VOLUME)" % vol)
+                try:
+                    self._ioctl(h, self.FSCTL_DISMOUNT_VOLUME)
+                    self.report.append("  %s 已卸载 (FSCTL_DISMOUNT_VOLUME)" % vol)
+                except OSError as e:
+                    self.report.append("  %s 卸载失败（错误 %d），仅靠卷锁继续"
+                                       % (vol, getattr(e, "winerror", 0) or e.errno))
+                self._handles.append(h)
+                self.locked = True
+            except OSError as e:
+                err = getattr(e, "winerror", 0) or e.errno
+                self.report.append("  %s 加锁失败（错误 %d: %s）" % (vol, err, e))
+                self._k32.CloseHandle(h)
+
+        if not self.locked:
+            self.report.append("  ⚠ 没能锁住任何卷 —— 写入可能在卷覆盖区被拒")
+        return self.locked, self.report
+
+    def close(self):
+        """关闭句柄 = 释放卷锁。"""
+        for h in self._handles:
+            try:
+                self._k32.CloseHandle(h)
+            except Exception:  # noqa
+                pass
+        self._handles = []
+
+
+
+# --------------------------------------------------------------------------
 # 写入（1 MiB 块；末尾自动补零到 PAD_SECTORS 扇区）
 # --------------------------------------------------------------------------
-def write_image(image_path, device_path, verify):
-    flags = os.O_WRONLY
-    if IS_WIN:
-        flags |= getattr(os, "O_BINARY", 0)
-    try:
-        fd = os.open(device_path, flags)
-    except PermissionError:
-        raise SystemExit(
-            "无法以写方式打开 %s：权限不足或设备被占用。\n"
-            "  Windows：请用管理员身份运行本脚本，并先在资源管理器里'弹出'该 U 盘。\n"
-            "  Linux/macOS：请用 sudo 运行。\n"
-            "  仍失败可改用图形化工具：Win32 Disk Imager / Rufus(DD 镜像模式) / dd。" % device_path)
-    except OSError as e:
-        raise SystemExit("无法打开设备 %s：%s\n提示：确认盘号/设备名正确、且不是系统盘。" % (device_path, e))
+def _is_access_denied(exc):
+    """判断异常是不是"设备被拒访问"（Win32 ERROR_ACCESS_DENIED / errno 5）。"""
+    return getattr(exc, "winerror", 0) == 5 or exc.errno == 5
 
-    written = 0
+
+def _clear_disk(disk_number):
+    """Windows：清掉目标盘的分区表（diskpart clean 的 PowerShell 等价物）。
+
+    这是写整盘镜像的**兜底**：只要盘上还有分区，文件系统就可能持有
+    物理设备写锁，让落在卷区的原始写被内核拒为 ACCESS_DENIED。
+    清掉分区后没有任何卷，锁自然消失。
+
+    注意：这一步同样会销毁该盘上的数据（本来就要被整盘覆盖）。
+    用 Clear-Disk 而不是 Remove-Partition：前者是官方的 "clean" 等价物，
+    会一并清掉卷与挂载点，不会残留半卸载的卷。
+    """
+    ps = ('Clear-Disk -Number %d -RemoveData -Confirm:$false -ErrorAction Stop; "DONE"'
+          % int(disk_number))
+    stdout, rc = _run(["powershell", "-NoProfile", "-Command", ps])
+    ok = "DONE" in (stdout or "")
+    print("  清空目标盘分区表：%s" % ("成功" if ok else "失败（退出码 %s）" % rc))
+    return ok
+
+
+def write_image(image_path, device_path, verify, disk_number=None):
+    guard = None
+    if IS_WIN and disk_number is not None:
+        # 先锁卷+卸载卷：NTFS 持有物理设备写锁时，落进卷覆盖区的原始写
+        # 会被内核拒为 ERROR_ACCESS_DENIED（errno 5）。
+        print("  [准备] 锁定并卸载目标盘上的卷...")
+        guard = _WinVolumeGuard(disk_number)
+        guard.engage()
+        for line in guard.report:
+            print(line)
     img_size = os.path.getsize(image_path)
-    pad_total = PAD_SECTORS * 512
-    try:
-        with open(image_path, "rb") as fsrc:
-            while True:
-                buf = fsrc.read(CHUNK)
-                if not buf:
-                    break
-                os.write(fd, buf)
-                written += len(buf)
-        # 补零到 1024 扇区（见 PAD_SECTORS 注释）
-        if written < pad_total:
-            zero = b"\x00" * min(CHUNK, pad_total - written)
-            while written < pad_total:
-                n = min(len(zero), pad_total - written)
-                os.write(fd, zero[:n])
-                written += n
-            print("已补零到 %d 扇区（+%d 字节，奇数扇区数会让部分 BIOS 的 U 盘引导失败）"
-                  % (PAD_SECTORS, pad_total - img_size))
-        # 落盘
+    pad_total = pad_target_bytes(img_size)
+
+    def _do_write():
+        written = 0
         try:
-            os.fsync(fd)
-        except OSError:
-            pass
+            dev = _RawDevice(device_path)
+        except PermissionError:
+            raise SystemExit(
+                "无法以写方式打开 %s：权限不足或设备被占用。\n"
+                "  Windows：请用管理员身份运行本脚本，并先在资源管理器里'弹出'该 U 盘。\n"
+                "  Linux/macOS：请用 sudo 运行。\n"
+                "  仍失败可改用图形化工具：Win32 Disk Imager / Rufus(DD 镜像模式) / dd。" % device_path)
+        except OSError as e:
+            raise SystemExit("无法打开设备 %s：%s\n提示：确认盘号/设备名正确、且不是系统盘。"
+                             % (device_path, e))
+        try:
+            with open(image_path, "rb") as fsrc:
+                while True:
+                    buf = fsrc.read(CHUNK)
+                    if not buf:
+                        break
+                    dev.write_at(written, buf)
+                    written += len(buf)
+            # 补零到 1024 扇区（见 PAD_SECTORS 注释）
+            if written < pad_total:
+                zero = b"\x00" * min(CHUNK, pad_total - written)
+                while written < pad_total:
+                    n = min(len(zero), pad_total - written)
+                    dev.write_at(written, zero[:n])
+                    written += n
+                print("已补零到 %d 扇区（+%d 字节，奇数扇区数会让部分 BIOS 的 U 盘引导失败）"
+                      % (pad_total // 512, pad_total - img_size))
+            dev.flush()
+        finally:
+            dev.close()
+        return written
+
+    try:
+        written = _do_write()
+    except OSError as e:
+        if not (IS_WIN and disk_number is not None and _is_access_denied(e)):
+            raise
+        # 兜底：卷锁没松开 → 删分区（锁随卷消失），从 0 重写。
+        print("  ⚠ 写入被拒（错误 5 = 卷仍持有设备写锁）。")
+        print("  [兜底] 清空目标盘分区表后重写...")
+        if guard:
+            guard.close()
+            guard = None
+        _clear_disk(disk_number)
+        written = _do_write()
     finally:
-        os.close(fd)
+        if guard:
+            # 释放卷锁（句柄关闭 = 解锁）
+            guard.close()
 
     if verify:
         written_back = _verify_readback(image_path, device_path)
@@ -247,10 +696,7 @@ def write_image(image_path, device_path, verify):
 
 
 def _verify_readback(image_path, device_path):
-    flags = os.O_RDONLY
-    if IS_WIN:
-        flags |= getattr(os, "O_BINARY", 0)
-    fd = os.open(device_path, flags)
+    dev = _RawDevice(device_path)
     total = 0
     try:
         with open(image_path, "rb") as fsrc:
@@ -258,12 +704,12 @@ def _verify_readback(image_path, device_path):
                 src = fsrc.read(CHUNK)
                 if not src:
                     break
-                dev = os.read(fd, len(src))
-                if len(dev) != len(src) or dev != src:
+                got = dev.read_at(total, len(src))
+                if len(got) != len(src) or got != src:
                     raise SystemExit("回读比对在第 %d 字节处不一致，U 盘可能损坏。" % total)
                 total += len(src)
     finally:
-        os.close(fd)
+        dev.close()
     return total
 
 
@@ -355,7 +801,8 @@ def main():
                          (confirm.strip(), target["id"]))
 
     print("\n写入中（块大小 %s）..." % human(CHUNK))
-    written = write_image(image_path, target["path"], args.verify)
+    disk_number = target["id"] if str(target["id"]).isdigit() else None
+    written = write_image(image_path, target["path"], args.verify, disk_number)
     print("✓ 完成：已写入 %s 到 %s" % (human(written), target["path"]))
     print("  别在 Windows 里点'格式化'！直接安全弹出 U 盘去真机试。")
 

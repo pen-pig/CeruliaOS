@@ -43,6 +43,7 @@ int mouse_present(void);     // 1 有指点设备（PS/2 或 USB），0 无
  *   buttons: bit0=左键 bit1=右键 bit2=中键；dz: 滚轮增量（>0 上滚）。
  * 内部关中断保护，与 IRQ12 的 PS/2 路径共用同一份指针状态。 */
 void mouse_inject_report(int dx, int dy, int buttons, int dz);
+void mouse_inject_absolute(unsigned x, unsigned y, int buttons, int dz);
 
 /* USB 鼠标存在性登记：让 mouse_present() 在没有 PS/2 鼠标时也返回 1。 */
 void mouse_usb_set_present(int present);

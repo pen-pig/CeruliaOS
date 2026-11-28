@@ -22,6 +22,7 @@
 #include "webview.h"
 #include "gfx.h"
 #include "http.h"
+#include "weburl.h"
 #include "rust_bridge.h"
 #include "isr.h"
 #include "keyboard.h"
@@ -181,10 +182,10 @@ static void clear_js(void){
 }
 void wv_script_register(const uint8_t *ref,unsigned n){
     if(!n||n>=WV_URL_MAX)return;
-    for(unsigned i=0;i<n;i++)if(ref[i]<=32||ref[i]=='&'||ref[i]=='\\')return;
     script_source *s=kmalloc(sizeof(*s)+n+1);
     if(!s)return;
-    s->next=0;memcpy(s->url,ref,n);s->url[n]=0;
+    if(!html_resource_url(s->url,n+1,ref,n)){kfree(s);return;}
+    s->next=0;
     if(script_tail)script_tail->next=s;else script_head=s;
     script_tail=s;
 }
@@ -1684,8 +1685,8 @@ void wv_bar_key(int key)
     }
     if (key == KEY_LEFT)  { wv_bar_cursor=wv_prev_byte(wv_url,wv_bar_cursor); return; }
     if (key == KEY_RIGHT) { wv_bar_cursor=wv_next_byte(wv_url,wv_bar_cursor,n); return; }
-    if (key == KEY_UP    || key == KEY_PGUP) { wv_scroll_by(-40); return; }
-    if (key == KEY_DOWN  || key == KEY_PGDN) { wv_scroll_by(40);  return; }
+    if (key == KEY_UP || key == KEY_PGUP) { wv_scroll_by(key==KEY_UP ? -40 : -wv_view_h+WV_LH); return; }
+    if (key == KEY_DOWN || key == KEY_PGDN) { wv_scroll_by(key==KEY_DOWN ? 40 : wv_view_h-WV_LH); return; }
     if (key == 27) { wv_bar_focus = 0; return; }        /* ESC */
     if (key == '\n' || key == '\r') {
         wv_bar_focus = 0;
@@ -1754,8 +1755,8 @@ void wv_page_key(int key)
     case 27: wv_cancel(); break;
     case KEY_UP:   wv_scroll_by(-WV_LH); break;
     case KEY_DOWN: wv_scroll_by(WV_LH);  break;
-    case KEY_PGUP: wv_scroll_by(-60);     break;
-    case KEY_PGDN: wv_scroll_by(60);      break;
+    case KEY_PGUP: wv_scroll_by(-wv_view_h+WV_LH);     break;
+    case KEY_PGDN: wv_scroll_by(wv_view_h-WV_LH);      break;
     case KEY_HOME: wv_scroll_to_top();    break;
     case KEY_END:  wv_scroll_by(1000000); break;
     case KEY_F1:   wv_bar_set_focus(1);   break;

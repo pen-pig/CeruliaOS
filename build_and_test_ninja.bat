@@ -28,6 +28,10 @@ if errorlevel 1 (
 rem Ninja rules also invoke python; use the same validated interpreter there.
 for %%P in ("%PYEXE%") do set "PATH=%%~dpP;%PATH%"
 
+rem Catch incomplete checkouts before Ninja reports a generated file missing.
+"%PYEXE%" tools/check_build_inputs.py
+if errorlevel 1 exit /b 1
+
 rem ===== generate build_auto.ninja =====
 rem All toolchain paths are resolved by tools\gen_ninja.py via ezos_env.py, which
 rem derives them from the project location. Nothing here is hardcoded to a drive

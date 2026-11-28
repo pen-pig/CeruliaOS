@@ -7,15 +7,9 @@
  *   [1]     保留
  *   [2..7]  键码数组（最多 6 键同时按下，0 = 空位）
  *
- * 判定"新按下"：把当前报告的键码与上一份报告比对，只处理**上一份里没有**的
- * 键码。这样按住不放不会刷出一串重复字符（boot 协议没有 typematic，设备会
- * 周期性重发同一份报告）。
- *
- * 红线落实：
- *  - 不可信输入上界：报告长度不足 8 字节直接丢弃；键码走映射表/switch，
- *    无越界下标。
- *  - 轮询绝不挂死：中断轮询本身有超时（uhci 层），这里额外做 5ms 节流，
- *    键盘的 shell 忙等循环因此最多每 5ms 才真正碰一次硬件。
+ * Compare key sets for edges. Typematic runs from the system clock and
+ * does not depend on whether a device resends identical idle reports.
+ * Controller input is now nonblocking on UHCI and xHCI.
  *  - 与 PS/2 共用缓冲：注入走 keyboard_inject()，由 keyboard.c 负责关中断
  *    保护，本模块不直接碰缓冲。
  *  - 静默原则：NAK（没有新报告）是每 10ms 发生一次的常态，绝不打印。
@@ -32,13 +26,21 @@
 
 #define USBKBD_THROTTLE_MS 5u      /* 轮询节流：键盘 interval=10ms */
 #define USBKBD_REPORT_LEN  8u      /* boot 协议键盘报告固定 8 字节 */
+#define REPEAT_DELAY 500u
+#define REPEAT_PERIOD 50u
+#define NON_SHIFT_MODS 0xDDu /* Ctrl, Alt and GUI, on either side */
 
-static const usb_dev_t *g_kbd = NULL;   /* 认领到的键盘（指向 usbenum 的静态表） */
-static uint8_t  g_prev[8];              /* 上一份报告（去重用） */
-static uint32_t g_last_poll = 0;        /* 上次真正轮询的 tick */
-static int      g_got_report = 0;       /* 至少收到过一个合法报告 */
+typedef struct {
+    const usb_dev_t *dev;
+    const usb_hid_if_t *keys;
+    uint8_t previous[32], modifiers, repeat, got_report;
+    uint32_t repeat_after;
+    int led_sent, led_failed;
+} kbd_t;
+static kbd_t keyboards[USBENUM_MAX_DEV];
+static int caps,num;
+static uint32_t last_poll;
 
-/* ---------- 手写格式化（内核无 sprintf） ---------- */
 static void k_str(char *b, int *n, int lim, const char *s) {
     while (*s && *n < lim) b[(*n)++] = *s++;
 }
@@ -79,7 +81,20 @@ static int hid_map(uint8_t k, int shift) {
         int i = (int)(k - 0x1Eu);
         return shift ? (int)ds[i] : (int)d[i];
     }
+    if (k>=0x59 && k<=0x63) {
+        static const char digits[]="1234567890.";
+        static const int nav[]={KEY_END,KEY_DOWN,KEY_PGDN,KEY_LEFT,0,
+                               KEY_RIGHT,KEY_HOME,KEY_UP,KEY_PGUP,0,0};
+        /* Shift temporarily reverses Num Lock, as on a PC keypad. */
+        return (num^shift) ? digits[k-0x59] : nav[k-0x59];
+    }
     switch (k) {
+    case 0x54: return '/';
+    case 0x55: return '*';
+    case 0x56: return '-';
+    case 0x57: return '+';
+    case 0x58: return '\n';
+    case 0x67: return '=';
     case 0x28u: return (int)'\n';            /* Enter */
     case 0x29u: return 27;                   /* Esc */
     case 0x2Au: return (int)'\b';            /* Backspace */
@@ -113,124 +128,191 @@ static int hid_map(uint8_t k, int shift) {
 }
 
 /* ---------- 入口：认领键盘并切 boot 协议 ---------- */
-void usbkbd_init(void) {
-    int n = usbenum_device_count();
-
-    g_kbd = NULL;
-    g_got_report = 0;
-    for (int i = 0; i < (int)sizeof(g_prev); i++) g_prev[i] = 0;
-
-    for (int i = 0; i < n; i++) {
-        const usb_dev_t *d = usbenum_get(i);
-        if (!d) continue;
-        /* boot 键盘的判据：HID 接口 + subclass=1(boot) + protocol=1(键盘)，
-         * 且枚举阶段已 SET_CONFIGURATION 成功、找到了中断 IN 端点。 */
-        if (d->hid_if >= 0 && d->hid_sub == 1u && d->hid_proto == 1u &&
-            d->hid_ep != 0u && d->configured) {
-            /* EHCI 上挂的 HID 认领不了：周期调度（中断 IN）还没实现。
-             * 真机不受影响——键鼠绝大多数是全速/低速，会被 EHCI 交还
-             * companion UHCI，走的正是已验证的 UHCI 路径。 */
-            if (!usbhc_supports_interrupt(&d->bus)) {
-                dmesg_write("USB-KBD: HID on EHCI skipped (no interrupt IN yet)");
-                continue;
+static const usb_hid_if_t *select_keys(const usb_dev_t *d) {
+    if(!usbhc_supports_interrupt(&d->bus))return 0;
+        for(unsigned j=0;j<d->hid_count;j++){
+            const usb_hid_if_t *h=&d->hid[j];
+            if(!h->ready || !usb_hid_keyboard(h))continue;
+            uint8_t protocol=!!h->bitmap.bytes;
+            uint8_t sp[]={0x21,0x0b,protocol,0,h->number,0,0,0};
+            if(h->sub==1 && !h->key_layout &&
+               usbhc_control_xfer(&d->bus,d->addr,0,sp,0,0,0,0)!=0) {
+                uint8_t proto=255;
+                int got=0;
+                uint8_t get[]={0xa1,3,0,0,h->number,0,1,0};
+                if(usbhc_control_xfer(&d->bus,d->addr,0,get,1,&proto,1,&got)!=0 ||
+                   got!=1 || proto!=protocol)continue;
             }
-            g_kbd = d;
-            break;
+            return h;
         }
-    }
+    return 0;
+}
 
-    if (!g_kbd) {
-        dmesg_write("USB-KBD: no HID boot keyboard");
-        return;
-    }
-
-    /* 只发 SET_PROTOCOL(boot=0)：让设备用固定的 8 字节 boot 报告格式。
-     *
-     * SET_IDLE **故意不发**（与 usbmouse.c 一致，别再补回来）：
-     * HID 规范里 boot 协议设备的默认 idle rate 就是 0（="无限"，只在
-     * 变化时报告），与显式 SET_IDLE(0) 语义等价，发它拿不到任何好处；
-     * 而实测 QEMU 的 HID 设备收到显式 SET_IDLE 之后就不再在中断端点
-     * 上报（中断 IN 恒 NAK），鼠标这条坑已经在 usbmouse.c 记过一次，
-     * 键盘同理。 */
-    uint8_t ifnum = (uint8_t)(g_kbd->hid_if & 0xFFu);
-    uint8_t sp[8] = {0x21, 0x0B, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
-    int rp = usbhc_control_xfer(&g_kbd->bus, g_kbd->addr, 0, sp, 0, NULL, 0,
-                                NULL);
-
+static void bind_keyboard(kbd_t *k,const usb_dev_t *picked,const usb_hid_if_t *keys) {
     {
         char line[128];
         int n2 = 0;
         int lim = (int)sizeof(line) - 1;
-        k_str(line, &n2, lim, "USB-KBD: boot kbd addr=");
-        k_dec(line, &n2, lim, (uint32_t)g_kbd->addr);
+        k_str(line, &n2, lim, keys->bitmap.bytes ? "USB-KBD: bitmap kbd addr=" :
+              keys->key_layout ? "USB-KBD: report kbd addr=" : "USB-KBD: boot kbd addr=");
+        k_dec(line, &n2, lim, (uint32_t)picked->addr);
         k_str(line, &n2, lim, " ep=");
-        k_hex2(line, &n2, lim, (uint32_t)g_kbd->hid_ep);
+        k_hex2(line, &n2, lim, (uint32_t)keys->ep);
         k_str(line, &n2, lim, " mps=");
-        k_dec(line, &n2, lim, (uint32_t)g_kbd->hid_ep_mps);
+        k_dec(line, &n2, lim, (uint32_t)keys->mps);
         k_str(line, &n2, lim, " int=");
-        k_dec(line, &n2, lim, (uint32_t)g_kbd->hid_ep_interval);
-        k_str(line, &n2, lim, (rp == 0) ? " proto=ok" : " proto=fail");
+        k_dec(line, &n2, lim, (uint32_t)keys->interval);
+        k_str(line, &n2, lim, " proto=ok");
         k_emit(line, n2, lim);
+    }
+    uint32_t flags=irq_save_disable();
+    *k=(kbd_t){.dev=picked,.keys=keys,.led_sent=-1};
+    irq_restore(flags);
+}
+
+void usbkbd_init(void) {
+    int n=usbenum_device_count();
+    for(int i=0;i<n && i<USBENUM_MAX_DEV;i++){
+        const usb_dev_t *d=usbenum_get(i);
+        if(!d || !d->configured || keyboards[i].dev)continue;
+        const usb_hid_if_t *keys=select_keys(d);
+        if(keys)bind_keyboard(&keyboards[i],d,keys);
+    }
+    if(!usbkbd_present())dmesg_write("USB-KBD: no HID boot keyboard");
+}
+
+void usbkbd_detach(const usb_dev_t *device) {
+    uint32_t flags=irq_save_disable();
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+        if(keyboards[i].dev==device)keyboards[i]=(kbd_t){0};
+    irq_restore(flags);
+}
+
+/* Called only by the hotplug worker. Each physical keyboard receives the
+ * shared lock state, but failing/stalling LEDs don't block other keyboards. */
+void usbkbd_sync_leds(void) {
+    uint32_t flags=irq_save_disable();
+    uint8_t bits=(uint8_t)((caps<<1)|num);
+    irq_restore(flags);
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++){
+        kbd_t *k=&keyboards[i];
+        const usb_dev_t *d=k->dev;
+        const usb_hid_if_t *h=k->keys;
+        if(!d || h->key_layout || h->bitmap.bytes || k->led_sent==bits || k->led_failed)continue;
+        uint8_t request[8]={0x21,9,0,2,h->number,0,1,0};
+        if(usbhc_control_xfer(&d->bus,d->addr,0,request,0,&bits,1,NULL)!=0){
+            k->led_failed=1;
+            continue;
+        }
+        k->led_sent=bits;
+        char line[]="USB-KBD: LED report 0";
+        line[sizeof(line)-2]=(char)('0'+bits);
+        dmesg_record(line);
     }
 }
 
-/* ---------- 轮询：读一份报告，注入新按下的键 ---------- */
-void usbkbd_poll(void) {
-    const usb_dev_t *d = g_kbd;
-    if (!d) return;
+static unsigned modifiers(void) {
+    unsigned mod=0;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+        if(keyboards[i].dev)mod|=keyboards[i].modifiers;
+    return mod;
+}
 
-    /*
-     * 关键前置检查：**中断关着就绝不能轮询**。
-     * uhci_interrupt_in() 靠 g_pit_ticks 推进做超时等待（IRQ0 驱动），在
-     * IF=0 的上下文（task_lock 临界区、IRQ 处理函数内部）里 g_pit_ticks 永远
-     * 不前进 —— 那不是"等 3ms"，而是**永久挂死**。shell 正是在 task_lock()
-     * 里读键盘的，所以这个检查不是防御性装饰，是死锁的唯一防线。
-     */
-    uint32_t flags = irq_save_disable();
-    int irq_was_on = (flags != 0u);
+static int repeatable(int key) {
+    return (key>=32 && key<127) || key=='\b' || key==KEY_UP ||
+           key==KEY_DOWN || key==KEY_LEFT || key==KEY_RIGHT ||
+           key==KEY_PGUP || key==KEY_PGDN;
+}
+static int mapped(uint8_t code,uint8_t mod) {
+    return code==0x2bu && (mod&0x44u) ? KEY_ALT_TAB :
+        hid_map(code, !!(mod&0x22u) ^ (caps && code>=4 && code<=0x1d));
+}
+
+void usbkbd_cancel_repeat(void) {
+    uint32_t flags=irq_save_disable();
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)keyboards[i].repeat=0;
     irq_restore(flags);
-    if (!irq_was_on) return;
+}
 
-    /* 节流：既符合设备 interval，也避免 shell 忙等循环把 UHCI 轮询跑满 */
-    uint32_t now = g_pit_ticks;
-    if ((uint32_t)(now - g_last_poll) < USBKBD_THROTTLE_MS) return;
-    g_last_poll = now;
+static void repeat_poll(kbd_t *k,uint32_t now) {
+    if(k->repeat && (int32_t)(now-k->repeat_after)>=0){
+        unsigned mod=modifiers();
+        int key=mapped(k->repeat,(uint8_t)mod);
+        if(!(mod&NON_SHIFT_MODS) && repeatable(key))keyboard_inject(key);
+        k->repeat_after=now+REPEAT_PERIOD;
+    }
+}
 
-    uint8_t rep[8];
-    int act = 0;
-    int mps = (int)d->hid_ep_mps;
-    if (mps < 1) mps = 8;
-    if (mps > (int)sizeof(rep)) mps = (int)sizeof(rep);
+/* Bounded polling; serialize the previous report, repeat, and injection. */
+static unsigned report_bit(const uint8_t *data,unsigned bit){
+    return (data[bit>>3]>>(bit&7u))&1u;
+}
 
-    for (int i = 0; i < (int)sizeof(rep); i++) rep[i] = 0;
-    int r = usbhc_interrupt_in(&d->bus, d->addr, d->hid_ep, rep, mps, &act);
-    if (r != 0) return;              /* 超时/致命错误：静默（下一轮再来） */
-    if (act < (int)USBKBD_REPORT_LEN) return;   /* NAK 或报告不完整：静默 */
+static void poll_report(kbd_t *k,uint32_t now) {
+    const usb_dev_t *d=k->dev;
+    uint8_t data[64]={0};
+    const hid_key_bitmap_t *layout=&k->keys->bitmap;
+    unsigned id=layout->bytes ? layout->id : (k->keys->key_layout<256 ? k->keys->key_layout : 0);
+    int act=0, prefix=!!id;
+    int want=layout->bytes ? layout->bytes : (int)USBKBD_REPORT_LEN+prefix;
+    uint8_t *rep=data+prefix;
+    int r=usbhc_interrupt_in(&d->bus,d->addr,k->keys->ep,data,want,&act);
+    if (r != 0 || (act && (act!=want || (prefix && data[0]!=id)))) {
+        k->repeat=0;
+        if(r!=0){ k->modifiers=0; for(unsigned i=0;i<32;i++)k->previous[i]=0; }
+        return;
+    }
+    if (!act) {
+        repeat_poll(k,now);
+        return;
+    }
 
-    if (!g_got_report) {
+    if (!k->got_report) {
         char line[96];
         int n = 0;
         int lim = (int)sizeof(line) - 1;
-        g_got_report = 1;
+        k->got_report = 1;
         k_str(line, &n, lim, "USB-KBD: report ok len=");
         k_dec(line, &n, lim, (uint32_t)act);   /* 实测长度，不写死 8 */
         k_emit(line, n, lim);
     }
 
-    uint8_t mod = rep[0];
-    int shift = (mod & 0x22u) ? 1 : 0;    /* bit1 LShift / bit5 RShift */
-
-    for (int i = 2; i < (int)USBKBD_REPORT_LEN; i++) {
-        uint8_t code = rep[i];
-        if (code == 0u) continue;
-        /* 去重：只处理上一份报告里没有的键码 */
-        int seen = 0;
-        for (int j = 2; j < (int)USBKBD_REPORT_LEN; j++) {
-            if (g_prev[j] == code) { seen = 1; break; }
+    uint8_t keys[32]={0};
+    unsigned mod=0;
+    if(layout->bytes){
+        for(unsigned k=layout->first;k<=layout->last;k++){
+            if(!report_bit(rep,layout->key_bit+k-layout->first))continue;
+            if(k>=224)mod|=1u<<(k-224);
+            else if(k>=4)keys[k>>3]|=(uint8_t)(1u<<(k&7u));
         }
-        if (seen) continue;
+        if(layout->mod_bit!=0xffff)
+            for(unsigned k=0;k<8;k++)mod|=report_bit(rep,layout->mod_bit+k)<<k;
+    }else{
+        mod=rep[0];
+        /* ErrorRollOver/POSTFail/Undefined are not releases. */
+        for(unsigned i=2;i<USBKBD_REPORT_LEN;i++){
+            unsigned usage=rep[i];
+            if(usage && usage<=3){k->repeat=0;return;}
+            if(usage)keys[usage>>3]|=(uint8_t)(1u<<(usage&7u));
+        }
+    }
+    k->modifiers=(uint8_t)mod;
+    mod=modifiers();
+    if(!report_bit(keys,k->repeat))k->repeat=0;
+    unsigned end=layout->bytes?224u:USBKBD_REPORT_LEN;
+    for(unsigned i=layout->bytes?4u:2u;i<end;i++){
+        unsigned code=layout->bytes?i:rep[i];
+        if(!code || !report_bit(keys,code) || report_bit(k->previous,code))continue;
+        /* Also suppress duplicate array entries within one report. */
+        k->previous[code>>3]|=(uint8_t)(1u<<(code&7u));
 
-        int key = hid_map(code, shift);
+        if(code==0x39u){caps=!caps;continue;}
+        if(code==0x53u){num=!num;continue;}
+        int key=mapped(code,mod);
+        if (repeatable(key) && !(mod&NON_SHIFT_MODS)) {
+            k->repeat=code;
+            k->repeat_after=now+REPEAT_DELAY;
+        }
         if (!keyboard_private_input() && !user_managed()) {
             char line[128];
             int n = 0;
@@ -244,13 +326,28 @@ void usbkbd_poll(void) {
         if (key != 0) keyboard_inject(key);
     }
 
-    for (int i = 0; i < (int)USBKBD_REPORT_LEN; i++) g_prev[i] = rep[i];
+    for(unsigned i=0;i<sizeof(keys);i++)k->previous[i]=keys[i];
+    repeat_poll(k,now);
+}
+
+void usbkbd_poll(void) {
+    uint32_t flags=irq_save_disable();
+    if(!flags)return;
+    uint32_t now=g_pit_ticks;
+    if((uint32_t)(now-last_poll)>=USBKBD_THROTTLE_MS){
+        last_poll=now;
+        for(unsigned i=0;i<USBENUM_MAX_DEV;i++)
+            if(keyboards[i].dev)poll_report(&keyboards[i],now);
+    }
+    irq_restore(flags);
 }
 
 int usbkbd_present(void) {
-    return g_kbd ? 1 : 0;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)if(keyboards[i].dev)return 1;
+    return 0;
 }
 
 int usbkbd_got_report(void) {
-    return g_got_report;
+    for(unsigned i=0;i<USBENUM_MAX_DEV;i++)if(keyboards[i].got_report)return 1;
+    return 0;
 }

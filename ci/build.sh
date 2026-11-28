@@ -42,14 +42,21 @@ ann_log() {
 }
 
 # ERR trap：$LINENO 直接指出是哪一行炸的，省掉"靠猜"这一步。
+set -E
 trap 'st=$?; \
       echo "[ci] FAILED at line $LINENO (exit $st)" >&2; \
       ann_err "[ci] build.sh failed at line $LINENO (exit $st)"' ERR
 
+# Resolve the shared Ninja graph instead of inferring which C files to link
+# from the contents of kernel/ (e.g. the legacy generated font table).
+SOURCES="$("$PYTHON" tools/check_build_inputs.py --kernel-sources)"
+LINK_INPUTS="$("$PYTHON" tools/check_build_inputs.py --kernel-link-inputs)"
+mapfile -t LINK_OBJS <<< "$LINK_INPUTS"
+
 # 工具链体检：CI 上装的和开发机上用的必须是同一套（stable + rust-src），
 # 否则就是"本地绿、CI 红"的经典死循环。版本打到注解里，方便远程核对。
-rustc_v="$(rustc --version 2>/dev/null | head -1 || echo 'rustc: MISSING')"
-cargo_v="$(cargo --version 2>/dev/null | head -1 || echo 'cargo: MISSING')"
+rustc_v="$(cd rust/ezos_rs && rustc --version)"
+cargo_v="$(cd rust/ezos_rs && cargo --version)"
 zig_v="$("$ZIG" version 2>/dev/null | head -1 || echo 'zig: MISSING')"
 echo "[ci] rustc  : $rustc_v"
 echo "[ci] cargo  : $cargo_v"
@@ -59,18 +66,12 @@ ann_note "rustc=$rustc_v"
 ann_note "cargo=$cargo_v"
 ann_note "zig=$zig_v"
 # -Z build-std 要 rust-src；没装的话 cargo 会在开编前就退出，症状是"20 秒速红"。
-sysroot="$(rustc --print sysroot 2>/dev/null || echo '')"
-if [ -n "$sysroot" ] && [ -f "$sysroot/lib/rustlib/src/rust/Cargo.toml" ]; then
-    ann_note "rust-src=OK ($sysroot/lib/rustlib/src/rust)"
-else
-    ann_note "rust-src=MISSING (sysroot=${sysroot:-none})"
-    # 这条 notice 曾经是**误报**：cargo 是强制步骤（失败就 exit 1），CI 全绿
-    # 说明 rust-src 其实在，只是这个探测路径没命中。所以别只打印 MISSING，
-    # 把真实布局和已装组件一并打出来，省得下次对着一行 MISSING 瞎猜。
-    ann_note "rustlib layout: $(ls "$sysroot/lib/rustlib" 2>/dev/null | tr '\n' ' ')"
-    ann_note "installed src components: $(rustup component list --installed \
-              2>/dev/null | grep -i src | tr '\n' ' ')"
+sysroot="$(cd rust/ezos_rs && rustc --print sysroot)"
+if [ ! -f "$sysroot/lib/rustlib/src/rust/library/core/Cargo.toml" ]; then
+    ann_err "rust-src not installed in active project toolchain: $sysroot"
+    exit 1
 fi
+ann_note "rust-src=OK ($sysroot)"
 
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
 # **-O2**：以前用 -Os 是被窗口逼的——镜像 0x10000 和主栈 0x90000 抢同一块
@@ -108,19 +109,20 @@ done
 "$LD" -m elf_i386 -s -T user/user.ld -o user/cc.elf user/crt0.o user/cc.o user/cc_libc.o
 "$PYTHON" tools/make_sysvol.py
 
-OBJS=""
-for src in $(find kernel -name '*.c' | sort); do
-    # Legacy Windows font generator output is not linked.
-    [ "$src" != kernel/cjk_font.c ] || continue
+while IFS= read -r src; do
     obj="${src%.c}.o"
     echo "[ci] CC ${src}"
+    extra=()
     if [ "$src" = kernel/webimage.c ]; then
-        "$CC" $CFLAGS -Os -Ithird_party/wuffs/include -c "$src" -o "$obj"
-    else
-        "$CC" $CFLAGS -c "$src" -o "$obj"
+        extra=(-Os -Ithird_party/wuffs/include)
     fi
-    OBJS="$OBJS $obj"
-done
+    if ! "$CC" $CFLAGS "${extra[@]}" -c "$src" -o "$obj" > ci-cc.log 2>&1; then
+        cat ci-cc.log >&2
+        ann_log ci-cc.log "$src"
+        exit 1
+    fi
+    cat ci-cc.log
+done <<< "$SOURCES"
 
 # ---- 汇编 ----
 echo "[ci] ASM boot/boot.asm (bin)"
@@ -142,7 +144,6 @@ echo "[ci] ASM kernel/bios_thunk.asm (elf32)"
 "$ASM" -f elf32 kernel/cjk_bitmap.asm -o kernel/cjk_bitmap.o
 "$PYTHON" tools/build_webjs.py "$CC" "$LD" user/webjs.elf
 "$ASM" -f elf32 kernel/webjs_blob.asm -o kernel/webjs_blob.o
-OBJS="$OBJS kernel/webjs_blob.o"
 
 # ---- 非 C 增量（Rust / Zig） ----
 # kernel/rust_bridge.h 里 EZ_EXFAT_IMPL 默认 1 = Rust：exFAT 的卷校验和 /
@@ -158,7 +159,7 @@ RUST_LIB="rust/ezos_rs/target/i686-ezos/release/libezos_rs.a"
 ZIG_OBJ="rust/ezos_zig/ezos_zig.o"
 
 echo "[ci] CARGO libezos_rs.a"
-if ! ( cd rust/ezos_rs && RUSTC_BOOTSTRAP=1 cargo build --release \
+if ! ( cd rust/ezos_rs && RUSTC_BOOTSTRAP=1 cargo build --locked --release \
         -Z build-std=core,compiler_builtins -Zjson-target-spec \
         --target ../i686-ezos.json ) > ci-cargo.log 2>&1; then
     echo "[ci] FATAL: cargo build failed, tail:" >&2
@@ -194,8 +195,7 @@ fi
 # （静态库必须放最后，否则归档里的符号可能解析不到）。
 echo "[ci] LD kernel_raw.bin"
 "$PYTHON" tools/build_tls.py "$CC" temp/libcerulia_tls.a
-if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
-        $OBJS kernel/bios_thunk_asm.o kernel/cjk_bitmap.o "$ZIG_OBJ" temp/libcerulia_tls.a "$RUST_LIB" > ci-ld.log 2>&1; then
+if ! "$LD" $LDFLAGS -o kernel_raw.bin "${LINK_OBJS[@]}" > ci-ld.log 2>&1; then
     echo "[ci] FATAL: link failed, tail:" >&2
     tail -40 ci-ld.log >&2
     ann_log ci-ld.log ld
@@ -203,7 +203,7 @@ if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
     # 一样时，产物大小会漂移几个 KB——把 .o 体积打出来，一眼就能看出是"超
     # 容量"还是"缺符号"。
     tot=0
-    for o in $OBJS; do
+    for o in "${LINK_OBJS[@]}"; do
         s=$(stat -c%s "$o" 2>/dev/null || echo 0)
         tot=$((tot + s))
     done

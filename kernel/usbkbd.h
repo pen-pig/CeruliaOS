@@ -3,7 +3,7 @@
  *
  * 在 H2-2c 枚举结果之上做三件事：
  *   1. 认领 HID boot 键盘（bInterfaceSubClass=1 / bInterfaceProtocol=1），
- *      用 SET_PROTOCOL(boot) + SET_IDLE(0) 把它切进 boot 报告格式；
+ *      用 SET_PROTOCOL(boot) 把它切进 boot 报告格式；
  *   2. 轮询中断 IN 端点，解析 8 字节 boot 报告（修饰键 + 6KRO 键码数组）；
  *   3. 把新按下的键经 keyboard_inject() 送进与 PS/2 共用的键盘缓冲。
  *
@@ -15,11 +15,18 @@
 #ifndef USBKBD_H
 #define USBKBD_H
 
+struct usb_device;
+
 /* 枚举后调用：认领键盘设备并切 boot 协议。没有键盘时打印一行并静默返回。 */
 void usbkbd_init(void);
+void usbkbd_detach(const struct usb_device *device);
+void usbkbd_sync_leds(void);
 
 /* 轮询一次中断端点（内部 5ms 节流）。可在任务上下文随时调用；无键盘时立即返回。 */
 void usbkbd_poll(void);
+
+/* Stop auto-repeat when the shell or desktop switches input context. */
+void usbkbd_cancel_repeat(void);
 
 /* 是否认领到了 USB HID boot 键盘 */
 int usbkbd_present(void);

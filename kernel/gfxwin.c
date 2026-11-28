@@ -3260,6 +3260,7 @@ static void gw_dump_state_serial(void)
         n=gw_skey(buf,n," err="); n=gw_sdec(buf,n,wv_error_number());
         n=gw_skey(buf,n," js="); n=gw_sdec(buf,n,wv_scripts_done());
         n=gw_skey(buf,n," jserr="); n=gw_sdec(buf,n,wv_scripts_error());
+        n=gw_skey(buf,n," scroll="); n=gw_sdec(buf,n,wv_scroll_get());
         n=gw_skey(buf,n," ticks="); n=gw_sdec(buf,n,g_pit_ticks);
         buf[n++]='\n'; buf[n]=0; serial_write(buf);
     }
@@ -4766,6 +4767,17 @@ void gw_demo(void)
 
         if (!gw_session_request && !gw_handle_desktop_mouse(mx, my, bt))
             gw_handle_mouse(mx, my, bt);
+        /* Consume wheel events here rather than leaving them for the shell.
+         * Do not scroll through a menu, title bar or another focused window. */
+        int wheel;
+        while ((wheel=mouse_get_wheel())!=0) {
+            gw_window_t *w=gw_focused_wnd;
+            if(!gw_session_request && !gw_start_menu_active && w && w->used && !w->hidden &&
+               !w->moving && w->app==GW_APP_BROWSER && !gw_in_taskbar(my) &&
+               mx>w->x && mx<w->x+w->w-1 && my>=w->y+38 && my<w->y+w->h-1){
+                wv_scroll_by(-wheel*48);gw_dirty=1;
+            }
+        }
         gw_dispatch_cnt++;
         if (gw_session_request) {
             int action = gw_session_request;

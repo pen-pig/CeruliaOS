@@ -24,6 +24,7 @@
  *  - 本模块不依赖 kmalloc（页表池静态），可在 kmalloc 之前/崩溃路径安全调用。
  */
 #include "paging.h"
+#include "irqflags.h"
 
 #define PD  ((volatile uint32_t *)PAGING_PD_ADDR)
 
@@ -236,30 +237,42 @@ int paging_lfb_ready(void) { return g_lfb_ready; }
 static uint64_t mmio_pdpt[4] __attribute__((aligned(32)));
 static uint64_t mmio_low_pd[512] __attribute__((aligned(4096)));
 static uint64_t mmio_high_pd[512] __attribute__((aligned(4096)));
-static int mmio64_ready;
+#define MMIO64_WINDOWS 4u
+static unsigned mmio64_windows;
 extern uint32_t pae_mmio_access(uint32_t pdpt, uint32_t va, uint32_t value, uint32_t write);
 
 int paging_mmio64_init(uint64_t phys_2m) {
     uint32_t eax = 1, ebx, ecx, edx;
     asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    if (!g_ready || mmio64_ready || !(edx & (1u << 6)) || (phys_2m & 0x1fffffu) ||
+    if (!g_ready || !(edx & (1u << 6)) || (phys_2m & 0x1fffffu) ||
         phys_2m < 0x100000000ull || phys_2m >= (1ull << 52)) return -1;
-    for (uint32_t i = 0; i < PAGING_IDENTITY_END / 0x200000u; i++)
-        mmio_low_pd[i] = (uint64_t)i * 0x200000u | 0x83u;
-    mmio_high_pd[0] = phys_2m | 0x9bu;  /* 2 MiB, supervisor RW, uncached */
-    mmio_pdpt[0] = (uint32_t)mmio_low_pd | 1u;
-    mmio_pdpt[3] = (uint32_t)mmio_high_pd | 1u;
-    mmio64_ready = 1;
-    return 0;
+    uint32_t flags=irq_save_disable();
+    uint64_t entry=phys_2m|0x9bu;  /* 2 MiB, supervisor RW, uncached */
+    unsigned slot=0;
+    for(;slot<mmio64_windows;slot++)
+        if((mmio_high_pd[slot]&~0x1fffffull)==phys_2m)break;
+    if(slot==MMIO64_WINDOWS){irq_restore(flags);return -1;}
+    if(slot==mmio64_windows){
+        if(!slot){
+            for(uint32_t i=0;i<PAGING_IDENTITY_END/0x200000u;i++)
+                mmio_low_pd[i]=(uint64_t)i*0x200000u|0x83u;
+            mmio_pdpt[0]=(uint32_t)mmio_low_pd|1u;
+            mmio_pdpt[3]=(uint32_t)mmio_high_pd|1u;
+        }
+        mmio_high_pd[slot]=entry;
+        mmio64_windows++;
+    }
+    irq_restore(flags);
+    return (int)(slot*0x200000u);
 }
 
 uint32_t paging_mmio64_read(uint32_t offset) {
-    if (!mmio64_ready || (offset & 3u) || offset > 0x1ffffcu) return 0xffffffffu;
+    if ((offset&3u) || (offset>>21)>=mmio64_windows)return 0xffffffffu;
     return pae_mmio_access((uint32_t)mmio_pdpt, PAGING_MMIO64_VA + offset, 0, 0);
 }
 
 void paging_mmio64_write(uint32_t offset, uint32_t value) {
-    if (mmio64_ready && !(offset & 3u) && offset <= 0x1ffffcu)
+    if (!(offset&3u) && (offset>>21)<mmio64_windows)
         (void)pae_mmio_access((uint32_t)mmio_pdpt, PAGING_MMIO64_VA + offset, value, 1);
 }
 

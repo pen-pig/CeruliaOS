@@ -18,8 +18,11 @@
 #ifndef USBMOUSE_H
 #define USBMOUSE_H
 
+struct usb_device;
+
 /* 枚举后调用：认领鼠标设备并切 boot 协议。没有鼠标时打印一行并静默返回。 */
 void usbmouse_init(void);
+void usbmouse_detach(const struct usb_device *device);
 
 /* 轮询一次中断端点（内部 5ms 节流）。可在任务上下文随时调用；无鼠标时立即返回。 */
 void usbmouse_poll(void);
